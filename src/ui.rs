@@ -1271,6 +1271,19 @@ impl App {
 
     /// Handle /models command — fetch model list and open interactive picker
     async fn handle_models_command(&mut self) {
+        // Re-read config.toml so a changed endpoint is picked up without restart
+        let fresh_config = crate::config::Config::load();
+        if fresh_config.endpoint != self.config.endpoint {
+            self.config.endpoint = fresh_config.endpoint.clone();
+            match OllamaClient::new(&fresh_config.endpoint, &self.config.model).await {
+                Ok(client) => { self.ollama_client = Some(client); }
+                Err(e) => {
+                    self.push_system_event(format!("❌ Failed to connect to {}: {}", fresh_config.endpoint, e));
+                    return;
+                }
+            }
+        }
+
         match &self.ollama_client {
             Some(client) => {
                 self.status_message = "⏳ Fetching models...".to_string();
