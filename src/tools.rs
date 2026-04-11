@@ -100,7 +100,7 @@ pub struct SpawnTool;
 impl SpawnTool {
     fn is_absolute_dangerous_path(path: &str) -> bool {
         // Block absolute paths to system directories
-        let dangerous_prefixes = vec!["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"];
+        let dangerous_prefixes = ["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"];
         dangerous_prefixes.iter().any(|p| path.starts_with(p))
     }
 }
@@ -404,7 +404,8 @@ impl Tool for RusteTool {
         self.validate_input(args)?;
 
         let file_path = args.trim_matches('"').trim_matches('\'');
-        let binary_name = format!("yggdra_out_{}", uuid::Uuid::new_v4().to_string()[0..8].to_string());
+        let uuid_str = uuid::Uuid::new_v4().to_string();
+        let binary_name = format!("yggdra_out_{}", &uuid_str[0..8]);
         let out_path = format!("/tmp/{}", binary_name);
 
         // Try native rustc first, fall back to docker if needed

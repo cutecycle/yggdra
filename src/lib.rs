@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Phase 3 infrastructure used in future phases
+
 pub mod config;
 pub mod message;
 pub mod notifications;

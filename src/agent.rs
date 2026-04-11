@@ -1,5 +1,5 @@
-/// Agent system: agentic loop with tool execution and steering injection.
-/// Manages tool-based reasoning with LLM orchestration via Ollama.
+//! Agent system: agentic loop with tool execution and steering injection.
+//! Manages tool-based reasoning with LLM orchestration via Ollama.
 
 use crate::tools::ToolRegistry;
 use crate::steering::SteeringDirective;

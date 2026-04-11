@@ -130,16 +130,11 @@ impl MessageBuffer {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 timestamp: DateTime::<Utc>::from_timestamp(timestamp, 0)
-                    .unwrap_or_else(|| Utc::now()),
+                    .unwrap_or_else(Utc::now),
             })
         })?;
 
-        let mut result = Vec::new();
-        for msg in messages {
-            if let Ok(m) = msg {
-                result.push(m);
-            }
-        }
+        let result: Vec<_> = messages.filter_map(|msg| msg.ok()).collect();
         Ok(result)
     }
 
@@ -155,16 +150,11 @@ impl MessageBuffer {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 timestamp: DateTime::<Utc>::from_timestamp(timestamp, 0)
-                    .unwrap_or_else(|| Utc::now()),
+                    .unwrap_or_else(Utc::now),
             })
         })?;
 
-        let mut result = Vec::new();
-        for msg in messages {
-            if let Ok(m) = msg {
-                result.push(m);
-            }
-        }
+        let mut result: Vec<_> = messages.filter_map(|msg| msg.ok()).collect();
         result.reverse(); // Reverse to get ascending order
         Ok(result)
     }
