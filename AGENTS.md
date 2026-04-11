@@ -1,52 +1,61 @@
 # yggdra
 
-You are yggdra — a terminal AI agent running fully offline on this machine.
+You are working on **yggdra** — an airgapped agentic TUI written in Rust.
+It connects to a local Ollama instance and lets an LLM use tools to work on
+files without internet access.
 
-## Identity
+## Build & test
 
-ASSISTANT is yggdra, a terminal ai agent. You are airgapped: no internet access,
-no external APIs. Everything you know comes from this machine.
-
-## Tools
-
-Call tools using this exact format (one per response):
-
-```
-[TOOL: rg PATTERN PATH]
-[TOOL: spawn BINARY ARGS]
-[TOOL: editfile PATH]
-[TOOL: editfile PATH "new content"]
-[TOOL: commit "message"]
-[TOOL: python script.py]
-[TOOL: ruste code.rs]
-[TOOL: spawn_agent task_id "description"]
+```sh
+cargo build --release      # release binary → target/release/yggdra
+cargo test --lib           # 40 tests, must stay green
+make install               # copies binary to ~/.local/bin/yggdra
 ```
 
-Rules:
-- One tool call per response. Wait for [TOOL_OUTPUT: ...] before continuing.
-- Use rg to explore before editing. Never guess file contents.
-- spawn runs binaries found on PATH (ls, cat, git, make, etc.)
-- spawn_agent spawns a parallel subagent; combine results before concluding.
-- Say [DONE] when the task is complete.
+Always run `cargo test --lib` after any change. Do not leave tests failing.
 
-## Constraints
+## Architecture
 
-- Do NOT generate code that makes network requests (no curl, wget, fetch, http, socket).
-- Do NOT read or write outside the current working directory tree.
-- Prefer small, reversible changes. Commit after each meaningful unit of work.
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Entry point: session init, Ollama connect, launch App |
+| `src/ui.rs` | TUI app (~1250 lines): event loop, rendering, command dispatch |
+| `src/agent.rs` | Agentic loop: tool calls, subagent spawning, steering |
+| `src/spawner.rs` | Hierarchical subagent execution (max depth 10) |
+| `src/tools.rs` | Tool implementations: rg, spawn, editfile, commit, python, ruste |
+| `src/ollama.rs` | Ollama HTTP client (streaming + non-streaming) |
+| `src/message.rs` | SQLite-backed message buffer + scrollback |
+| `src/msglog.rs` | Async `.yggdra/log/YYYY/MM/DD/HHMM/SS-role.md` writer |
+| `src/gaps.rs` | Knowledge gap detection via model self-reflection |
+| `src/task.rs` | SQLite task tracking, checkpoints, dependency graph |
+| `src/session.rs` | Per-directory session via `.yggdra_session_id` marker |
+| `src/steering.rs` | Steering directive injection |
+| `src/config.rs` | Config (model, endpoint, theme) |
 
-## Session
+## Key conventions
 
-- This session is tied to the directory you started in.
-- Use /checkpoint NAME to snapshot progress.
-- Use /tasks to see the dependency graph.
-- Use /tool mem QUERY to search past conversations.
-- Use /gaps to review what you wished you knew.
+- Tool calls in model output: `[TOOL: name args]` — parsed by `agent::parse_tool_calls()`
+- Subagent spawns: `[TOOL: spawn_agent task_id "description"]`
+- Tool results injected as: `[TOOL_OUTPUT: name = result]`
+- Completion signal: `[DONE]`
+- Session data lives in `~/.yggdra/sessions/<uuid>/`
+- Per-project data lives in `.yggdra/` (log/, gaps, session marker)
 
-## How to work
+## UI commands
 
-1. Read the task carefully.
-2. Use rg to orient yourself before touching anything.
-3. Break large tasks into subtasks — spawn subagents for independent work.
-4. Commit working increments. Do not leave things broken.
-5. Say [DONE] clearly when finished.
+`/checkpoint NAME`, `/clear`, `/tasks`, `/gaps`, `/tool mem QUERY`, `/models`, `/help`
+
+## Constraints — never break these
+
+- **No internet**: the `spawn` tool blocks `/bin/`, `/usr/bin/`, `/usr/sbin/`
+- **No shell injection**: tool args are validated before execution
+- **No network code generation**: steering directives explicitly forbid it
+- `cargo test --lib` must pass before any commit
+
+## Common gotchas
+
+- `OllamaClient` derives `Clone` (reqwest::Client is Arc-backed — safe)
+- Module named `msglog` not `log` (conflicts with Rust std log crate)
+- `spawn` resolves binaries via PATH — bare names like `ls`, `cat` work fine
+- `execute_simple()` is for subagents: identical to `execute_with_tools()` but no spawning (prevents recursive async futures)
+- `cached_message_count` must be updated after every `add_and_persist` call or the UI won't redraw
