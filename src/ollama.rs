@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Ollama client for communicating with Ollama API
+#[derive(Clone)]
 pub struct OllamaClient {
     endpoint: String,
     model: String,

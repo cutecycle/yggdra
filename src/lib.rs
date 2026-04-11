@@ -1,4 +1,5 @@
 pub mod config;
+pub mod gaps;
 pub mod message;
 pub mod notifications;
 pub mod ollama;

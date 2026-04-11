@@ -48,6 +48,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
+    PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
     PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
     PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
@@ -148,6 +149,8 @@ pub struct App {
     tool_iteration_count: usize,
     /// Receives result from async tool execution
     tool_result_rx: Option<oneshot::Receiver<ToolResult>>,
+    /// Receives result from async gap query
+    gap_rx: Option<oneshot::Receiver<Option<crate::gaps::Gap>>>,
     /// Build (autonomous) vs Plan (interactive) mode
     mode: AppMode,
     /// Contents of AGENTS.md if found on startup
@@ -200,6 +203,7 @@ impl App {
             turn_phase: TurnPhase::Idle,
             tool_iteration_count: 0,
             tool_result_rx: None,
+            gap_rx: None,
             mode: AppMode::Build,
             agents_task: agents_md,
             palette_open: false,
@@ -227,6 +231,8 @@ impl App {
             self.drain_stream_tokens();
             // Check for completed tool execution
             self.check_tool_result();
+            // Check for completed gap reflection
+            self.check_gap_result();
 
             terminal.draw(|f| self.draw(f))?;
 
@@ -315,6 +321,18 @@ impl App {
         }
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
+
+        // Fire-and-forget gap reflection: ask the model what it wished it knew
+        if let Some(client) = self.ollama_client.clone() {
+            let model = self.config.model.clone();
+            let text = response_text.clone();
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let result = crate::gaps::query_gap(&client, &model, &text).await;
+                let _ = tx.send(result.unwrap_or(None));
+            });
+            self.gap_rx = Some(rx);
+        }
 
         // Check for tool calls in the response
         let tool_calls = agent::parse_tool_calls(&response_text);
@@ -418,6 +436,35 @@ impl App {
                 self.tool_result_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
+            }
+        }
+    }
+
+    /// Check if the async gap reflection query has completed; record and surface if so
+    fn check_gap_result(&mut self) {
+        let rx = match self.gap_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        match rx.try_recv() {
+            Ok(Some(gap)) => {
+                self.gap_rx = None;
+                if let Err(e) = crate::gaps::record_gap(&gap) {
+                    eprintln!("Failed to record gap: {}", e);
+                } else {
+                    self.push_system_event(format!("ℹ️  I wish I knew: {}", gap.content));
+                }
+            }
+            Ok(None) => {
+                // Model reported no gap — nothing to do
+                self.gap_rx = None;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                // Still waiting
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.gap_rx = None;
             }
         }
     }
@@ -765,6 +812,8 @@ impl App {
             self.handle_clear_command();
         } else if command == "/tasks" {
             self.handle_tasks_command();
+        } else if command == "/gaps" {
+            self.handle_gaps_command();
         } else if command.starts_with("/checkpoint") {
             let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
             self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
@@ -1094,7 +1143,7 @@ impl App {
         match self.task_manager.list_all_tasks() {
             Ok(tasks) => {
                 if tasks.is_empty() {
-                    self.push_system_event("📋 No tasks defined");
+                    self.status_message = "📋 No tasks defined yet".to_string();
                     return;
                 }
 
@@ -1137,11 +1186,42 @@ impl App {
                 if let Err(e) = self.message_buffer.add_and_persist(tasks_msg) {
                     self.status_message = format!("❌ Failed to save tasks: {}", e);
                 } else {
-                    self.push_system_event(&format!("📋 Showing {} tasks", tasks.len()));
+                    self.cached_message_count = self.message_buffer.messages()
+                        .map(|v| v.len()).unwrap_or(0);
+                    self.status_message = format!("📋 {} tasks", tasks.len());
                 }
             }
             Err(e) => {
                 self.status_message = format!("❌ Failed to list tasks: {}", e);
+            }
+        }
+    }
+
+    /// Handle /gaps command to show recorded knowledge gaps
+    fn handle_gaps_command(&mut self) {
+        match crate::gaps::load_gaps() {
+            Ok(lines) => {
+                if lines.is_empty() {
+                    self.status_message = "ℹ️  No knowledge gaps recorded yet".to_string();
+                    return;
+                }
+
+                let mut output = format!("ℹ️  Knowledge Gaps ({} recorded):\n\n", lines.len());
+                for line in &lines {
+                    output.push_str(&format!("  {}\n", line));
+                }
+
+                let gaps_msg = Message::new("tool", output);
+                if let Err(e) = self.message_buffer.add_and_persist(gaps_msg) {
+                    self.status_message = format!("❌ Failed to display gaps: {}", e);
+                } else {
+                    self.cached_message_count = self.message_buffer.messages()
+                        .map(|v| v.len()).unwrap_or(0);
+                    self.status_message = format!("ℹ️  {} gaps", lines.len());
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("❌ Failed to load gaps: {}", e);
             }
         }
     }

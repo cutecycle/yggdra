@@ -1,4 +1,5 @@
 mod config;
+mod gaps;
 mod message;
 mod notifications;
 mod ollama;
