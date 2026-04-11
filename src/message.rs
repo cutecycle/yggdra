@@ -56,6 +56,23 @@ impl MessageBuffer {
             [],
         )?;
 
+        // Create scrollback table for archived messages
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS scrollback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                archived_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scrollback_archived ON scrollback(archived_at)",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -134,5 +151,59 @@ impl MessageBuffer {
     /// Reload from same database (for multi-window sync without reopening)
     pub fn refresh(&self) -> SqliteResult<Vec<Message>> {
         self.messages()
+    }
+
+    /// Archive all current messages to scrollback
+    pub fn archive_to_scrollback(&mut self) -> SqliteResult<usize> {
+        let now = Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        
+        // Move all messages to scrollback
+        tx.execute(
+            "INSERT INTO scrollback (role, content, timestamp, archived_at)
+             SELECT role, content, timestamp, ?1 FROM messages",
+            params![now],
+        )?;
+        
+        // Count how many we archived
+        let count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM scrollback WHERE archived_at = ?1",
+            params![now],
+            |row| row.get(0),
+        )?;
+        
+        // Clear current messages
+        tx.execute("DELETE FROM messages", [])?;
+        
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Search scrollback by query (searches both role and content)
+    pub fn search_scrollback(&self, query: &str) -> SqliteResult<Vec<(Message, i64)>> {
+        let search_pattern = format!("%{}%", query.to_lowercase());
+        let mut stmt = self.conn.prepare(
+            "SELECT role, content, timestamp, archived_at FROM scrollback 
+             WHERE LOWER(role) LIKE ?1 OR LOWER(content) LIKE ?1
+             ORDER BY archived_at DESC, timestamp DESC"
+        )?;
+
+        let messages = stmt.query_map(params![search_pattern], |row| {
+            let timestamp = row.get::<_, i64>(2)?;
+            let archived_at = row.get::<_, i64>(3)?;
+            Ok((Message {
+                role: row.get(0)?,
+                content: row.get(1)?,
+                timestamp: DateTime::<Utc>::from_timestamp(timestamp, 0)
+                    .unwrap_or_else(Utc::now),
+            }, archived_at))
+        })?;
+
+        messages.collect()
+    }
+
+    /// Get scrollback message count
+    pub fn scrollback_count(&self) -> SqliteResult<usize> {
+        self.conn.query_row("SELECT COUNT(*) FROM scrollback", [], |row| row.get(0))
     }
 }

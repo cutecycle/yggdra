@@ -45,6 +45,8 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
+    PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
+    PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
     PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
@@ -758,6 +760,8 @@ impl App {
             self.handle_models_command().await;
         } else if command == "/help" {
             self.show_help();
+        } else if command == "/clear" {
+            self.handle_clear_command();
         } else if command.starts_with("/checkpoint") {
             let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
             self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
@@ -801,6 +805,12 @@ impl App {
 
         let tool_name = parts[0];
         let args = if parts.len() > 1 { parts[1] } else { "" };
+
+        // Handle special "mem" tool for searching scrollback
+        if tool_name == "mem" {
+            self.handle_mem_command(args);
+            return;
+        }
 
         self.status_message = format!("⏳ Executing tool: {}", tool_name);
 
@@ -1015,6 +1025,57 @@ impl App {
             }
             Err(e) => {
                 self.status_message = format!("❌ Checkpoint failed: {}", e);
+            }
+        }
+    }
+
+    /// Handle /clear command to archive current messages to scrollback
+    fn handle_clear_command(&mut self) {
+        match self.message_buffer.archive_to_scrollback() {
+            Ok(count) => {
+                let summary = format!("🗑️  Archived {} messages to scrollback", count);
+                self.push_system_event(&summary);
+                self.status_message = summary;
+                self.cached_message_count = 0;
+            }
+            Err(e) => {
+                self.status_message = format!("❌ Clear failed: {}", e);
+            }
+        }
+    }
+
+    /// Handle /tool mem command to search scrollback memory
+    fn handle_mem_command(&mut self, query: &str) {
+        if query.is_empty() {
+            self.status_message = "❌ mem: search query required. Usage: /tool mem QUERY".to_string();
+            return;
+        }
+
+        match self.message_buffer.search_scrollback(query) {
+            Ok(results) => {
+                if results.is_empty() {
+                    self.status_message = format!("🔍 No scrollback results for '{}'", query);
+                    return;
+                }
+
+                let summary = format!("🔍 Found {} results in scrollback for '{}'", results.len(), query);
+                self.push_system_event(&summary);
+
+                // Add top results to conversation
+                let mut output = format!("Search results for '{}' in scrollback:\n\n", query);
+                for (msg, _archived_at) in results.iter().take(5) {
+                    output.push_str(&format!("{}: {}\n\n", msg.role.to_uppercase(), msg.content));
+                }
+
+                let mem_msg = Message::new("tool", output);
+                if let Err(e) = self.message_buffer.add_and_persist(mem_msg) {
+                    self.status_message = format!("❌ Failed to save search results: {}", e);
+                } else {
+                    self.status_message = format!("✅ mem: {} results found", results.len());
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("❌ mem search failed: {}", e);
             }
         }
     }
