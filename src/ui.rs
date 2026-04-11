@@ -8,7 +8,7 @@ use crate::steering::SteeringDirective;
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event, KeyCode, KeyEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -87,7 +87,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -95,7 +95,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -150,6 +150,8 @@ pub struct App {
     palette_open: bool,
     /// Which palette item is highlighted
     palette_selection: usize,
+    /// Scroll offset for message history
+    scroll_offset: u16,
 }
 
 impl App {
@@ -191,6 +193,7 @@ impl App {
             agents_task: agents_md,
             palette_open: false,
             palette_selection: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -217,15 +220,21 @@ impl App {
 
             terminal.draw(|f| self.draw(f))?;
 
-            // Fast poll when active (16ms for smooth token display), longer when idle
-            let poll_ms = if self.turn_phase == TurnPhase::Idle { 200 } else { 16 };
+            // Fast poll: 10ms when streaming (responsive to scroll), 200ms when idle
+            let poll_ms = if self.turn_phase == TurnPhase::Idle { 200 } else { 10 };
 
             if crossterm::event::poll(Duration::from_millis(poll_ms))? {
-                if let Event::Key(key) = event::read()? {
-                    self.handle_key(key).await;
-                    if !self.running {
-                        break;
+                match event::read()? {
+                    Event::Key(key) => {
+                        self.handle_key(key).await;
+                        if !self.running {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse_event) => {
+                        self.handle_mouse(mouse_event);
+                    }
+                    _ => {}
                 }
             } else if self.turn_phase == TurnPhase::Idle {
                 self.poll_for_updates();
@@ -480,6 +489,7 @@ impl App {
         // Render each message as its own Block with full-width background
         let mut exchange_idx: usize = 0;
         let mut current_y = messages_area.top();
+        let mut total_lines_skipped: u16 = 0;
         
         for msg in messages_list.iter() {
             let (emoji, fg_color, bg_tint, show_band) = match msg.role.as_str() {
@@ -506,7 +516,7 @@ impl App {
                 _ => ("💬", Color::Gray, None, false),
             };
 
-            let text_content = format!("{} {}", emoji, msg.content);
+            let text_content = format!("{} {}", emoji, self.format_message_content(&msg.content));
             let msg_para = Paragraph::new(text_content)
                 .wrap(ratatui::widgets::Wrap { trim: true });
 
@@ -522,6 +532,12 @@ impl App {
             
             if current_y >= messages_area.bottom() {
                 break; // No more space
+            }
+
+            // Apply scroll offset: skip messages that are above the scroll window
+            if total_lines_skipped + msg_height <= self.scroll_offset {
+                total_lines_skipped += msg_height;
+                continue;
             }
 
             let msg_area = Rect {
@@ -706,6 +722,19 @@ impl App {
         }
     }
 
+    /// Handle mouse events (scroll wheel)
+    fn handle_mouse(&mut self, mouse_event: crossterm::event::MouseEvent) {
+        match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            }
+            _ => {}
+        }
+    }
+
     /// Return palette commands matching the current query, scored by relevance
     fn palette_matches(&self) -> Vec<&'static PaletteCommand> {
         let query = self.input_buffer.trim_start_matches('/');
@@ -879,6 +908,7 @@ impl App {
             return;
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
+        self.scroll_offset = 0; // Reset scroll to bottom when new message is sent
 
         // Warn when context window is getting full (>70% threshold)
         let estimated_usage = (self.cached_message_count as f64 * 150.0 / 4096.0 * 100.0) as u32;
@@ -940,6 +970,49 @@ impl App {
                 self.cached_message_count = count;
             }
         }
+    }
+
+    /// Format message content with nice code block indentation
+    fn format_message_content(&self, content: &str) -> String {
+        let mut result = String::new();
+        let mut in_code_block = false;
+        let mut code_block_indent = String::new();
+
+        for line in content.lines() {
+            // Detect code block markers (```
+            if line.trim_start().starts_with("```") {
+                in_code_block = !in_code_block;
+                if in_code_block {
+                    // Start of code block: add visual marker and set indent
+                    result.push_str("┌─ code\n");
+                    code_block_indent = "│ ".to_string();
+                } else {
+                    // End of code block
+                    result.push_str("└─\n");
+                    code_block_indent.clear();
+                }
+                continue;
+            }
+
+            if in_code_block {
+                // Add code line with indentation and border
+                result.push_str(&code_block_indent);
+                result.push_str(line);
+            } else if line.starts_with("    ") || line.starts_with("\t") {
+                // Detect indented lines as code-like
+                result.push_str("  ");
+                result.push_str(line);
+            } else {
+                result.push_str(line);
+            }
+            result.push('\n');
+        }
+
+        // Trim trailing newline
+        if result.ends_with('\n') {
+            result.pop();
+        }
+        result
     }
 }
 
