@@ -81,13 +81,15 @@ impl Agent {
         self.registry.execute(&call.name, &call.args)
     }
 
-    /// Format system prompt with steering directive for tool use
+    /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering() -> String {
         let steering = SteeringDirective::custom(
-            "You are an agentic assistant with access to tools. When you need to execute tasks, \
-             use the [TOOL: name args] format to call tools. Available tools: rg (ripgrep), \
-             spawn (run binary), editfile (edit files), commit (git commit), \
-             python (run python scripts), ruste (compile and run rust). \
+            "You are an agentic assistant with access to tools and subagent spawning. \
+             When you need to execute tasks, use [TOOL: name args] format to call tools. \
+             Available tools: rg, spawn, editfile, commit, python, ruste.\n\
+             For divisible tasks, consider parallelization via [TOOL: spawn_agent task_id \"description\"].\
+             Examples: [TOOL: spawn_agent search \"find all .rs files\"] [TOOL: spawn_agent analyze \"compute metrics\"]\n\
+             Subagents run in parallel and report results. Combine results for final output.\
              Always respond with [TOOL: ...] calls when needed, followed by [DONE] when complete."
         );
         steering.format_for_system_prompt()

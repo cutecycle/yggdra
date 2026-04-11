@@ -6,6 +6,7 @@ mod session;
 mod steering;
 mod tools;
 mod agent;
+mod spawner;
 mod task;
 mod ui;
 

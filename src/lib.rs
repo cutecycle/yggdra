@@ -7,4 +7,5 @@ pub mod steering;
 pub mod ui;
 pub mod tools;
 pub mod agent;
+pub mod spawner;
 pub mod task;
