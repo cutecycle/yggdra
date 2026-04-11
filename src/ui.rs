@@ -785,7 +785,7 @@ impl App {
                 Style::default()
             };
 
-            rendered.push(RenderedMsg { text: text_content, style, height });
+            rendered.push(RenderedMsg { text: text_content, style, height: height + 1 });
         }
 
         // Add streaming text as a virtual message at the end
@@ -941,9 +941,15 @@ impl App {
         }
 
         // Status bar
+        let token_info = if self.total_tokens_used > 0 {
+            format!("🪙 {}tok", self.total_tokens_used)
+        } else {
+            "🪙 0".to_string()
+        };
         let status = format!(
-            "🔢 {} | 💬 {} | {}",
+            "🔢 {} | {} | 💬 {} | {}",
             &self.session.id[..8],
+            token_info,
             self.cached_message_count,
             self.status_message.lines().next().unwrap_or("")
         );

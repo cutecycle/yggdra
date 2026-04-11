@@ -18,6 +18,10 @@ use ui::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Become process group leader so all children die when we exit
+    #[cfg(unix)]
+    unsafe { libc::setpgid(0, 0); }
+
     let config = config::Config::load_with_smart_model().await;
     let session = Session::load_or_create()?;
 
@@ -39,7 +43,13 @@ async fn main() -> Result<()> {
     };
 
     let mut app = App::new(config, session, ollama_client, agents_md);
-    app.run().await?;
+    let result = app.run().await;
 
-    Ok(())
+    // Kill entire process group on exit (catches spawned subagents)
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(0, libc::SIGTERM);
+    }
+
+    result
 }
