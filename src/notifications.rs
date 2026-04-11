@@ -1,5 +1,5 @@
-/// Native OS notifications for Yggdra events
-/// Emits system notifications for key lifecycle events
+//! Native OS notifications for Yggdra events.
+//! Emits system notifications for key lifecycle events.
 
 use notify_rust::Notification;
 

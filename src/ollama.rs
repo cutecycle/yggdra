@@ -1,5 +1,5 @@
-/// Ollama client: interface to Ollama API for model inference
-/// Handles model discovery and message generation with steering directives
+//! Ollama client: interface to Ollama API for model inference.
+//! Handles model discovery and message generation with steering directives.
 
 use crate::message::Message;
 use anyhow::{anyhow, Result};
@@ -36,16 +36,16 @@ struct GenerateRequest {
 }
 
 /// Message format for Ollama API
-#[derive(Debug, Serialize, Deserialize)]
-struct OllamaMessage {
-    role: String,
-    content: String,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OllamaMessage {
+    pub role: String,
+    pub content: String,
 }
 
 /// Response from Ollama generate endpoint (non-streaming)
 #[derive(Debug, Deserialize)]
-struct GenerateResponse {
-    message: OllamaMessage,
+pub struct GenerateResponse {
+    pub message: OllamaMessage,
 }
 
 impl OllamaClient {
@@ -62,10 +62,23 @@ impl OllamaClient {
         };
 
         // Validate connection by listing models
-        let _ = ollama_client.list_models().await?;
-
-        eprintln!("✅ Ollama connection validated: {}", endpoint);
-        Ok(ollama_client)
+        match ollama_client.list_models().await {
+            Ok(_) => {
+                eprintln!("✅ Ollama connection validated: {}", endpoint);
+                Ok(ollama_client)
+            }
+            Err(e) => {
+                let friendly_msg = if e.to_string().contains("connection refused") {
+                    format!("Ollama is not running at {}", endpoint)
+                } else if e.to_string().contains("timeout") {
+                    format!("Ollama at {} is not responding", endpoint)
+                } else {
+                    e.to_string()
+                };
+                eprintln!("❌ Ollama connection failed: {}", friendly_msg);
+                Err(e)
+            }
+        }
     }
 
     /// Fetch list of available models from Ollama
@@ -111,7 +124,7 @@ impl OllamaClient {
         Ok(last_model.name.clone())
     }
 
-    /// Send a message to Ollama and get response
+    /// Send a message to Ollama and get response (using Message type)
     /// If steering is provided, it will be prepended to the system prompt
     pub async fn generate(
         &self,
@@ -122,13 +135,13 @@ impl OllamaClient {
         let mut ollama_messages = Vec::new();
 
         for (i, msg) in messages.iter().enumerate() {
-            let content = if i == 0 && steering.is_some() {
-                // Inject steering directive into first (system) message
-                format!(
-                    "{}\n{}",
-                    steering.unwrap(),
-                    msg.content
-                )
+            let content = if i == 0 {
+                if let Some(steer) = steering {
+                    // Inject steering directive into first (system) message
+                    format!("{}\n{}", steer, msg.content)
+                } else {
+                    msg.content.clone()
+                }
             } else {
                 msg.content.clone()
             };
@@ -140,11 +153,13 @@ impl OllamaClient {
         }
 
         // If no messages but steering exists, prepend a system message
-        if ollama_messages.is_empty() && steering.is_some() {
-            ollama_messages.push(OllamaMessage {
-                role: "system".to_string(),
-                content: steering.unwrap().to_string(),
-            });
+        if ollama_messages.is_empty() {
+            if let Some(steer) = steering {
+                ollama_messages.push(OllamaMessage {
+                    role: "system".to_string(),
+                    content: steer.to_string(),
+                });
+            }
         }
 
         let request = GenerateRequest {
@@ -183,6 +198,51 @@ impl OllamaClient {
             .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
 
         Ok(data.message.content)
+    }
+
+    /// Send messages directly to Ollama (raw OllamaMessage format)
+    /// Used by Agent for agentic loops
+    pub async fn generate_with_messages(
+        &self,
+        model: &str,
+        messages: Vec<OllamaMessage>,
+    ) -> Result<GenerateResponse> {
+        let request = GenerateRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+        };
+
+        let url = format!("{}/api/chat", self.endpoint);
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to send request to Ollama at {}: {}",
+                    self.endpoint,
+                    e
+                )
+            })?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Ollama returned error: {} - {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            ));
+        }
+
+        let data: GenerateResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
+
+        Ok(data)
     }
 }
 

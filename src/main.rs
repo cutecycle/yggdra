@@ -4,6 +4,8 @@ mod notifications;
 mod ollama;
 mod session;
 mod steering;
+mod tools;
+mod agent;
 mod ui;
 
 use anyhow::Result;

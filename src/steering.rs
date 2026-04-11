@@ -1,6 +1,6 @@
-/// Steering system for prompt injection control
-/// Constructs steering directives that can be injected into LLM prompts
-/// to constrain model behavior and prevent prompt injection attacks
+//! Steering system for prompt injection control.
+//! Constructs steering directives that can be injected into LLM prompts
+//! to constrain model behavior and prevent prompt injection attacks.
 
 pub struct SteeringDirective {
     pub constraint: String,

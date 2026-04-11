@@ -5,3 +5,5 @@ pub mod ollama;
 pub mod session;
 pub mod steering;
 pub mod ui;
+pub mod tools;
+pub mod agent;
