@@ -1171,11 +1171,15 @@ impl App {
             f.render_widget(list, inner[1]);
         }
 
-        // Status bar
-        let token_info = if self.total_tokens_used > 0 {
-            format!("🪙 {}", self.total_tokens_used)
+        // Status bar — show current prompt tokens / context window size
+        let ctx_window = self.config.context_window.unwrap_or(4096);
+        let (prompt_tok, _) = self.last_token_counts;
+        let token_info = if prompt_tok > 0 {
+            format!("🪙 {}/{}", prompt_tok, ctx_window)
+        } else if self.total_tokens_used > 0 {
+            format!("🪙 ~{}/{}", self.total_tokens_used, ctx_window)
         } else {
-            "🪙 0".to_string()
+            format!("🪙 0/{}", ctx_window)
         };
         let status = format!(
             "🔢 {} | {} | 💬 {} | {}",
