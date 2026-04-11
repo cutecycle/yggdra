@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub struct Session {
     pub id: String,
     pub messages_db: PathBuf,
+    pub tasks_db: PathBuf,
 }
 
 impl Session {
@@ -40,6 +41,7 @@ impl Session {
                     return Ok(Session {
                         id: session_id,
                         messages_db: session_dir.join("messages.db"),
+                        tasks_db: session_dir.join("tasks.db"),
                     });
                 }
             }
@@ -50,9 +52,11 @@ impl Session {
         let session_dir = Self::session_dir(&session_id)?;
         fs::create_dir_all(&session_dir)?;
 
-        // Create SQLite database for messages
+        // Create SQLite databases for messages and tasks
         let messages_db = session_dir.join("messages.db");
+        let tasks_db = session_dir.join("tasks.db");
         crate::message::MessageBuffer::new(&messages_db)?;
+        crate::task::TaskManager::new(&tasks_db)?;
 
         // Write marker
         fs::write(&marker, &session_id)?;
@@ -62,6 +66,7 @@ impl Session {
         Ok(Session {
             id: session_id,
             messages_db,
+            tasks_db,
         })
     }
 }

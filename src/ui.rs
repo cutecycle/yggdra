@@ -8,7 +8,7 @@ use crate::steering::SteeringDirective;
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
+    event::{self, Event, KeyCode, KeyEvent, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -43,6 +43,7 @@ struct PaletteCommand {
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
+    PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
     PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
@@ -150,8 +151,6 @@ pub struct App {
     palette_open: bool,
     /// Which palette item is highlighted
     palette_selection: usize,
-    /// Scroll offset for message history
-    scroll_offset: u16,
 }
 
 impl App {
@@ -193,7 +192,6 @@ impl App {
             agents_task: agents_md,
             palette_open: false,
             palette_selection: 0,
-            scroll_offset: 0,
         }
     }
 
@@ -230,9 +228,6 @@ impl App {
                         if !self.running {
                             break;
                         }
-                    }
-                    Event::Mouse(mouse_event) => {
-                        self.handle_mouse(mouse_event);
                     }
                     _ => {}
                 }
@@ -489,7 +484,6 @@ impl App {
         // Render each message as its own Block with full-width background
         let mut exchange_idx: usize = 0;
         let mut current_y = messages_area.top();
-        let mut total_lines_skipped: u16 = 0;
         
         for msg in messages_list.iter() {
             let (emoji, _fg_color, bg_tint, show_band) = match msg.role.as_str() {
@@ -526,18 +520,12 @@ impl App {
                 msg_para
             };
 
-            // Estimate height (simple: count newlines + 1, capped by area)
-            let estimated_lines = (msg.content.lines().count() + 1).min(messages_area.height as usize);
-            let msg_height = (estimated_lines as u16).min(messages_area.bottom() - current_y);
+            // Estimate height: count newlines, assume ~60% fill width due to wrapping
+            let estimated_lines = (msg.content.len() / 50).max(msg.content.lines().count());
+            let msg_height = (estimated_lines as u16).min(messages_area.bottom().saturating_sub(current_y));
             
             if current_y >= messages_area.bottom() {
                 break; // No more space
-            }
-
-            // Apply scroll offset: skip messages that are above the scroll window
-            if total_lines_skipped + msg_height <= self.scroll_offset {
-                total_lines_skipped += msg_height;
-                continue;
             }
 
             let msg_area = Rect {
@@ -722,19 +710,6 @@ impl App {
         }
     }
 
-    /// Handle mouse events (scroll wheel)
-    fn handle_mouse(&mut self, mouse_event: crossterm::event::MouseEvent) {
-        match mouse_event.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
-            }
-            _ => {}
-        }
-    }
-
     /// Return palette commands matching the current query, scored by relevance
     fn palette_matches(&self) -> Vec<&'static PaletteCommand> {
         let query = self.input_buffer.trim_start_matches('/');
@@ -908,7 +883,6 @@ impl App {
             return;
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
-        self.scroll_offset = 0; // Reset scroll to bottom when new message is sent
 
         // Warn when context window is getting full (>70% threshold)
         let estimated_usage = (self.cached_message_count as f64 * 150.0 / 4096.0 * 100.0) as u32;
