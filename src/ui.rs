@@ -1,6 +1,6 @@
 /// TUI module: minimal terminal UI with streaming responses, tool execution, and multi-window sync
 use crate::agent;
-use crate::config::Config;
+use crate::config::{Config, AppMode};
 use crate::message::{Message, MessageBuffer};
 use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
@@ -54,9 +54,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
     PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
-    PaletteCommand { name: "plan",   description: "Switch to Plan mode (reflective)",   keywords: "interactive manual control plan",   fill: "/plan" },
-    PaletteCommand { name: "build",  description: "Switch to Build mode (autonomous)",  keywords: "build auto run execute work",       fill: "/build" },
-    PaletteCommand { name: "ask",    description: "Switch to Ask-only mode (read-only)", keywords: "ask only read no modify block",   fill: "/ask" },
+    PaletteCommand { name: "mode",  description: "Cycle or set mode (ask/plan/build)", keywords: "mode switch cycle toggle ask plan build", fill: "/mode " },
     PaletteCommand { name: "copycode",  description: "Copy code block from last reply",   keywords: "copy code block clipboard snippet", fill: "/copycode" },
     PaletteCommand { name: "copytext",  description: "Copy full last reply as plain text", keywords: "copy text clipboard message",      fill: "/copytext" },
     PaletteCommand { name: "copylink",  description: "Copy URL from last reply",           keywords: "copy link url clipboard",          fill: "/copylink" },
@@ -129,14 +127,6 @@ struct ToolResult {
     tool_name: String,
     _args: String,
     output: std::result::Result<String, String>,
-}
-
-/// Application mode: autonomous execution vs interactive planning
-#[derive(Debug, Clone, PartialEq)]
-enum AppMode {
-    Build,
-    Plan,
-    AskOnly,
 }
 
 /// Minimal TUI application
@@ -242,6 +232,8 @@ impl App {
             .join("log");
         let log_sender = Some(crate::msglog::start(log_dir.clone()));
 
+        let initial_mode = config.mode;
+
         Self {
             config,
             session,
@@ -261,7 +253,7 @@ impl App {
             gap_rx: None,
             log_sender,
             log_dir,
-            mode: AppMode::Build,
+            mode: initial_mode,
             agents_context: agents_md,
             subagent_result_rx: None,
             subagent_count: 0,
@@ -547,7 +539,7 @@ impl App {
     /// Spawn tool execution off the UI thread
     fn execute_tool_async(&mut self, tool_name: String, args: String) {
         // Block modifying tools in Ask-only mode
-        if self.mode == AppMode::AskOnly {
+        if self.mode == AppMode::Ask {
             match tool_name.as_str() {
                 "editfile" | "commit" | "python" | "ruste" => {
                     self.push_system_event(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
@@ -669,7 +661,7 @@ impl App {
                 self.tool_result_rx = None;
 
                 // In Ask-only mode, detect and revert any file changes
-                if self.mode == AppMode::AskOnly {
+                if self.mode == AppMode::Ask {
                     if let Ok(output) = std::process::Command::new("git")
                         .args(&["diff", "--name-only"])
                         .current_dir(".")
@@ -946,7 +938,7 @@ impl App {
         let (mode_label, mode_color) = match self.mode {
             AppMode::Build => ("⚡ BUILD", self.theme.violet),
             AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
-            AppMode::AskOnly => ("🔍 ASK", Color::Yellow),
+            AppMode::Ask => ("🔍 ASK", Color::Yellow),
         };
 
         // Token usage indicator — real counts when available, estimate otherwise
@@ -1152,25 +1144,37 @@ impl App {
             self.input_buffer.clone()
         };
 
+        let (mode_badge, mode_border_color) = match self.mode {
+            AppMode::Build => (" ⚡BUILD ", self.theme.violet),
+            AppMode::Plan  => (" 🧠PLAN ",  self.theme.accent),
+            AppMode::Ask => (" 🔍ASK ", Color::Yellow),
+        };
+
         let input = Paragraph::new(format!("> {}", input_text))
-            .block(Block::default().title(" 🌱 Input ").borders(Borders::ALL));
+            .block(Block::default()
+                .title(format!(" 🌱 Input {}", mode_badge))
+                .border_style(Style::default().fg(mode_border_color))
+                .borders(Borders::ALL));
         f.render_widget(input, chunks[2]);
 
         // Command palette overlay (above input box)
         if self.palette_open {
             let matches = self.palette_matches();
             if !matches.is_empty() {
-                let palette_height = (matches.len().min(8) + 2) as u16;
                 let area = chunks[2];
-                // Float palette just above the input box
+                let max_palette_rows = area.y.saturating_sub(chunks[0].height);
+                let visible_items = matches.len().min(8).min(max_palette_rows.saturating_sub(2) as usize);
+                let palette_height = (visible_items + 2) as u16;
+                // Float palette just above the input box, full width
                 let palette_rect = Rect {
                     x: area.x,
                     y: area.y.saturating_sub(palette_height),
-                    width: area.width.min(60),
+                    width: area.width,
                     height: palette_height,
                 };
                 let items: Vec<ListItem> = matches
                     .iter()
+                    .take(visible_items)
                     .enumerate()
                     .map(|(i, cmd)| {
                         let line = Line::from(vec![
@@ -1195,7 +1199,7 @@ impl App {
                     })
                     .collect();
                 let palette = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" 🌼 Commands "));
+                    .block(Block::default().borders(Borders::ALL).title(" Commands "));
                 f.render_widget(Clear, palette_rect);
                 f.render_widget(palette, palette_rect);
             }
@@ -1535,23 +1539,43 @@ impl App {
             }
         } else if command == "/build" {
             self.mode = AppMode::Build;
+            self.config.mode = self.mode;
+            let _ = self.config.save();
             self.notify("⚡ Switched to Build mode — autonomous execution");
         } else if command == "/plan" {
             self.mode = AppMode::Plan;
+            self.config.mode = self.mode;
+            let _ = self.config.save();
             self.notify("🧠 Switched to Plan mode — reflective & interactive");
         } else if command == "/ask" {
-            self.mode = AppMode::AskOnly;
+            self.mode = AppMode::Ask;
+            self.config.mode = self.mode;
+            let _ = self.config.save();
             self.notify("🔍 Switched to Ask-only mode — read-only, no modifications");
-        } else if command == "/mode" {
-            self.mode = match self.mode {
-                AppMode::Build => AppMode::Plan,
-                AppMode::Plan => AppMode::AskOnly,
-                AppMode::AskOnly => AppMode::Build,
-            };
+        } else if command == "/mode" || command.starts_with("/mode ") {
+            if let Some(arg) = command.strip_prefix("/mode ").map(|s| s.trim()) {
+                match arg {
+                    "ask" => self.mode = AppMode::Ask,
+                    "plan" => self.mode = AppMode::Plan,
+                    "build" => self.mode = AppMode::Build,
+                    _ => {
+                        self.notify(format!("Unknown mode '{}' — use ask, plan, or build", arg));
+                        return;
+                    }
+                }
+            } else {
+                self.mode = match self.mode {
+                    AppMode::Build => AppMode::Plan,
+                    AppMode::Plan => AppMode::Ask,
+                    AppMode::Ask => AppMode::Build,
+                };
+            }
+            self.config.mode = self.mode;
+            let _ = self.config.save();
             let label = match self.mode {
                 AppMode::Build => "⚡ Build",
                 AppMode::Plan => "🧠 Plan",
-                AppMode::AskOnly => "🔍 Ask",
+                AppMode::Ask => "🔍 Ask",
             };
             self.notify(format!("Switched to {} mode", label));
         } else if command.starts_with("/ctx ") {
@@ -1634,7 +1658,7 @@ impl App {
         let args = if parts.len() > 1 { parts[1] } else { "" };
 
         // Block modifying tools in Ask-only mode
-        if self.mode == AppMode::AskOnly {
+        if self.mode == AppMode::Ask {
             match tool_name {
                 "editfile" | "commit" | "python" | "ruste" => {
                     self.notify(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));

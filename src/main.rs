@@ -113,13 +113,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mut app = App::new(config.clone(), session, ollama_client, agents_md);
+    let mut app = App::new(config, session, ollama_client, agents_md);
     let result = app.run().await;
-    
-    // Save config with current mode on exit (mode may have changed)
-    if let Err(e) = config.save() {
-        eprintln!("⚠️  Failed to save config: {}", e);
-    }
 
     // Kill entire process group on exit (catches spawned subagents)
     #[cfg(unix)]
