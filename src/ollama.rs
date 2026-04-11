@@ -52,7 +52,8 @@ impl OllamaClient {
     /// Create a new Ollama client and validate connection
     pub async fn new(endpoint: &str, model: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(300))
             .build()?;
 
         let ollama_client = Self {
