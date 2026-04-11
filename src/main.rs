@@ -34,6 +34,27 @@ async fn main() -> Result<()> {
             .output();
     }
 
+    // Terraform: if there are no commits yet, snapshot the current state.
+    // This gives the user a safe baseline to revert to before the agent begins.
+    let has_commits = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !has_commits {
+        eprintln!("🌱 No commits yet — creating initial snapshot");
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&cwd)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "chore: initial snapshot (pre-agent baseline)"])
+            .current_dir(&cwd)
+            .output();
+    }
+
     let config = config::Config::load_with_smart_model().await;
     let session = Session::load_or_create()?;
 
