@@ -649,7 +649,55 @@ impl App {
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
 
-    /// Push a system-level notice into the conversation (compaction, warnings, etc.)
+    /// Autocompact: drop oldest messages (keep last 20 conversational turns)
+    /// to bring context back under threshold. Archived to scrollback, not deleted.
+    fn run_autocompact(&mut self) {
+        let all = match self.message_buffer.messages() {
+            Ok(msgs) => msgs,
+            Err(_) => return,
+        };
+
+        let keep_tail = 20usize;
+        let conversation_count = all.iter()
+            .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
+            .count();
+
+        if conversation_count <= keep_tail {
+            return; // Not enough to compact
+        }
+
+        let drop_conversational = conversation_count - keep_tail;
+        let mut dropped = 0usize;
+        let kept: Vec<crate::message::Message> = all.into_iter()
+            .filter(|m| {
+                if matches!(m.role.as_str(), "user" | "assistant") && dropped < drop_conversational {
+                    dropped += 1;
+                    false // drop oldest
+                } else {
+                    true  // keep
+                }
+            })
+            .collect();
+
+        // Archive everything, then re-insert the kept messages
+        if let Err(e) = self.message_buffer.archive_to_scrollback() {
+            eprintln!("Autocompact archive failed: {}", e);
+            return;
+        }
+        if let Err(e) = self.message_buffer.add_multiple(&kept) {
+            eprintln!("Autocompact re-insert failed: {}", e);
+            return;
+        }
+
+        self.last_token_counts = (0, 0);
+        self.cached_message_count = self.message_buffer.count().unwrap_or(0);
+        self.push_system_event(format!(
+            "🌿 Autocompacted: archived {} old messages to scrollback",
+            dropped
+        ));
+    }
+
+
     fn push_system_event(&mut self, text: impl Into<String>) {
         let msg = Message::new("system", text);
         self.persist_message(msg);
@@ -1271,14 +1319,23 @@ impl App {
 
     /// Handle /models command — fetch model list and open interactive picker
     async fn handle_models_command(&mut self) {
-        // Re-read config.toml so a changed endpoint is picked up without restart
+        // Always re-read config.toml to pick up endpoint changes without restart
         let fresh_config = crate::config::Config::load();
-        if fresh_config.endpoint != self.config.endpoint {
-            self.config.endpoint = fresh_config.endpoint.clone();
-            match OllamaClient::new(&fresh_config.endpoint, &self.config.model).await {
-                Ok(client) => { self.ollama_client = Some(client); }
+        let target_endpoint = fresh_config.endpoint.clone();
+
+        // Reconnect if endpoint changed or client is missing
+        let needs_reconnect = self.ollama_client.is_none()
+            || self.ollama_client.as_ref().map(|c| c.endpoint()) != Some(&target_endpoint);
+
+        if needs_reconnect {
+            self.status_message = format!("🔌 Connecting to {}…", target_endpoint);
+            match OllamaClient::new(&target_endpoint, &self.config.model).await {
+                Ok(client) => {
+                    self.config.endpoint = target_endpoint.clone();
+                    self.ollama_client = Some(client);
+                }
                 Err(e) => {
-                    self.push_system_event(format!("❌ Failed to connect to {}: {}", fresh_config.endpoint, e));
+                    self.push_system_event(format!("❌ Failed to connect to {}: {}", target_endpoint, e));
                     return;
                 }
             }
@@ -1350,8 +1407,8 @@ impl App {
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
 
-        // Warn when context window is getting full (>70% threshold)
-        let context_window = self.config.context_window.unwrap_or(4096) as f64;
+        // Autocompact when context window is getting full (>70% threshold)
+        let context_window = self.config.context_window.unwrap_or(8192) as f64;
         let (prompt_tok, _) = self.last_token_counts;
         let usage_pct = if prompt_tok > 0 {
             (prompt_tok as f64 / context_window * 100.0) as u32
@@ -1359,7 +1416,7 @@ impl App {
             (self.cached_message_count as f64 * 150.0 / context_window * 100.0) as u32
         };
         if usage_pct >= 70 {
-            self.push_system_event(format!("⚠️ Context ~{}% full — autocompact may trigger soon", usage_pct));
+            self.run_autocompact();
         }
 
         if self.ollama_client.is_none() {
