@@ -446,7 +446,7 @@ impl App {
         }
 
         let output = Paragraph::new(messages_text)
-            .block(Block::default().title(" 🌸 Conversation ").borders(Borders::ALL))
+            .block(Block::default().title(" 🌸 Conversation "))
             .wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(output, chunks[1]);
 

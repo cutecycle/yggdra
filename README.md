@@ -1,6 +1,6 @@
 # Yggdra: Airgapped Agentic TUI
 
-**Yggdra** is a minimal, airgapped TUI (terminal user interface) for local language model inference with integrated tool execution. Designed for secure, offline environments with zero internet connectivity.
+**Yggdra** is a minimal, airgapped TUI (terminal user interface) for local language model inference with integrated tool execution. Designed for secure, offline environments with zero internet connectivity—while supporting local or tailnet Ollama endpoints.
 
 ## ✨ Features
 
@@ -245,10 +245,11 @@ Both instances poll the SQLite DB every 500ms, showing real-time updates.
 
 ### Airgapped Design
 
-- ✅ No outbound network calls
-- ✅ No telemetry or tracking
-- ✅ No API keys required
-- ✅ All data stays on your machine
+- ✅ **No public internet**: All inference stays on local machine or tailnet
+- ✅ **No telemetry or tracking**: Your data never leaves your device
+- ✅ **No API keys required**: Works entirely with local models
+- ✅ **All data stays local**: Conversation history in `~/.yggdra/` on your machine
+- ⚡ **Tailnet support**: Optional `OLLAMA_ENDPOINT` for private Ollama instances on your tailnet
 
 ### Input Validation
 
