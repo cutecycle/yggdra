@@ -440,6 +440,9 @@ impl App {
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
 
+        // Save as todo in plan mode
+        self.save_plan_as_todo(&response_text);
+
         // Fire-and-forget gap reflection: ask the model what it wished it knew
         if let Some(client) = self.ollama_client.clone() {
             let model = self.config.model.clone();
@@ -1600,7 +1603,7 @@ impl App {
         self.status_message = format!(
             "{}{}",
             metrics_display,
-            "\nUse /estimate more to ask agent for completion prediction."
+            "\n\nPlan mode auto-saves all plans as .yggdra/todo items for discovery."
         );
     }
 
@@ -1788,6 +1791,56 @@ impl App {
             }
         }
         urls
+    }
+
+    /// Save assistant response as todo item in plan mode
+    fn save_plan_as_todo(&mut self, message: &str) {
+        if self.mode != AppMode::Plan {
+            return; // Only save in plan mode
+        }
+
+        // Generate a filename from the first line of the message
+        let first_line = message.lines().next().unwrap_or("plan");
+        let sanitized = first_line
+            .chars()
+            .take(50)
+            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { ' ' })
+            .collect::<String>()
+            .trim()
+            .replace(' ', "-")
+            .to_lowercase();
+        
+        if sanitized.is_empty() {
+            return;
+        }
+
+        let filename = format!("{}.md", sanitized);
+        let todo_path = std::env::current_dir()
+            .ok()
+            .map(|p| p.join(".yggdra").join("todo").join(&filename));
+
+        if let Some(path) = todo_path {
+            // Create .yggdra/todo if needed
+            if let Ok(cwd) = std::env::current_dir() {
+                let _ = std::fs::create_dir_all(cwd.join(".yggdra").join("todo"));
+            }
+
+            // Format as todo markdown
+            let todo_content = format!(
+                "# {}\n\n**Status:** pending\n**Priority:** medium\n\n## Plan\n\n{}\n",
+                first_line,
+                message
+            );
+
+            match std::fs::write(&path, todo_content) {
+                Ok(_) => {
+                    self.notify(format!("📝 Plan saved as todo: {}", filename));
+                }
+                Err(e) => {
+                    self.notify(format!("❌ Failed to save plan: {}", e));
+                }
+            }
+        }
     }
 
     /// Get the text of the last assistant message
