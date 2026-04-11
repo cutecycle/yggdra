@@ -6,6 +6,7 @@ mod session;
 mod steering;
 mod tools;
 mod agent;
+mod task;
 mod ui;
 
 use anyhow::Result;
