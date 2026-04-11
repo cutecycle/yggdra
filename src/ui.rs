@@ -726,12 +726,22 @@ impl App {
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         let mut base = format!(
             "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
-             Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], [TOOL: spawn BINARY ARGS], \
-             [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], [TOOL: ruste FILE].\n\
-             Examples: [TOOL: spawn ls -la .] or [TOOL: rg TODO src/] or [TOOL: editfile Cargo.toml].\n\
-             Use tools proactively. Do not say you cannot access files—use [TOOL: spawn ls] instead. Be concise.\n\
-             Say [DONE] when a task is complete — this notifies the user as a milestone. \
-             After [DONE], immediately find and begin the next task: improve, refactor, document, explore. \
+             You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
+             AVAILABLE TOOLS:\n\
+             • [TOOL: rg PATTERN PATH] — ripgrep search: find patterns in files/dirs\n\
+             • [TOOL: editfile PATH] — read files (or create if missing)\n\
+             • [TOOL: spawn BINARY ARGS] — execute commands: ls, git, cargo, python, etc.\n\
+             • [TOOL: commit MSG] — git commit changes\n\
+             • [TOOL: python SCRIPT ARGS] — run Python code\n\
+             • [TOOL: ruste FILE] — compile & execute Rust code\n\
+             TOOL EXAMPLES:\n\
+             [TOOL: rg TODO src/] — find TODO comments\n\
+             [TOOL: editfile Cargo.toml] — read or update manifest\n\
+             [TOOL: spawn ls -la] — list current directory\n\
+             Never say \"I cannot access files.\" Use [TOOL: rg] or [TOOL: spawn] instead.\n\
+             Use tools proactively to explore, analyze, and implement. Be concise.\n\
+             Say [DONE] when a task is complete — this notifies the user as a milestone.\n\
+             After [DONE], immediately find and begin the next task: improve, refactor, document, explore.\n\
              Work is continuous; [DONE] is a checkpoint, not a stop."
         );
         if let Some(ctx) = &self.agents_context {
