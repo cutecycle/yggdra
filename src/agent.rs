@@ -252,9 +252,8 @@ mod tests {
     #[test]
     fn test_system_prompt_has_steering() {
         let prompt = Agent::system_prompt_with_steering();
-        assert!(prompt.contains("[STEERING:"));
-        assert!(prompt.contains("[END_STEERING]"));
-        assert!(prompt.contains("tools"));
+        // Should contain tool instructions without wrapper tags
+        assert!(prompt.contains("tools") || prompt.contains("Tools") || prompt.contains("TOOL"));
     }
 
     #[test]

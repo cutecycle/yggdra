@@ -38,10 +38,7 @@ impl SteeringDirective {
 
     /// Format the directive as a system message injection
     pub fn format_for_system_prompt(&self) -> String {
-        format!(
-            "[STEERING: {}] [END_STEERING]",
-            self.constraint
-        )
+        self.constraint.clone()
     }
 
     /// Format directive with tool output context
@@ -63,8 +60,7 @@ mod tests {
         let dir = SteeringDirective::json_output();
         let formatted = dir.format_for_system_prompt();
         assert!(formatted.contains("Always respond in valid JSON format only"));
-        assert!(formatted.contains("[STEERING:"));
-        assert!(formatted.contains("[END_STEERING]"));
+        // No wrapper tags — format_for_system_prompt returns the constraint directly
     }
 
     #[test]

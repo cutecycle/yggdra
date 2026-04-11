@@ -151,6 +151,10 @@ impl OllamaClient {
         }
 
         for msg in messages {
+            // Skip "system" role messages — those are UI-only events (context warnings,
+            // offline notices etc.) and must not be forwarded to the model.
+            // The actual system prompt comes from the `steering` parameter above.
+            if msg.role == "system" { continue; }
             let role = if msg.role == "tool" { "user" } else { &msg.role };
             ollama_messages.push(OllamaMessage {
                 role: role.to_string(),
