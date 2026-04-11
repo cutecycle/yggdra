@@ -1,5 +1,6 @@
 /// Integration test for core infrastructure
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn test_session_files_created() {
@@ -138,4 +139,41 @@ fn test_context_usage_calculation() {
     let critical_usage = (critical_total as f32 / context_limit as f32) * 100.0;
     let critical_compression_needed = critical_usage > 70.0;
     assert!(critical_compression_needed, "Should need compression at {:.1}% usage", critical_usage);
+}
+
+#[test]
+fn test_directory_session_id_file() {
+    // Test that .yggdra_session_id file can be created and read
+    let temp_dir = std::env::temp_dir().join("yggdra_test_session");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp test dir");
+
+    let session_file = temp_dir.join(".yggdra_session_id");
+    let test_session_id = "550e8400-e29b-41d4-a716-446655440000";
+
+    // Write session ID
+    fs::write(&session_file, test_session_id).expect("Failed to write session ID");
+
+    // Read it back
+    let read_id = fs::read_to_string(&session_file).expect("Failed to read session ID");
+    assert_eq!(read_id.trim(), test_session_id);
+
+    // Verify file exists
+    assert!(session_file.exists());
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[test]
+fn test_gitignore_includes_session_id() {
+    // Verify .yggdra_session_id is in .gitignore
+    let gitignore_path = PathBuf::from("./src/../.gitignore");
+    let content = fs::read_to_string(&gitignore_path)
+        .expect("Failed to read .gitignore");
+    
+    assert!(
+        content.contains(".yggdra_session_id"),
+        ".gitignore should contain .yggdra_session_id entry"
+    );
 }

@@ -48,9 +48,15 @@ impl SessionManager {
         Ok(home.join(".yggdra"))
     }
 
-    /// Get current session ID file path
+    /// Get current session ID file path (global)
     fn current_session_file() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("current_session_id"))
+    }
+
+    /// Get per-directory session ID file path
+    fn directory_session_file() -> Result<PathBuf> {
+        let cwd = std::env::current_dir()?;
+        Ok(cwd.join(".yggdra_session_id"))
     }
 
     /// Create a new session
@@ -104,7 +110,41 @@ impl SessionManager {
         Ok(metadata)
     }
 
-    /// Load the last active session, or create one if none exists
+    /// Load the per-directory session, or create one if none exists
+    /// This checks for .yggdra_session_id in the current working directory first
+    pub fn load_or_create_per_directory() -> Result<SessionMetadata> {
+        // First, try to load from directory-local session ID file
+        match Self::directory_session_file() {
+            Ok(dir_session_file) => {
+                if dir_session_file.exists() {
+                    if let Ok(session_id) = std::fs::read_to_string(&dir_session_file) {
+                        let session_id = session_id.trim();
+                        if !session_id.is_empty() {
+                            if let Ok(metadata) = Self::load_session(session_id) {
+                                eprintln!("📂 Loaded session from .yggdra_session_id: {}", session_id);
+                                return Ok(metadata);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+
+        // Create new session if none exists in this directory
+        let metadata = Self::create_session(SessionMode::Plan)?;
+
+        // Write session ID to directory-local file
+        if let Ok(dir_session_file) = Self::directory_session_file() {
+            let _ = std::fs::write(&dir_session_file, &metadata.id);
+            eprintln!("📂 Created new session for this directory: {}", metadata.id);
+        }
+
+        Ok(metadata)
+    }
+
+    /// Load the last active session (global), or create one if none exists
+    /// This is used when no per-directory session exists
     pub fn load_or_create_last() -> Result<SessionMetadata> {
         match Self::current_session_file() {
             Ok(current_file) => {

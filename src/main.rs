@@ -7,17 +7,22 @@ use anyhow::Result;
 use config::ConfigManager;
 use message::Message;
 use message::MessageBuffer;
-use session::{SessionManager, SessionMode};
+use session::SessionManager;
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
     let config = ConfigManager::load()?;
 
-    // Load or create session
-    let session = SessionManager::load_or_create_last()?;
+    // Load or create per-directory session
+    let session = SessionManager::load_or_create_per_directory()?;
     eprintln!("📋 Session: {}", session.id);
     eprintln!("🎯 Mode: {}", session.mode);
+    
+    // Display current working directory
+    let cwd = std::env::current_dir()?;
+    eprintln!("📁 Working directory: {}", cwd.display());
 
     // Load existing messages
     let messages_json = SessionManager::read_messages(&session.id)?;
