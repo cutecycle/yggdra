@@ -9,7 +9,7 @@ use crate::task::{TaskManager, Checkpoint};
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, EnableMouseCapture, DisableMouseCapture},
+    event::{self, Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -169,6 +169,12 @@ pub struct App {
     last_token_counts: (u32, u32),
     /// Running total of tokens used this session
     total_tokens_used: u32,
+    /// Scroll offset from bottom (0 = pinned to latest, >0 = scrolled up)
+    scroll_offset: u16,
+    /// Whether the user has manually scrolled up (suppresses auto-pin)
+    user_scrolled: bool,
+    /// Last time a 🕐 clock event was inserted (for 5-min interval markers)
+    last_clock: std::time::Instant,
     /// Whether the command palette is open
     palette_open: bool,
     /// Which palette item is highlighted
@@ -234,6 +240,9 @@ impl App {
             active_subagents: 0,
             last_token_counts: (0, 0),
             total_tokens_used: 0,
+            scroll_offset: 0,
+            user_scrolled: false,
+            last_clock: std::time::Instant::now(),
             palette_open: false,
             palette_selection: 0,
         }
@@ -284,6 +293,9 @@ impl App {
                             break;
                         }
                     }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
+                    }
                     _ => {}
                 }
             } else if self.turn_phase == TurnPhase::Idle {
@@ -305,6 +317,9 @@ impl App {
             match rx.try_recv() {
                 Ok(StreamEvent::Token(token)) => {
                     self.streaming_text.push_str(&token);
+                    if !self.user_scrolled {
+                        self.scroll_offset = 0;
+                    }
                 }
                 Ok(StreamEvent::Done(prompt_tokens, gen_tokens)) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
@@ -633,10 +648,26 @@ impl App {
             .map(|v| v.len()).unwrap_or(0);
     }
 
-    /// Persist a message to SQLite and asynchronously write it to .yggdra/log
+    /// Persist a message to SQLite and asynchronously write it to .yggdra/log.
+    /// Inserts a 🕐 clock marker if 5+ minutes have passed since the last one.
     fn persist_message(&mut self, msg: Message) -> bool {
+        // Insert clock marker every 5 minutes
+        if self.last_clock.elapsed() >= std::time::Duration::from_secs(300) {
+            let timestamp = chrono::Local::now().format("%H:%M").to_string();
+            let clock_msg = Message::new("clock", format!("🕐 {}", timestamp));
+            if let Some(sender) = &self.log_sender as &Option<crate::msglog::LogSender> {
+                sender.log(&clock_msg);
+            }
+            let _ = self.message_buffer.add_and_persist(clock_msg);
+            self.last_clock = std::time::Instant::now();
+        }
+
         if let Some(sender) = &self.log_sender as &Option<crate::msglog::LogSender> {
             sender.log(&msg);
+        }
+        // Auto-pin to bottom when new content arrives
+        if !self.user_scrolled {
+            self.scroll_offset = 0;
         }
         self.message_buffer.add_and_persist(msg).is_ok()
     }
@@ -687,25 +718,33 @@ impl App {
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
         f.render_widget(header, chunks[0]);
 
-        // Messages area with full-width colored bands
+        // Messages area with full-width colored bands — bottom-anchored with scroll
         let messages_area = chunks[1];
+        let viewport_height = messages_area.height as i32;
+        let area_width = messages_area.width;
         let messages_list = self
             .message_buffer
             .messages()
             .unwrap_or_default();
 
-        // Render each message as its own Block with full-width background
+        // Pre-compute each message's formatted text, style, and estimated height
+        struct RenderedMsg {
+            text: String,
+            style: Style,
+            height: u16,
+        }
+
+        let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(messages_list.len() + 1);
         let mut exchange_idx: usize = 0;
-        let mut current_y = messages_area.top();
-        
+
         for msg in messages_list.iter() {
             let (emoji, _fg_color, bg_tint, show_band) = match msg.role.as_str() {
                 "user" => {
                     exchange_idx += 1;
                     let tint = if exchange_idx % 2 == 0 {
-                        Color::Rgb(30, 30, 45)   // dark blue
+                        Color::Rgb(30, 30, 45)
                     } else {
-                        Color::Rgb(20, 35, 20)   // dark green
+                        Color::Rgb(20, 35, 20)
                     };
                     ("👤", Color::Cyan, Some(tint), true)
                 }
@@ -720,6 +759,7 @@ impl App {
                 }
                 "tool" => ("🔧", Color::Green, None, false),
                 "system" => ("⚙️", Color::Rgb(180, 120, 0), None, false),
+                "clock" => ("🕐", Color::Rgb(120, 120, 120), None, false),
                 "spawn" => ("🤖", Color::White, Some(Color::Rgb(20, 40, 55)), true),
                 _ => ("💬", Color::Gray, None, false),
             };
@@ -729,36 +769,27 @@ impl App {
             } else {
                 format!("{} {}", emoji, self.format_message_content(&msg.content))
             };
-            let msg_para = Paragraph::new(text_content)
-                .wrap(ratatui::widgets::Wrap { trim: true });
 
-            let msg_para = if show_band {
-                msg_para.style(Style::default().fg(Color::White).bg(bg_tint.unwrap()))
+            // Estimate height accounting for line wrapping
+            let line_count = text_content.lines().count().max(1);
+            let wrap_extra: usize = if area_width > 0 {
+                text_content.lines()
+                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .sum::<u16>() as usize
+            } else { 0 };
+            let height = (line_count + wrap_extra).max(1) as u16;
+
+            let style = if show_band {
+                Style::default().fg(Color::White).bg(bg_tint.unwrap())
             } else {
-                msg_para
+                Style::default()
             };
 
-            // Estimate height: count newlines, assume ~60% fill width due to wrapping
-            let estimated_lines = (msg.content.len() / 50).max(msg.content.lines().count());
-            let msg_height = (estimated_lines as u16).min(messages_area.bottom().saturating_sub(current_y));
-            
-            if current_y >= messages_area.bottom() {
-                break; // No more space
-            }
-
-            let msg_area = Rect {
-                x: messages_area.x,
-                y: current_y,
-                width: messages_area.width,
-                height: msg_height,
-            };
-
-            f.render_widget(&msg_para, msg_area);
-            current_y += msg_height;
+            rendered.push(RenderedMsg { text: text_content, style, height });
         }
 
-        // Show streaming response in a colored block
-        if !self.streaming_text.is_empty() && current_y < messages_area.bottom() {
+        // Add streaming text as a virtual message at the end
+        if !self.streaming_text.is_empty() {
             let tint = if exchange_idx % 2 == 0 {
                 Color::Rgb(30, 30, 45)
             } else {
@@ -770,18 +801,82 @@ impl App {
                 String::new()
             };
             let stream_text = format!("🤖{} {}▌", agent_badge, self.streaming_text);
-            let stream_para = Paragraph::new(stream_text)
-                .style(Style::default().fg(Color::White).bg(tint))
-                .wrap(ratatui::widgets::Wrap { trim: true });
-            
-            let stream_height = 1u16.min(messages_area.bottom() - current_y);
-            let stream_area = Rect {
+            let line_count = stream_text.lines().count().max(1);
+            let wrap_extra: usize = if area_width > 0 {
+                stream_text.lines()
+                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .sum::<u16>() as usize
+            } else { 0 };
+            let height = (line_count + wrap_extra).max(1) as u16;
+            rendered.push(RenderedMsg {
+                text: stream_text,
+                style: Style::default().fg(Color::White).bg(tint),
+                height,
+            });
+        }
+
+        // Calculate total content height and clamp scroll_offset
+        let total_height: i32 = rendered.iter().map(|m| m.height as i32).sum();
+        let max_scroll = (total_height - viewport_height).max(0) as u16;
+        let effective_scroll = self.scroll_offset.min(max_scroll);
+
+        // Bottom-anchored rendering: skip lines from the top based on scroll position
+        // lines_to_skip = total_height - viewport_height - scroll_offset
+        let lines_to_skip = (total_height - viewport_height - effective_scroll as i32).max(0);
+
+        let mut skipped: i32 = 0;
+        let mut current_y = messages_area.top();
+
+        for rm in &rendered {
+            let msg_h = rm.height as i32;
+
+            // Skip messages that are entirely above the viewport
+            if skipped + msg_h <= lines_to_skip {
+                skipped += msg_h;
+                continue;
+            }
+
+            // Partial skip: this message starts partway through
+            let partial_skip = (lines_to_skip - skipped).max(0) as u16;
+            skipped = lines_to_skip; // done skipping
+
+            let visible_height = rm.height.saturating_sub(partial_skip);
+            let available = (messages_area.bottom() as i32 - current_y as i32).max(0) as u16;
+            let draw_height = visible_height.min(available);
+
+            if draw_height == 0 || current_y >= messages_area.bottom() {
+                break;
+            }
+
+            let msg_para = Paragraph::new(rm.text.clone())
+                .style(rm.style)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .scroll((partial_skip, 0));
+
+            let msg_area = Rect {
                 x: messages_area.x,
                 y: current_y,
                 width: messages_area.width,
-                height: stream_height,
+                height: draw_height,
             };
-            f.render_widget(stream_para, stream_area);
+
+            f.render_widget(msg_para, msg_area);
+            current_y += draw_height;
+        }
+
+        // Scroll indicator in top-right of messages area
+        if effective_scroll > 0 {
+            let indicator = format!("↑{}", effective_scroll);
+            let ind_x = messages_area.right().saturating_sub(indicator.len() as u16 + 1);
+            let ind_area = Rect {
+                x: ind_x,
+                y: messages_area.top(),
+                width: indicator.len() as u16 + 1,
+                height: 1,
+            };
+            let ind_widget = Paragraph::new(indicator)
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(ind_widget, ind_area);
         }
 
         // Input area
@@ -929,11 +1024,38 @@ impl App {
                     self.input_buffer.clear();
                 }
             }
+            KeyCode::PageUp => {
+                let half_page = crossterm::terminal::size().map(|(_, h)| h / 2).unwrap_or(10);
+                self.scroll_offset = self.scroll_offset.saturating_add(half_page);
+                self.user_scrolled = true;
+            }
+            KeyCode::PageDown => {
+                let half_page = crossterm::terminal::size().map(|(_, h)| h / 2).unwrap_or(10);
+                self.scroll_offset = self.scroll_offset.saturating_sub(half_page);
+                if self.scroll_offset == 0 {
+                    self.user_scrolled = false;
+                }
+            }
             _ => {}
         }
     }
 
-    /// Return palette commands matching the current query, scored by relevance
+    /// Handle mouse events (scroll wheel)
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                self.user_scrolled = true;
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                if self.scroll_offset == 0 {
+                    self.user_scrolled = false;
+                }
+            }
+            _ => {}
+        }
+    }
     fn palette_matches(&self) -> Vec<&'static PaletteCommand> {
         let query = self.input_buffer.trim_start_matches('/');
         let mut scored: Vec<(i32, &'static PaletteCommand)> = PALETTE_COMMANDS
