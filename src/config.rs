@@ -48,15 +48,47 @@ pub struct Config {
     /// Application mode: ask, build, or plan
     #[serde(default)]
     pub mode: AppMode,
+    /// Knowledge index configuration
+    #[serde(default)]
+    pub knowledge_index: KnowledgeIndexSettings,
 }
 
-/// Optional file-based config (.yggdra/config.toml)
+/// Knowledge index settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeIndexSettings {
+    /// Enable or disable knowledge indexing
+    #[serde(default = "default_knowledge_enabled")]
+    pub enabled: bool,
+    /// Size limit in GB (default 2GB)
+    #[serde(default = "default_knowledge_size_gb")]
+    pub size_limit_gb: f64,
+    /// Battery delay in milliseconds (default 100ms)
+    #[serde(default = "default_battery_delay_ms")]
+    pub battery_delay_ms: u64,
+}
+
+fn default_knowledge_enabled() -> bool { true }
+fn default_knowledge_size_gb() -> f64 { 0.02 } // 20MB default
+fn default_battery_delay_ms() -> u64 { 100 }
+
+impl Default for KnowledgeIndexSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_knowledge_enabled(),
+            size_limit_gb: default_knowledge_size_gb(),
+            battery_delay_ms: default_battery_delay_ms(),
+        }
+    }
+}
+
+/// Optional file-based config (.yggdra/config.toml or config.json)
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     endpoint: Option<String>,
     model: Option<String>,
     context_window: Option<u32>,
     mode: Option<String>,
+    knowledge_index: Option<KnowledgeIndexSettings>,
 }
 
 impl FileConfig {
@@ -92,6 +124,7 @@ impl Default for Config {
             model: "qwen:3.5".to_string(),
             context_window: None,
             mode: AppMode::Plan,
+            knowledge_index: KnowledgeIndexSettings::default(),
         }
     }
 }
@@ -117,9 +150,11 @@ impl Config {
             .and_then(|m| m.parse::<AppMode>().ok())
             .unwrap_or(AppMode::Plan);
 
+        let knowledge_index = file.knowledge_index.unwrap_or_default();
+
         eprintln!("🔧 Config: endpoint={}, model={}, mode={}", endpoint, model, mode);
 
-        Config { endpoint, model, context_window, mode }
+        Config { endpoint, model, context_window, mode, knowledge_index }
     }
 
     /// Load config with smart model detection from Ollama
@@ -164,7 +199,9 @@ impl Config {
             .and_then(|m| m.parse::<AppMode>().ok())
             .unwrap_or(AppMode::Plan);
 
-        Config { endpoint, model, context_window, mode }
+        let knowledge_index = file.knowledge_index.unwrap_or_default();
+
+        Config { endpoint, model, context_window, mode, knowledge_index }
     }
 
     /// Persist config to .yggdra/config.json (creates dir if needed)

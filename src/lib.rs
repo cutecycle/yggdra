@@ -1,5 +1,7 @@
+pub mod battery;
 pub mod config;
 pub mod gaps;
+pub mod knowledge_index;
 pub mod msglog;
 pub mod message;
 pub mod notifications;

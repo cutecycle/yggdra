@@ -1,5 +1,7 @@
+mod battery;
 mod config;
 mod gaps;
+mod knowledge_index;
 mod msglog;
 mod message;
 mod notifications;
@@ -18,7 +20,6 @@ use anyhow::Result;
 use session::Session;
 use ui::App;
 use config::AppMode;
-use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
     }
 
     let config = config::Config::load_with_smart_model().await;
-    let mut config = if let Some(mode) = mode_override {
+    let config = if let Some(mode) = mode_override {
         let mut c = config;
         c.mode = mode;
         eprintln!("🔧 CLI override: mode={}", mode);
@@ -87,6 +88,15 @@ async fn main() -> Result<()> {
     } else {
         config
     };
+    
+    // Start background knowledge indexing task
+    let index_config = crate::knowledge_index::KnowledgeIndexConfig {
+        size_limit_bytes: (config.knowledge_index.size_limit_gb as u64) * 1024 * 1024 * 1024,
+        battery_delay_ms: config.knowledge_index.battery_delay_ms,
+        enabled: config.knowledge_index.enabled,
+    };
+    knowledge_index::start_indexing_task(Some(index_config));
+    
     let session = Session::load_or_create()?;
 
     // Load AGENTS.md from CWD if present

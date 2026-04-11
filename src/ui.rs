@@ -807,6 +807,13 @@ impl App {
              • .yggdra/todo/ — markdown task files (status, requirements, hints). Discover with rg\n\
              • .yggdra/log/ — session history by timestamp. Review with spawn\n\
              • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
+             • .yggdra/knowledge/INDEX.md — auto-generated index of indexed categories (refreshes in background)\n\
+             \n\
+             KNOWLEDGE BASE:\n\
+             Check INDEX.md first to see which categories are indexed.\n\
+             For indexed categories (large keyword lists), search directly: rg \"term\" .yggdra/knowledge/category/\n\
+             For unindexed content, INDEX.md suggests fallback commands.\n\
+             As indexing runs in background on battery-aware schedule, INDEX.md grows over time.\n\
              \n\
              WORKFLOW:\n\
              1. Discover pending todos: rg TODO .yggdra/todo/\n\
