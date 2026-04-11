@@ -5,7 +5,6 @@ use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use chrono::Local;
 
 /// Tool trait: defines interface for executable tools
 pub trait Tool: Send + Sync {
@@ -203,24 +202,19 @@ impl Tool for EditfileTool {
         let file_path = args.trim_matches('"').trim_matches('\'');
         let path = Path::new(file_path);
 
-        // Create backup if file exists
         if path.exists() {
-            let backup_dir = path.parent().unwrap_or(Path::new(".")).join(".backup");
-            fs::create_dir_all(&backup_dir)
-                .map_err(|e| anyhow!("editfile: failed to create backup dir: {}", e))?;
-
-            let filename = path.file_name().unwrap().to_string_lossy();
-            let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-            let backup_path = backup_dir.join(format!("{}.{}", filename, timestamp));
-
-            fs::copy(path, &backup_path)
-                .map_err(|e| anyhow!("editfile: backup failed: {}", e))?;
+            let content = fs::read_to_string(path)
+                .map_err(|e| anyhow!("editfile: failed to read {}: {}", file_path, e))?;
+            let line_count = content.lines().count();
+            if content.len() > 8000 {
+                let truncated: String = content.chars().take(8000).collect();
+                Ok(format!("📄 {} ({} lines, truncated):\n{}\n...", file_path, line_count, truncated))
+            } else {
+                Ok(format!("📄 {} ({} lines):\n{}", file_path, line_count, content))
+            }
+        } else {
+            Ok(format!("📄 {} does not exist yet", file_path))
         }
-
-        // Note: This tool receives content via steering system
-        // The actual content write is handled by the agent framework
-        // This just validates the path and creates backup
-        Ok(format!("File ready for edit: {}", file_path))
     }
 }
 

@@ -1,4 +1,5 @@
-/// TUI module: minimal terminal UI with streaming responses and multi-window sync
+/// TUI module: minimal terminal UI with streaming responses, tool execution, and multi-window sync
+use crate::agent;
 use crate::config::Config;
 use crate::message::{Message, MessageBuffer};
 use crate::ollama::{OllamaClient, StreamEvent};
@@ -20,9 +21,11 @@ use ratatui::{
 };
 use std::io;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+const MAX_TOOL_ITERATIONS: usize = 10;
 
 /// RAII guard to restore terminal state on drop (including panics/errors)
 struct TerminalGuard;
@@ -42,6 +45,21 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Explicit state machine for the agentic turn lifecycle
+#[derive(Debug, Clone, PartialEq)]
+enum TurnPhase {
+    Idle,
+    Streaming,
+    ExecutingTool(String),
+}
+
+/// Result from async tool execution
+struct ToolResult {
+    tool_name: String,
+    _args: String,
+    output: std::result::Result<String, String>,
+}
+
 /// Minimal TUI application
 pub struct App {
     config: Config,
@@ -51,13 +69,18 @@ pub struct App {
     running: bool,
     message_buffer: MessageBuffer,
     ollama_client: Option<OllamaClient>,
-    waiting_for_response: bool,
     tool_registry: ToolRegistry,
     cached_message_count: usize,
     /// Accumulates tokens during streaming
     streaming_text: String,
     /// Receives tokens from the streaming task
     stream_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
+    /// Explicit state machine for the current turn
+    turn_phase: TurnPhase,
+    /// How many tool→re-stream cycles this turn
+    tool_iteration_count: usize,
+    /// Receives result from async tool execution
+    tool_result_rx: Option<oneshot::Receiver<ToolResult>>,
 }
 
 impl App {
@@ -87,11 +110,13 @@ impl App {
             running: true,
             message_buffer,
             ollama_client,
-            waiting_for_response: false,
             tool_registry: ToolRegistry::new(),
             cached_message_count: 0,
             streaming_text: String::new(),
             stream_rx: None,
+            turn_phase: TurnPhase::Idle,
+            tool_iteration_count: 0,
+            tool_result_rx: None,
         }
     }
 
@@ -106,11 +131,13 @@ impl App {
         loop {
             // Drain any pending stream tokens before drawing
             self.drain_stream_tokens();
+            // Check for completed tool execution
+            self.check_tool_result();
 
             terminal.draw(|f| self.draw(f))?;
 
-            // Short poll when streaming (16ms for smooth token display), longer when idle
-            let poll_ms = if self.stream_rx.is_some() { 16 } else { 200 };
+            // Fast poll when active (16ms for smooth token display), longer when idle
+            let poll_ms = if self.turn_phase == TurnPhase::Idle { 200 } else { 16 };
 
             if crossterm::event::poll(Duration::from_millis(poll_ms))? {
                 if let Event::Key(key) = event::read()? {
@@ -119,7 +146,7 @@ impl App {
                         break;
                     }
                 }
-            } else if self.stream_rx.is_none() {
+            } else if self.turn_phase == TurnPhase::Idle {
                 self.poll_for_updates();
             }
         }
@@ -140,24 +167,26 @@ impl App {
                     self.streaming_text.push_str(&token);
                 }
                 Ok(StreamEvent::Done) => {
-                    self.finish_streaming();
+                    self.complete_streaming_turn();
                     return;
                 }
                 Ok(StreamEvent::Error(e)) => {
                     self.status_message = format!("❌ Stream error: {}", e);
                     self.streaming_text.clear();
                     self.stream_rx = None;
-                    self.waiting_for_response = false;
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
                     return;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Channel closed unexpectedly — save what we have
                     if !self.streaming_text.is_empty() {
-                        self.finish_streaming();
+                        self.complete_streaming_turn();
                     } else {
                         self.stream_rx = None;
-                        self.waiting_for_response = false;
+                        self.turn_phase = TurnPhase::Idle;
+                        self.tool_iteration_count = 0;
                     }
                     return;
                 }
@@ -165,21 +194,154 @@ impl App {
         }
     }
 
-    /// Finalize streaming: persist the accumulated response and clean up
-    fn finish_streaming(&mut self) {
-        if !self.streaming_text.is_empty() {
-            let model_msg = Message::new("assistant", self.streaming_text.clone());
-            if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
-                eprintln!("Failed to save streamed response: {}", e);
-                self.status_message = format!("⚠️ Response received but not saved: {}", e);
-            } else {
-                self.status_message = "✅ Model responded".to_string();
-                self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
-            }
+    /// Streaming finished: persist response, check for tool calls, maybe continue
+    fn complete_streaming_turn(&mut self) {
+        if self.streaming_text.is_empty() {
+            self.stream_rx = None;
+            self.turn_phase = TurnPhase::Idle;
+            self.tool_iteration_count = 0;
+            return;
         }
+
+        let response_text = self.streaming_text.clone();
+
+        // Persist assistant message
+        let model_msg = Message::new("assistant", &response_text);
+        if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
+            eprintln!("Failed to save streamed response: {}", e);
+            self.status_message = format!("⚠️ Response received but not saved: {}", e);
+            self.streaming_text.clear();
+            self.stream_rx = None;
+            self.turn_phase = TurnPhase::Idle;
+            self.tool_iteration_count = 0;
+            return;
+        }
+        self.cached_message_count = self.message_buffer.count()
+            .unwrap_or(self.cached_message_count + 1);
+
+        // Check for tool calls in the response
+        let tool_calls = agent::parse_tool_calls(&response_text);
+
+        if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
+            // Execute FIRST tool call only (one per turn to avoid dependency issues)
+            let call = &tool_calls[0];
+            self.status_message = format!("🔧 Executing tool: {} ...", call.name);
+            self.execute_tool_async(call.name.clone(), call.args.clone());
+            self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
+        } else {
+            if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
+                self.status_message = "⚠️ Max tool iterations reached".to_string();
+            } else {
+                self.status_message = "✅ Response complete".to_string();
+            }
+            self.turn_phase = TurnPhase::Idle;
+            self.tool_iteration_count = 0;
+        }
+
         self.streaming_text.clear();
         self.stream_rx = None;
-        self.waiting_for_response = false;
+    }
+
+    /// Spawn tool execution off the UI thread
+    fn execute_tool_async(&mut self, tool_name: String, args: String) {
+        let (tx, rx) = oneshot::channel();
+
+        tokio::task::spawn_blocking(move || {
+            let registry = ToolRegistry::new();
+            let result = registry.execute(&tool_name, &args);
+            let _ = tx.send(ToolResult {
+                tool_name,
+                _args: args,
+                output: result.map_err(|e| e.to_string()),
+            });
+        });
+
+        self.tool_result_rx = Some(rx);
+    }
+
+    /// Check if async tool execution has completed; if so, persist result and continue
+    fn check_tool_result(&mut self) {
+        let rx = match self.tool_result_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.tool_result_rx = None;
+
+                let output_text = match &result.output {
+                    Ok(output) => {
+                        let truncated = if output.len() > 4000 {
+                            format!("{}...(truncated)", &output[..4000])
+                        } else {
+                            output.clone()
+                        };
+                        format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncated)
+                    }
+                    Err(e) => format!("[TOOL_ERROR: {} = {}]", result.tool_name, e),
+                };
+
+                // Persist tool result
+                let tool_msg = Message::new("tool", &output_text);
+                if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {
+                    self.status_message = format!("⚠️ Failed to save tool result: {}", e);
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
+                    return;
+                }
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+
+                // Start next streaming generation with full history including tool result
+                self.tool_iteration_count += 1;
+                self.status_message = format!(
+                    "⏳ Continuing after {} (step {}/{})...",
+                    result.tool_name, self.tool_iteration_count, MAX_TOOL_ITERATIONS
+                );
+
+                if let Some(client) = &self.ollama_client {
+                    let steering_text = self.steering_text();
+                    let messages = self.message_buffer.messages().unwrap_or_default();
+                    let rx = client.generate_streaming(messages, Some(&steering_text));
+                    self.stream_rx = Some(rx);
+                    self.streaming_text.clear();
+                    self.turn_phase = TurnPhase::Streaming;
+                } else {
+                    self.status_message = "⚠️ Ollama offline".to_string();
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                // Still waiting for tool execution
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.status_message = "❌ Tool execution failed unexpectedly".to_string();
+                self.tool_result_rx = None;
+                self.turn_phase = TurnPhase::Idle;
+                self.tool_iteration_count = 0;
+            }
+        }
+    }
+
+    /// Build the steering system prompt (shared between handle_message and check_tool_result)
+    fn steering_text(&self) -> String {
+        let steering_directive = SteeringDirective::custom(
+            "You are Yggdra, a local agentic assistant. You have access to tools for \
+             interacting with the local filesystem and running code. Available tools:\n\
+             - rg PATTERN PATH — search files with ripgrep\n\
+             - editfile PATH — read a file's contents\n\
+             - spawn BINARY ARGS — execute a local binary\n\
+             - commit \"MESSAGE\" — git commit\n\
+             - python SCRIPT ARGS — run a Python script\n\
+             - ruste FILE — compile and run Rust code\n\
+             To use a tool, output: [TOOL: name args]\n\
+             After receiving tool output, analyze the results and continue.\n\
+             When done, just respond normally without tool calls.\n\
+             Be concise and helpful. You work entirely offline."
+        );
+        steering_directive.format_for_system_prompt()
     }
 
     /// Draw UI frame
@@ -198,17 +360,27 @@ impl App {
             .split(f.area());
 
         // Header
-        let header_text = if self.waiting_for_response {
-            format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Streaming...",
-                if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" },
-                self.config.model
-            )
-        } else {
-            format!("🌷 Yggdra v0.1 - {} | {} | Model: {}",
-                if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" },
-                self.config.endpoint.replace("http://", "").replace(":11434", ""),
-                self.config.model
-            )
+        let connection_status = if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" };
+        let header_text = match &self.turn_phase {
+            TurnPhase::Streaming if self.tool_iteration_count > 0 => {
+                format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Tool follow-up ({}/{})",
+                    connection_status, self.config.model,
+                    self.tool_iteration_count, MAX_TOOL_ITERATIONS)
+            }
+            TurnPhase::Streaming => {
+                format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Streaming...",
+                    connection_status, self.config.model)
+            }
+            TurnPhase::ExecutingTool(name) => {
+                format!("🌷 Yggdra v0.1 - {} | {} | 🔧 Running {}...",
+                    connection_status, self.config.model, name)
+            }
+            TurnPhase::Idle => {
+                format!("🌷 Yggdra v0.1 - {} | {} | Model: {}",
+                    connection_status,
+                    self.config.endpoint.replace("http://", "").replace(":11434", ""),
+                    self.config.model)
+            }
         };
 
         let header = Paragraph::new(header_text)
@@ -243,10 +415,10 @@ impl App {
         f.render_widget(output, chunks[1]);
 
         // Input area
-        let input_hint = if self.waiting_for_response {
-            "(streaming response...)"
-        } else {
-            "(type message or /help for commands)"
+        let input_hint = match &self.turn_phase {
+            TurnPhase::Idle => "(type message or /help for commands)",
+            TurnPhase::Streaming => "(streaming response...)",
+            TurnPhase::ExecutingTool(_) => "(executing tool...)",
         };
         let input_text = if self.input_buffer.is_empty() {
             input_hint.to_string()
@@ -339,7 +511,7 @@ impl App {
              Available tools:\n\
              • rg          - Ripgrep search (usage: /tool rg pattern path)\n\
              • spawn       - Execute binary (usage: /tool spawn /path/to/bin args)\n\
-             • editfile    - Edit file (usage: /tool editfile /path/to/file)\n\
+             • editfile    - Read file contents (usage: /tool editfile /path/to/file)\n\
              • commit      - Git commit (usage: /tool commit \"message\")\n\
              • python      - Run Python script (usage: /tool python script.py args)\n\
              • ruste       - Compile/run Rust (usage: /tool ruste script.rs)\n\n\
@@ -368,7 +540,6 @@ impl App {
         let tool_name = parts[0];
         let args = if parts.len() > 1 { parts[1] } else { "" };
 
-        self.waiting_for_response = true;
         self.status_message = format!("⏳ Executing tool: {}", tool_name);
 
         // Execute tool via registry
@@ -395,15 +566,12 @@ impl App {
                 self.status_message = format!("❌ Tool {} error: {}", tool_name, e);
             }
         }
-
-        self.waiting_for_response = false;
     }
 
     /// Handle /models command
     async fn handle_models_command(&mut self) {
         match &self.ollama_client {
             Some(client) => {
-                self.waiting_for_response = true;
                 self.status_message = "⏳ Fetching models from Ollama...".to_string();
 
                 match tokio::time::timeout(
@@ -441,7 +609,6 @@ impl App {
                     }
                 }
 
-                self.waiting_for_response = false;
             }
             None => {
                 self.status_message = "⚠️ Ollama not connected. Check that Ollama is running on http://localhost:11434".to_string();
@@ -475,23 +642,11 @@ impl App {
             return;
         }
 
-        self.waiting_for_response = true;
+        self.turn_phase = TurnPhase::Streaming;
+        self.tool_iteration_count = 0;
         self.status_message = "⏳ Streaming response...".to_string();
 
-        let steering_directive = SteeringDirective::custom(
-            "You are Yggdra, a local agentic assistant. You have access to tools for \
-             interacting with the local filesystem and running code. Available tools:\n\
-             - rg PATTERN PATH — search files with ripgrep\n\
-             - spawn BINARY ARGS — execute a local binary\n\
-             - editfile PATH — edit a file\n\
-             - commit \"MESSAGE\" — git commit\n\
-             - python SCRIPT ARGS — run a Python script\n\
-             - ruste FILE — compile and run Rust code\n\
-             To use a tool, output: [TOOL: name args]\n\
-             Be concise and helpful. You work entirely offline."
-        );
-        let steering_text = steering_directive.format_for_system_prompt();
-
+        let steering_text = self.steering_text();
         let messages_for_ollama: Vec<Message> = self
             .message_buffer
             .messages()

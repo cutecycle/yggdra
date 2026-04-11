@@ -138,7 +138,8 @@ impl OllamaClient {
         Ok(last_model.name.clone())
     }
 
-    /// Build the OllamaMessage list with steering injected as system message
+    /// Build the OllamaMessage list with steering injected as system message.
+    /// Maps "tool" role to "user" for Ollama API compatibility.
     fn build_messages(messages: &[Message], steering: Option<&str>) -> Vec<OllamaMessage> {
         let mut ollama_messages = Vec::new();
 
@@ -150,8 +151,9 @@ impl OllamaClient {
         }
 
         for msg in messages {
+            let role = if msg.role == "tool" { "user" } else { &msg.role };
             ollama_messages.push(OllamaMessage {
-                role: msg.role.clone(),
+                role: role.to_string(),
                 content: msg.content.clone(),
             });
         }
@@ -392,6 +394,22 @@ mod tests {
         let result = OllamaClient::build_messages(&msgs, None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
+    }
+
+    #[test]
+    fn test_build_messages_maps_tool_to_user() {
+        let msgs = vec![
+            Message::new("user", "search for main"),
+            Message::new("assistant", "I'll search. [TOOL: rg main .]"),
+            Message::new("tool", "[TOOL_OUTPUT: rg = found matches]"),
+        ];
+        let result = OllamaClient::build_messages(&msgs, None);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[1].role, "assistant");
+        // "tool" role should be mapped to "user" for Ollama API compatibility
+        assert_eq!(result[2].role, "user");
+        assert!(result[2].content.contains("TOOL_OUTPUT"));
     }
 
     #[test]

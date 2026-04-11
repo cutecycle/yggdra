@@ -9,9 +9,26 @@ use regex::Regex;
 
 /// Tool call representation parsed from LLM output
 #[derive(Debug, Clone)]
-struct ToolCall {
-    name: String,
-    args: String,
+pub struct ToolCall {
+    pub name: String,
+    pub args: String,
+}
+
+/// Parse tool calls from LLM output (module-level for reuse from UI)
+/// Format: [TOOL: name "arg1" "arg2"] or [TOOL: name arg1]
+pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    if let Ok(re) = Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]") {
+        for cap in re.captures_iter(output) {
+            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
+                calls.push(ToolCall {
+                    name: name_match.as_str().to_string(),
+                    args: args_match.as_str().trim().to_string(),
+                });
+            }
+        }
+    }
+    calls
 }
 
 /// Agent configuration
@@ -54,24 +71,9 @@ impl Agent {
         })
     }
 
-    /// Parse tool calls from LLM output
-    /// Format: [TOOL: name "arg1" "arg2"] or [TOOL: name arg1]
+    /// Parse tool calls from LLM output (delegates to module-level function)
     fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
-        let mut calls = Vec::new();
-
-        // Match [TOOL: name args] pattern
-        if let Ok(re) = Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]") {
-            for cap in re.captures_iter(output) {
-                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                    calls.push(ToolCall {
-                        name: name_match.as_str().to_string(),
-                        args: args_match.as_str().trim().to_string(),
-                    });
-                }
-            }
-        }
-
-        calls
+        parse_tool_calls(output)
     }
 
     /// Execute a tool and return result
@@ -196,7 +198,7 @@ mod tests {
     #[test]
     fn test_parse_tool_calls_single() {
         let output = "I'll search for the pattern. [TOOL: rg \"fn main\" \"/path\"]";
-        let calls = Agent::parse_tool_calls(output);
+        let calls = parse_tool_calls(output);
         
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "rg");
@@ -206,7 +208,7 @@ mod tests {
     #[test]
     fn test_parse_tool_calls_multiple() {
         let output = "First [TOOL: rg \"pattern\" \"/path\"] then [TOOL: commit \"fix bug\"]";
-        let calls = Agent::parse_tool_calls(output);
+        let calls = parse_tool_calls(output);
         
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "rg");
@@ -216,9 +218,26 @@ mod tests {
     #[test]
     fn test_parse_no_tool_calls() {
         let output = "This is just text without any tools";
-        let calls = Agent::parse_tool_calls(output);
+        let calls = parse_tool_calls(output);
         
         assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_embedded_in_prose() {
+        let output = "Let me search for that. [TOOL: rg \"fn main\" .] I'll check the results.";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "rg");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_editfile() {
+        let output = "I'll read the file. [TOOL: editfile src/main.rs]";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "editfile");
+        assert_eq!(calls[0].args, "src/main.rs");
     }
 
     #[test]

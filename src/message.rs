@@ -74,6 +74,18 @@ impl MessageBuffer {
         Ok(())
     }
 
+    /// Add multiple messages atomically in a single transaction
+    pub fn add_multiple(&mut self, messages: &[Message]) -> SqliteResult<()> {
+        let tx = self.conn.transaction()?;
+        for msg in messages {
+            tx.execute(
+                "INSERT INTO messages (role, content, timestamp) VALUES (?1, ?2, ?3)",
+                params![&msg.role, &msg.content, msg.timestamp.timestamp()],
+            )?;
+        }
+        tx.commit()
+    }
+
     /// Get all messages, ordered by insertion order (timestamp, id)
     pub fn messages(&self) -> SqliteResult<Vec<Message>> {
         let mut stmt = self.conn.prepare(
