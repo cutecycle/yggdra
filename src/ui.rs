@@ -1972,11 +1972,11 @@ impl App {
     /// Convert technical errors to user-friendly messages
     fn friendly_error(&self, error: &str) -> String {
         if error.contains("refused") || error.contains("connection refused") {
-            "Ollama is offline. Make sure Ollama is running on http://localhost:11434".to_string()
+            format!("Proxy/Ollama is offline. Make sure the proxy is running on {} or Ollama on http://localhost:11434", self.config.endpoint)
         } else if error.contains("model") && error.contains("not found") {
             format!("Model '{}' not found. Use /models to see available models.", self.config.model)
         } else if error.contains("timeout") {
-            "Connection timeout. Ollama may be unresponsive.".to_string()
+            "Connection timeout. Proxy/Ollama may be unresponsive.".to_string()
         } else if error.contains("permission") {
             "Permission denied. Check file/directory permissions.".to_string()
         } else if error.contains("Parse") || error.contains("parse") {

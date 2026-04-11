@@ -20,12 +20,23 @@ struct FileConfig {
 
 impl FileConfig {
     fn load() -> Self {
-        let path = std::env::current_dir()
+        let base_dir = std::env::current_dir()
             .unwrap_or_default()
-            .join(".yggdra")
-            .join("config.toml");
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            eprintln!("🔧 Loading config from {}", path.display());
+            .join(".yggdra");
+        
+        // Try JSON first (preferred format)
+        let json_path = base_dir.join("config.json");
+        if let Ok(contents) = std::fs::read_to_string(&json_path) {
+            eprintln!("🔧 Loading config from {}", json_path.display());
+            if let Ok(config) = serde_json::from_str::<Self>(&contents) {
+                return config;
+            }
+        }
+        
+        // Fall back to TOML
+        let toml_path = base_dir.join("config.toml");
+        if let Ok(contents) = std::fs::read_to_string(&toml_path) {
+            eprintln!("🔧 Loading config from {}", toml_path.display());
             toml::from_str(&contents).unwrap_or_default()
         } else {
             Self::default()
@@ -36,7 +47,7 @@ impl FileConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:11434".to_string(),
+            endpoint: "http://localhost:11435".to_string(),
             model: "qwen:3.5".to_string(),
             context_window: None,
         }
@@ -50,7 +61,7 @@ impl Config {
         let endpoint = std::env::var("OLLAMA_ENDPOINT")
             .ok()
             .or(file.endpoint)
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+            .unwrap_or_else(|| "http://localhost:11435".to_string());
         let model = std::env::var("OLLAMA_MODEL")
             .ok()
             .or(file.model)
@@ -66,13 +77,13 @@ impl Config {
     }
 
     /// Load config with smart model detection from Ollama
-    /// Priority: env var → .yggdra/config.toml → last loaded model from Ollama → default
+    /// Priority: env var → .yggdra/config.json/.toml → last loaded model from Ollama → default
     pub async fn load_with_smart_model() -> Self {
         let file = FileConfig::load();
         let endpoint = std::env::var("OLLAMA_ENDPOINT")
             .ok()
             .or(file.endpoint)
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+            .unwrap_or_else(|| "http://localhost:11435".to_string());
 
         let model = if let Ok(env_model) = std::env::var("OLLAMA_MODEL") {
             eprintln!("🎯 Using explicit model from OLLAMA_MODEL env var: {}", env_model);
