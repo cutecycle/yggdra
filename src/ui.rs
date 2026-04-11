@@ -469,68 +469,92 @@ impl App {
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
         f.render_widget(header, chunks[0]);
 
-        // Messages + live streaming text
+        // Messages area with full-width colored bands
+        let messages_area = chunks[1];
         let messages_list = self
             .message_buffer
             .messages()
             .unwrap_or_default();
 
-        // Track exchange index for alternating row tints (skip tool messages in count)
+        // Render each message as its own Block with full-width background
         let mut exchange_idx: usize = 0;
-        let mut messages_text: Vec<Line> = messages_list
-            .iter()
-            .map(|m| {
-                let tint = if exchange_idx % 2 == 0 {
-                    Color::Rgb(30, 30, 45)   // subtle dark blue band
-                } else {
-                    Color::Rgb(20, 35, 20)   // subtle dark green band
-                };
-                let line = match m.role.as_str() {
-                    "user" => {
-                        exchange_idx += 1;
-                        Line::from(vec![
-                            Span::styled("👤 ", Style::default().fg(Color::Cyan)),
-                            Span::styled(&m.content, Style::default().fg(Color::White)),
-                        ]).style(Style::default().bg(tint))
-                    }
-                    "assistant" => {
-                        exchange_idx += 1;
-                        Line::from(vec![
-                            Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
-                            Span::styled(&m.content, Style::default().fg(Color::White)),
-                        ]).style(Style::default().bg(tint))
-                    }
-                    "tool" => Line::from(vec![
-                        Span::styled("🔧 ", Style::default().fg(Color::Green)),
-                        Span::styled(&m.content, Style::default().fg(Color::DarkGray)),
-                    ]),
-                    "system" => Line::from(vec![
-                        Span::styled("⚙️  ", Style::default().fg(Color::Rgb(180, 120, 0))),
-                        Span::styled(&m.content, Style::default().fg(Color::Rgb(180, 120, 0)).add_modifier(Modifier::DIM)),
-                    ]),
-                    _ => Line::from(vec![
-                        Span::styled("💬 ", Style::default().fg(Color::Gray)),
-                        Span::raw(&m.content),
-                    ]),
-                };
-                line
-            })
-            .collect();
+        let mut current_y = messages_area.top();
+        
+        for msg in messages_list.iter() {
+            let (emoji, fg_color, bg_tint, show_band) = match msg.role.as_str() {
+                "user" => {
+                    exchange_idx += 1;
+                    let tint = if exchange_idx % 2 == 0 {
+                        Color::Rgb(30, 30, 45)   // dark blue
+                    } else {
+                        Color::Rgb(20, 35, 20)   // dark green
+                    };
+                    ("👤", Color::Cyan, Some(tint), true)
+                }
+                "assistant" => {
+                    exchange_idx += 1;
+                    let tint = if exchange_idx % 2 == 0 {
+                        Color::Rgb(30, 30, 45)
+                    } else {
+                        Color::Rgb(20, 35, 20)
+                    };
+                    ("🤖", Color::Yellow, Some(tint), true)
+                }
+                "tool" => ("🔧", Color::Green, None, false),
+                "system" => ("⚙️", Color::Rgb(180, 120, 0), None, false),
+                _ => ("💬", Color::Gray, None, false),
+            };
 
-        // Show partial streaming response
-        if !self.streaming_text.is_empty() {
-            let tint = if exchange_idx % 2 == 0 { Color::Rgb(30, 30, 45) } else { Color::Rgb(20, 35, 20) };
-            messages_text.push(
-                Line::from(vec![
-                    Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}▌", self.streaming_text), Style::default().fg(Color::White)),
-            ]));
+            let text_content = format!("{} {}", emoji, msg.content);
+            let msg_para = Paragraph::new(text_content)
+                .wrap(ratatui::widgets::Wrap { trim: true });
+
+            let msg_para = if show_band {
+                msg_para.style(Style::default().fg(Color::White).bg(bg_tint.unwrap()))
+            } else {
+                msg_para
+            };
+
+            // Estimate height (simple: count newlines + 1, capped by area)
+            let estimated_lines = (msg.content.lines().count() + 1).min(messages_area.height as usize);
+            let msg_height = (estimated_lines as u16).min(messages_area.bottom() - current_y);
+            
+            if current_y >= messages_area.bottom() {
+                break; // No more space
+            }
+
+            let msg_area = Rect {
+                x: messages_area.x,
+                y: current_y,
+                width: messages_area.width,
+                height: msg_height,
+            };
+
+            f.render_widget(&msg_para, msg_area);
+            current_y += msg_height;
         }
 
-        let output = Paragraph::new(messages_text)
-            .block(Block::default().title(" 🌸 Conversation "))
-            .wrap(ratatui::widgets::Wrap { trim: true });
-        f.render_widget(output, chunks[1]);
+        // Show streaming response in a colored block
+        if !self.streaming_text.is_empty() && current_y < messages_area.bottom() {
+            let tint = if exchange_idx % 2 == 0 {
+                Color::Rgb(30, 30, 45)
+            } else {
+                Color::Rgb(20, 35, 20)
+            };
+            let stream_text = format!("🤖 {}▌", self.streaming_text);
+            let stream_para = Paragraph::new(stream_text)
+                .style(Style::default().fg(Color::White).bg(tint))
+                .wrap(ratatui::widgets::Wrap { trim: true });
+            
+            let stream_height = 1u16.min(messages_area.bottom() - current_y);
+            let stream_area = Rect {
+                x: messages_area.x,
+                y: current_y,
+                width: messages_area.width,
+                height: stream_height,
+            };
+            f.render_widget(stream_para, stream_area);
+        }
 
         // Input area
         let input_hint = match &self.turn_phase {
