@@ -14,7 +14,7 @@ use ui::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = config::Config::load_with_smart_model().await?;
+    let config = config::Config::load_with_smart_model().await;
     let session = Session::load_or_create()?;
 
     eprintln!("🌷 Yggdra v0.1 starting...");

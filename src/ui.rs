@@ -1,7 +1,7 @@
-/// TUI module: minimal terminal UI with multi-window sync via polling
+/// TUI module: minimal terminal UI with streaming responses and multi-window sync
 use crate::config::Config;
 use crate::message::{Message, MessageBuffer};
-use crate::ollama::OllamaClient;
+use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
 use crate::steering::SteeringDirective;
 use crate::tools::ToolRegistry;
@@ -20,6 +20,7 @@ use ratatui::{
 };
 use std::io;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -53,6 +54,10 @@ pub struct App {
     waiting_for_response: bool,
     tool_registry: ToolRegistry,
     cached_message_count: usize,
+    /// Accumulates tokens during streaming
+    streaming_text: String,
+    /// Receives tokens from the streaming task
+    stream_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
 }
 
 impl App {
@@ -65,7 +70,6 @@ impl App {
         let message_buffer = MessageBuffer::from_db(&session.messages_db)
             .unwrap_or_else(|e| {
                 eprintln!("🌹 Failed to open messages DB: {}", e);
-                // Last resort: create fresh DB
                 MessageBuffer::new(&session.messages_db)
                     .expect("Cannot create message database")
             });
@@ -86,10 +90,12 @@ impl App {
             waiting_for_response: false,
             tool_registry: ToolRegistry::new(),
             cached_message_count: 0,
+            streaming_text: String::new(),
+            stream_rx: None,
         }
     }
 
-    /// Run the TUI
+    /// Run the TUI — main event loop with streaming support
     pub async fn run(&mut self) -> Result<()> {
         let _guard = TerminalGuard::new()?;
 
@@ -98,23 +104,82 @@ impl App {
         terminal.clear()?;
 
         loop {
+            // Drain any pending stream tokens before drawing
+            self.drain_stream_tokens();
+
             terminal.draw(|f| self.draw(f))?;
 
-            if crossterm::event::poll(Duration::from_millis(500))? {
+            // Short poll when streaming (16ms for smooth token display), longer when idle
+            let poll_ms = if self.stream_rx.is_some() { 16 } else { 200 };
+
+            if crossterm::event::poll(Duration::from_millis(poll_ms))? {
                 if let Event::Key(key) = event::read()? {
-                    if !self.waiting_for_response {
-                        self.handle_key(key).await;
-                        if !self.running {
-                            break;
-                        }
+                    self.handle_key(key).await;
+                    if !self.running {
+                        break;
                     }
                 }
-            } else {
+            } else if self.stream_rx.is_none() {
                 self.poll_for_updates();
             }
         }
 
         Ok(())
+    }
+
+    /// Drain all available tokens from the stream receiver
+    fn drain_stream_tokens(&mut self) {
+        let rx = match self.stream_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(StreamEvent::Token(token)) => {
+                    self.streaming_text.push_str(&token);
+                }
+                Ok(StreamEvent::Done) => {
+                    self.finish_streaming();
+                    return;
+                }
+                Ok(StreamEvent::Error(e)) => {
+                    self.status_message = format!("❌ Stream error: {}", e);
+                    self.streaming_text.clear();
+                    self.stream_rx = None;
+                    self.waiting_for_response = false;
+                    return;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed unexpectedly — save what we have
+                    if !self.streaming_text.is_empty() {
+                        self.finish_streaming();
+                    } else {
+                        self.stream_rx = None;
+                        self.waiting_for_response = false;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Finalize streaming: persist the accumulated response and clean up
+    fn finish_streaming(&mut self) {
+        if !self.streaming_text.is_empty() {
+            let model_msg = Message::new("assistant", self.streaming_text.clone());
+            if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
+                eprintln!("Failed to save streamed response: {}", e);
+                self.status_message = format!("⚠️ Response received but not saved: {}", e);
+            } else {
+                self.status_message = "✅ Model responded".to_string();
+                self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
+            }
+        }
+        self.streaming_text.clear();
+        self.stream_rx = None;
+        self.waiting_for_response = false;
     }
 
     /// Draw UI frame
@@ -132,14 +197,14 @@ impl App {
             )
             .split(f.area());
 
-        // Header with status
+        // Header
         let header_text = if self.waiting_for_response {
-            format!("🌷 Yggdra v0.1 - {} | Endpoint: {} | ⏳ Processing...",
+            format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Streaming...",
                 if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" },
-                self.config.endpoint.replace("http://", "").replace(":11434", "")
+                self.config.model
             )
         } else {
-            format!("🌷 Yggdra v0.1 - {} | Endpoint: {} | Model: {}",
+            format!("🌷 Yggdra v0.1 - {} | {} | Model: {}",
                 if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" },
                 self.config.endpoint.replace("http://", "").replace(":11434", ""),
                 self.config.model
@@ -150,8 +215,8 @@ impl App {
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
         f.render_widget(header, chunks[0]);
 
-        // Messages output with scrolling
-        let messages_text: Vec<Line> = self
+        // Messages + live streaming text
+        let mut messages_text: Vec<Line> = self
             .message_buffer
             .messages()
             .unwrap_or_default()
@@ -167,14 +232,19 @@ impl App {
             })
             .collect();
 
+        // Show partial streaming response
+        if !self.streaming_text.is_empty() {
+            messages_text.push(Line::from(format!("🤖 [assistant] {}▌", self.streaming_text)));
+        }
+
         let output = Paragraph::new(messages_text)
-            .block(Block::default().title(" Conversation ").borders(Borders::ALL))
+            .block(Block::default().title(" 🌸 Conversation ").borders(Borders::ALL))
             .wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(output, chunks[1]);
 
         // Input area
         let input_hint = if self.waiting_for_response {
-            "(waiting for response...)"
+            "(streaming response...)"
         } else {
             "(type message or /help for commands)"
         };
@@ -185,7 +255,7 @@ impl App {
         };
 
         let input = Paragraph::new(format!("> {}", input_text))
-            .block(Block::default().title(" Input ").borders(Borders::ALL));
+            .block(Block::default().title(" 🌱 Input ").borders(Borders::ALL));
         f.render_widget(input, chunks[2]);
 
         // Status bar
@@ -379,7 +449,7 @@ impl App {
         }
     }
 
-    /// Handle user message - send to Ollama with steering
+    /// Handle user message — kick off streaming generation
     async fn handle_message(&mut self, message: &str) {
         if message.is_empty() {
             self.status_message = "❌ Message cannot be empty".to_string();
@@ -395,21 +465,31 @@ impl App {
         let user_msg = Message::new("user", message.to_string());
         if let Err(e) = self.message_buffer.add_and_persist(user_msg) {
             eprintln!("Failed to save user message: {}", e);
-            self.status_message = format!("❌ Storage error: Cannot save message - {}", self.friendly_error(&e.to_string()));
+            self.status_message = format!("❌ Storage error: {}", self.friendly_error(&e.to_string()));
             return;
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
 
         if self.ollama_client.is_none() {
-            self.status_message = "⚠️ Ollama offline: Message saved locally but not sent to model. Try /help for more info.".to_string();
+            self.status_message = "⚠️ Ollama offline: Message saved but not sent.".to_string();
             return;
         }
 
         self.waiting_for_response = true;
-        self.status_message = "⏳ Sending message to model...".to_string();
+        self.status_message = "⏳ Streaming response...".to_string();
 
-        // Prepare messages for Ollama with explicit system message for steering
-        let steering_directive = SteeringDirective::custom("Be concise and helpful");
+        let steering_directive = SteeringDirective::custom(
+            "You are Yggdra, a local agentic assistant. You have access to tools for \
+             interacting with the local filesystem and running code. Available tools:\n\
+             - rg PATTERN PATH — search files with ripgrep\n\
+             - spawn BINARY ARGS — execute a local binary\n\
+             - editfile PATH — edit a file\n\
+             - commit \"MESSAGE\" — git commit\n\
+             - python SCRIPT ARGS — run a Python script\n\
+             - ruste FILE — compile and run Rust code\n\
+             To use a tool, output: [TOOL: name args]\n\
+             Be concise and helpful. You work entirely offline."
+        );
         let steering_text = steering_directive.format_for_system_prompt();
 
         let messages_for_ollama: Vec<Message> = self
@@ -417,37 +497,12 @@ impl App {
             .messages()
             .unwrap_or_default();
 
+        // Start streaming — returns immediately, tokens arrive via channel
         if let Some(client) = &self.ollama_client {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                client.generate(messages_for_ollama, Some(&steering_text))
-            ).await {
-                Ok(Ok(response)) => {
-                    let model_msg = Message::new("assistant", response.clone());
-                    if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
-                        eprintln!("Failed to save model response: {}", e);
-                        self.status_message = format!("⚠️ Response received but not saved: {}", self.friendly_error(&e.to_string()));
-                    } else {
-                        self.status_message = "✅ Model responded".to_string();
-                        self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
-                        crate::notifications::model_responded("🌻 New response ready").await;
-                    }
-                }
-                Ok(Err(e)) => {
-                    let friendly_msg = self.friendly_error(&e.to_string());
-                    eprintln!("Error sending message to Ollama: {}", e);
-                    self.status_message = format!("❌ Model error: {}", friendly_msg);
-                    crate::notifications::error_occurred(&friendly_msg).await;
-                }
-                Err(_) => {
-                    eprintln!("Timeout waiting for Ollama response");
-                    self.status_message = "❌ Model timeout: Response took too long (>2 minutes). Try a shorter message.".to_string();
-                    crate::notifications::error_occurred("Request timeout").await;
-                }
-            }
+            let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text));
+            self.stream_rx = Some(rx);
+            self.streaming_text.clear();
         }
-
-        self.waiting_for_response = false;
     }
 
     /// Convert technical errors to user-friendly messages

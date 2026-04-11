@@ -24,7 +24,8 @@ dirs = "6.0.0"
 notify-rust = "4.14.0"
 ratatui = "0.30.0"
 regex = "1.10"
-reqwest = { version = "0.12.10", features = ["json"] }
+reqwest = { version = "0.12.10", features = ["json", "stream"] }
+futures-util = "0.3"
 rusqlite = { version = "0.30", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
