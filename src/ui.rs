@@ -971,35 +971,41 @@ impl App {
         }
     }
 
-    /// Format message content with nice code block indentation
+    /// Format message content with nice code block indentation and language detection
     fn format_message_content(&self, content: &str) -> String {
         let mut result = String::new();
         let mut in_code_block = false;
-        let mut code_block_indent = String::new();
+        let mut code_language = String::new();
 
         for line in content.lines() {
-            // Detect code block markers (```
+            // Detect code block markers (```language)
             if line.trim_start().starts_with("```") {
-                in_code_block = !in_code_block;
-                if in_code_block {
-                    // Start of code block: add visual marker and set indent
-                    result.push_str("┌─ code\n");
-                    code_block_indent = "│ ".to_string();
+                if !in_code_block {
+                    // Start of code block: extract language and add visual marker
+                    let lang_part = line.trim_start().strip_prefix("```").unwrap_or("").trim();
+                    code_language = if lang_part.is_empty() {
+                        "code".to_string()
+                    } else {
+                        lang_part.to_string()
+                    };
+                    result.push_str(&format!("┌─ {}\n", code_language));
+                    in_code_block = true;
                 } else {
                     // End of code block
                     result.push_str("└─\n");
-                    code_block_indent.clear();
+                    in_code_block = false;
+                    code_language.clear();
                 }
                 continue;
             }
 
             if in_code_block {
-                // Add code line with indentation and border
-                result.push_str(&code_block_indent);
+                // Add code line with indentation (4 spaces + border)
+                result.push_str("│   ");
                 result.push_str(line);
             } else if line.starts_with("    ") || line.starts_with("\t") {
-                // Detect indented lines as code-like
-                result.push_str("  ");
+                // Detect indented lines as code-like (indent further)
+                result.push_str("    ");
                 result.push_str(line);
             } else {
                 result.push_str(line);
