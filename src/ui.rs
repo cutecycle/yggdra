@@ -43,6 +43,7 @@ struct PaletteCommand {
 }
 
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand { name: "shell",  description: "Run a shell command inline",          keywords: "run exec shell bash command terminal", fill: "/shell " },
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
@@ -278,7 +279,8 @@ impl App {
                 "New session started in `{cwd}`. \
                  Orient yourself: list the directory, review any existing tasks, \
                  and begin working autonomously. \
-                 Use tools to explore. Say [DONE] only when fully complete."
+                 Use tools to explore. When a task is fully complete, say [DONE] \
+                 to notify the user, then immediately continue to the next task."
             );
             self.handle_message(&kick).await;
         }
@@ -405,6 +407,9 @@ impl App {
         let tool_calls = agent::parse_tool_calls(&response_text);
         let spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
 
+        // Detect [DONE] signal: notify the user but do NOT stop — re-kick to continue
+        let signaled_done = response_text.contains("[DONE]");
+
         // Handle spawn_agent: show 🤖 N indicator in chat, execute first one
         if !spawn_calls.is_empty() && self.subagent_result_rx.is_none() {
             let (task_id, task_desc) = &spawn_calls[0];
@@ -425,6 +430,32 @@ impl App {
             self.status_message = format!("🔧 Executing tool: {} ...", call.name);
             self.execute_tool_async(call.name.clone(), call.args.clone());
             self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
+        } else if signaled_done {
+            // Agent thinks it's done — notify user but inject a continue kick
+            self.push_system_event("🌸 Agent signaled [DONE] — notifying & continuing…");
+            tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
+            self.status_message = "🌸 Milestone reached — finding next task".to_string();
+            // Re-kick with a continue prompt so the loop doesn't idle
+            let continue_msg = Message::new("user",
+                "Good work. Now find what's next — more tasks, improvements, \
+                 refactoring, or documentation. Keep going.");
+            if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
+                eprintln!("Failed to save continue kick: {}", e);
+            }
+            self.cached_message_count = self.message_buffer.count()
+                .unwrap_or(self.cached_message_count + 1);
+            // Immediately start next streaming turn
+            let steering = self.steering_text();
+            let messages = self.message_buffer.messages().unwrap_or_default();
+            if let Some(client) = &self.ollama_client {
+                self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+                self.streaming_text.clear();
+                self.turn_phase = TurnPhase::Streaming;
+                self.tool_iteration_count = 0;
+            } else {
+                self.turn_phase = TurnPhase::Idle;
+                self.tool_iteration_count = 0;
+            }
         } else {
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
                 self.status_message = "⚠️ Max tool iterations reached".to_string();
@@ -644,7 +675,10 @@ impl App {
              Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], [TOOL: spawn BINARY ARGS], \
              [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], [TOOL: ruste FILE].\n\
              Examples: [TOOL: spawn ls -la .] or [TOOL: rg TODO src/] or [TOOL: editfile Cargo.toml].\n\
-             Use tools proactively. Do not say you cannot access files—use [TOOL: spawn ls] instead. Be concise."
+             Use tools proactively. Do not say you cannot access files—use [TOOL: spawn ls] instead. Be concise.\n\
+             Say [DONE] when a task is complete — this notifies the user as a milestone. \
+             After [DONE], immediately find and begin the next task: improve, refactor, document, explore. \
+             Work is continuous; [DONE] is a checkpoint, not a stop."
         );
         if let Some(ctx) = &self.agents_context {
             base.push_str("\n\n--- AGENTS.md ---\n");
@@ -1263,6 +1297,13 @@ impl App {
         } else if command.starts_with("/checkpoint") {
             let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
             self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
+        } else if command.starts_with("/shell ") || command == "/shell" {
+            let shell_cmd = command.strip_prefix("/shell").unwrap_or("").trim().to_string();
+            if shell_cmd.is_empty() {
+                self.status_message = "Usage: /shell <command>".to_string();
+            } else {
+                self.handle_shell_command(shell_cmd).await;
+            }
         } else if command.starts_with('/') {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
@@ -1335,6 +1376,61 @@ impl App {
             Err(e) => {
                 self.status_message = format!("❌ Tool {} error: {}", tool_name, e);
             }
+        }
+    }
+
+    /// Handle /shell — run a shell command, show output in chat, inform the assistant
+    async fn handle_shell_command(&mut self, cmd: String) {
+        self.status_message = format!("⏳ Running: {}", cmd);
+
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await;
+
+        let (stdout, stderr, code) = match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let code = out.status.code().unwrap_or(-1);
+                (stdout, stderr, code)
+            }
+            Err(e) => (String::new(), format!("Failed to run: {e}"), -1),
+        };
+
+        let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+            (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
+            (false, true)  => stdout.trim().to_string(),
+            (true, false)  => stderr.trim().to_string(),
+            (true, true)   => "(no output)".to_string(),
+        };
+
+        let exit_label = if code == 0 { "✅".to_string() } else { format!("❌ exit {code}") };
+
+        // Show in chat as a tool message (indented, distinct style)
+        let tool_msg = Message::new("tool", format!("{exit_label} $ {cmd}\n{combined}"));
+        self.persist_message(tool_msg);
+        self.cached_message_count = self.message_buffer.count().unwrap_or(0);
+        self.status_message = format!("{exit_label} shell command done");
+
+        // Inject as user message so the assistant sees it and can respond
+        let context_msg = Message::new("user",
+            format!("I just ran this shell command:\n```\n$ {cmd}\n```\nOutput (exit {code}):\n```\n{combined}\n```"));
+        if let Err(e) = self.message_buffer.add_and_persist(context_msg) {
+            eprintln!("Failed to save shell context: {}", e);
+            return;
+        }
+        self.cached_message_count = self.message_buffer.count().unwrap_or(0);
+
+        // Trigger assistant response
+        let steering = self.steering_text();
+        let messages = self.message_buffer.messages().unwrap_or_default();
+        if let Some(client) = &self.ollama_client {
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+            self.streaming_text.clear();
+            self.turn_phase = TurnPhase::Streaming;
+            self.tool_iteration_count = 0;
         }
     }
 
