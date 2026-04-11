@@ -37,6 +37,8 @@ pub struct AgentConfig {
     pub model: String,
     pub endpoint: String,
     pub max_iterations: usize,
+    pub max_recursion_depth: usize,
+    pub current_depth: usize,
 }
 
 impl AgentConfig {
@@ -45,11 +47,18 @@ impl AgentConfig {
             model: model.into(),
             endpoint: endpoint.into(),
             max_iterations: 10,
+            max_recursion_depth: 10,
+            current_depth: 0,
         }
     }
 
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    pub fn with_max_recursion_depth(mut self, depth: usize) -> Self {
+        self.max_recursion_depth = depth;
         self
     }
 }
@@ -100,7 +109,92 @@ impl Agent {
         output.contains("[DONE]")
     }
 
-    /// Execute query with agentic loop
+    /// Simple execution loop: only tools, no subagent spawning (for subagents to prevent recursion)
+    pub async fn execute_simple(&mut self, user_query: &str) -> Result<String> {
+        let mut iteration = 0;
+        let mut messages: Vec<OllamaMessage> = vec![
+            OllamaMessage {
+                role: "system".to_string(),
+                content: Self::system_prompt_with_steering(),
+            },
+        ];
+
+        let steering = SteeringDirective::custom(
+            "Use tools to complete this task. Format tool calls as:\n\
+             [TOOL: name args]\n\
+             After execution, include results in your next response. Respond with [DONE] when complete."
+        );
+        let query_with_steering = format!(
+            "{}\n{}",
+            user_query,
+            steering.format_for_system_prompt()
+        );
+
+        messages.push(OllamaMessage {
+            role: "user".to_string(),
+            content: query_with_steering,
+        });
+
+        loop {
+            iteration += 1;
+            if iteration > self.config.max_iterations {
+                return Err(anyhow!("agent: max iterations ({}) reached", self.config.max_iterations));
+            }
+
+            let response = self.client.generate_with_messages(
+                &self.config.model,
+                messages.clone(),
+            ).await?;
+
+            let llm_output = response.message.content.clone();
+            messages.push(OllamaMessage {
+                role: "assistant".to_string(),
+                content: llm_output.clone(),
+            });
+
+            // Check for tool calls (no subagent spawning here)
+            let tool_calls = Self::parse_tool_calls(&llm_output);
+
+            if tool_calls.is_empty() {
+                if Self::is_done(&llm_output) {
+                    return Ok(llm_output);
+                }
+                messages.push(OllamaMessage {
+                    role: "user".to_string(),
+                    content: "Complete the task or respond with [DONE].".to_string(),
+                });
+                continue;
+            }
+
+            // Execute tools
+            let mut tool_results = String::new();
+            for call in tool_calls {
+                let result = match self.execute_tool(&call) {
+                    Ok(output) => output,
+                    Err(e) => format!("[ERROR]: {}", e),
+                };
+                tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
+            }
+
+            let steering = SteeringDirective::tool_response();
+            let injection = format!(
+                "Tool results:\n{}\n{}",
+                tool_results,
+                steering.format_for_system_prompt()
+            );
+
+            messages.push(OllamaMessage {
+                role: "user".to_string(),
+                content: injection,
+            });
+
+            if Self::is_done(&llm_output) {
+                return Ok(llm_output);
+            }
+        }
+    }
+
+    /// Execute query with agentic loop, supporting tool execution and subagent spawning
     pub async fn execute_with_tools(&mut self, user_query: &str) -> Result<String> {
         let mut iteration = 0;
         let mut messages: Vec<OllamaMessage> = vec![
@@ -112,8 +206,10 @@ impl Agent {
 
         // Add user query with steering injection for tool use
         let steering = SteeringDirective::custom(
-            "Use tools to answer this query. Format tool calls as [TOOL: name args]. \
-             After each tool execution, include results in your next response."
+            "Use tools or spawn subagents to answer this query. Format calls as:\n\
+             [TOOL: name args] for local tools\n\
+             [TOOL: spawn_agent task_id \"description\"] for parallel subagents.\n\
+             After execution, include results in your next response."
         );
         let query_with_steering = format!(
             "{}\n{}",
@@ -148,9 +244,15 @@ impl Agent {
 
             // Check for tool calls
             let tool_calls = Self::parse_tool_calls(&llm_output);
+            let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
+            
+            // Disable subagent spawning if recursion depth limit reached
+            if self.config.current_depth >= self.config.max_recursion_depth {
+                spawn_calls.clear();
+            }
 
-            if tool_calls.is_empty() {
-                // No tools called, we're done
+            if tool_calls.is_empty() && spawn_calls.is_empty() {
+                // No tools or subagents called
                 if Self::is_done(&llm_output) {
                     return Ok(llm_output);
                 }
@@ -172,10 +274,40 @@ impl Agent {
                 tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
             }
 
-            // Inject tool results into next query with steering
-            let steering = SteeringDirective::tool_response();
+            // Spawn subagents (in parallel, but we'll await them sequentially for simplicity)
+            for (task_id, task_desc) in &spawn_calls {
+                let mut child_config = self.config.clone();
+                child_config.current_depth += 1;
+                
+                let subagent_result = crate::spawner::spawn_subagent(
+                    "agent",
+                    task_id,
+                    task_desc,
+                    &self.config.endpoint,
+                    child_config,
+                ).await;
+
+                match subagent_result {
+                    Ok(result) => {
+                        tool_results.push_str(&format!("{}\n", result.to_injection()));
+                    }
+                    Err(e) => {
+                        tool_results.push_str(&format!(
+                            "[SUBAGENT_ERROR: {} = {}]\n",
+                            task_id, e
+                        ));
+                    }
+                }
+            }
+
+            // Inject tool and subagent results with steering
+            let steering = if !spawn_calls.is_empty() {
+                SteeringDirective::custom(&crate::spawner::AgentResult::return_steering())
+            } else {
+                SteeringDirective::tool_response()
+            };
             let injection = format!(
-                "Tool execution results:\n{}\n{}",
+                "Execution results:\n{}\n{}",
                 tool_results,
                 steering.format_for_system_prompt()
             );

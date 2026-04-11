@@ -42,20 +42,22 @@ pub async fn spawn_subagent(
     parent_id: &str,
     task_id: &str,
     task_description: &str,
-    client: OllamaClient,
+    endpoint: &str,
     config: AgentConfig,
 ) -> Result<AgentResult> {
+    let client = OllamaClient::new(endpoint, &config.model).await?;
     let mut agent = Agent::new(config, client).await?;
     
     let full_prompt = format!(
         "Subagent {}/{}\n\
          Task: {}\n\
          Complete this task and provide a clear, concise result.\n\
-         You have access to tools: rg, spawn, editfile, commit, python, ruste.",
+         You have access to tools: rg, spawn, editfile, commit, python, ruste.\n\
+         Respond with [DONE] when complete.",
         parent_id, task_id, task_description
     );
 
-    match agent.execute_with_tools(&full_prompt).await {
+    match agent.execute_simple(&full_prompt).await {
         Ok(output) => Ok(AgentResult {
             agent_id: format!("{}/{}", parent_id, task_id),
             task_description: task_description.to_string(),
