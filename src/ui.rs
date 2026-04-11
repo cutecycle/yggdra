@@ -372,31 +372,28 @@ impl App {
             )
             .split(f.area());
 
-        // Header
+        // Header with context window indicator
         let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
         let mode_indicator = match self.mode {
             AppMode::Build => "⚡ Build",
             AppMode::Plan => "🧠 Plan",
         };
-        let header_text = match &self.turn_phase {
-            TurnPhase::Streaming if self.tool_iteration_count > 0 => {
-                format!("🌷 {} | {} | {} | ⏳ Tool follow-up ({}/{})",
-                    mode_indicator, connection_status, self.config.model,
-                    self.tool_iteration_count, MAX_TOOL_ITERATIONS)
-            }
-            TurnPhase::Streaming => {
-                format!("🌷 {} | {} | {} | ⏳ Streaming...",
-                    mode_indicator, connection_status, self.config.model)
-            }
-            TurnPhase::ExecutingTool(name) => {
-                format!("🌷 {} | {} | {} | 🔧 Running {}...",
-                    mode_indicator, connection_status, self.config.model, name)
-            }
-            TurnPhase::Idle => {
-                format!("🌷 {} | {} | {}",
-                    mode_indicator, connection_status, self.config.model)
-            }
+        
+        // Estimate context window usage (rough: message count affects token count)
+        let message_count = self.cached_message_count as f64;
+        let estimated_tokens = message_count * 150.0; // rough avg tokens per message
+        let context_window = 4096.0; // for qwen:3.5-chat typical
+        let usage_percent = (estimated_tokens / context_window * 100.0).min(100.0) as u32;
+        let context_indicator = if usage_percent > 70 {
+            format!("🔴 {}%", usage_percent)
+        } else if usage_percent > 50 {
+            format!("🟡 {}%", usage_percent)
+        } else {
+            format!("🟢 {}%", usage_percent)
         };
+        
+        let header_text = format!("🌷 {} | {} | {} | {}", 
+            mode_indicator, connection_status, self.config.model, context_indicator);
 
         let header = Paragraph::new(header_text)
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
