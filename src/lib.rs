@@ -6,6 +6,7 @@ pub mod notifications;
 pub mod ollama;
 pub mod session;
 pub mod steering;
+pub mod theme;
 pub mod ui;
 pub mod tools;
 pub mod agent;

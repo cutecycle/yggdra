@@ -6,6 +6,7 @@ mod notifications;
 mod ollama;
 mod session;
 mod steering;
+mod theme;
 mod tools;
 mod agent;
 mod spawner;

@@ -6,6 +6,7 @@ use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
 use crate::steering::SteeringDirective;
 use crate::task::{TaskManager, Checkpoint};
+use crate::theme::Theme;
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use crossterm::{
@@ -185,6 +186,8 @@ pub struct App {
     model_picker_items: Vec<String>,
     /// Currently highlighted model in picker
     model_picker_selection: usize,
+    /// Detected terminal theme (light/dark + colour palette)
+    theme: Theme,
 }
 
 impl App {
@@ -254,6 +257,7 @@ impl App {
             model_picker_open: false,
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
+            theme: Theme::detect(),
         }
     }
 
@@ -800,26 +804,18 @@ impl App {
             let (emoji, bg_tint, show_band) = match msg.role.as_str() {
                 "user" => {
                     exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 {
-                        Color::Rgb(218, 228, 242) // soft blue
-                    } else {
-                        Color::Rgb(220, 238, 220) // soft green
-                    };
+                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
                     ("👤", Some(tint), true)
                 }
                 "assistant" => {
                     exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 {
-                        Color::Rgb(218, 228, 242)
-                    } else {
-                        Color::Rgb(220, 238, 220)
-                    };
+                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
                     ("🤖", Some(tint), true)
                 }
                 "tool"   => ("🔧", None, false),
                 "system" => ("⚙️", None, false),
                 "clock"  => ("🕐", None, false),
-                "spawn"  => ("🤖", Some(Color::Rgb(210, 238, 235)), true),
+                "spawn"  => ("🤖", Some(self.theme.band_spawn), true),
                 _        => ("💬", None, false),
             };
 
@@ -839,7 +835,13 @@ impl App {
             let height = (line_count + wrap_extra).max(1) as u16;
 
             let style = if show_band {
-                Style::default().bg(bg_tint.unwrap()) // no explicit fg → terminal default text color
+                // Dark theme: set explicit light fg so text contrasts against dark band
+                // Light theme: no explicit fg → terminal's dark default text shows through
+                if self.theme.kind == crate::theme::ThemeKind::Dark {
+                    Style::default().fg(Color::Rgb(220, 230, 240)).bg(bg_tint.unwrap())
+                } else {
+                    Style::default().bg(bg_tint.unwrap())
+                }
             } else {
                 Style::default()
             };
@@ -849,11 +851,7 @@ impl App {
 
         // Add streaming text as a virtual message at the end
         if !self.streaming_text.is_empty() {
-            let tint = if exchange_idx % 2 == 0 {
-                Color::Rgb(218, 228, 242)
-            } else {
-                Color::Rgb(220, 238, 220)
-            };
+            let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
             let agent_badge = if self.active_subagents > 0 {
                 format!(" [🤖{}]", self.active_subagents)
             } else {
@@ -867,11 +865,12 @@ impl App {
                     .sum::<u16>() as usize
             } else { 0 };
             let height = (line_count + wrap_extra).max(1) as u16;
-            rendered.push(RenderedMsg {
-                text: stream_text,
-                style: Style::default().bg(tint),
-                height,
-            });
+            let stream_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
+                Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
+            } else {
+                Style::default().bg(tint)
+            };
+            rendered.push(RenderedMsg { text: stream_text, style: stream_style, height });
         }
 
         // Calculate total content height and clamp scroll_offset
@@ -975,17 +974,17 @@ impl App {
                             Span::styled(
                                 format!(" /{:<16}", cmd.name),
                                 if i == self.palette_selection {
-                                    Style::default().fg(Color::Black).bg(Color::Rgb(42, 161, 152)).add_modifier(Modifier::BOLD)
+                                    Style::default().fg(self.theme.selected_fg).bg(self.theme.accent).add_modifier(Modifier::BOLD)
                                 } else {
-                                    Style::default().fg(Color::Rgb(42, 161, 152))
+                                    Style::default().fg(self.theme.accent)
                                 },
                             ),
                             Span::styled(
                                 format!(" {}", cmd.description),
                                 if i == self.palette_selection {
-                                    Style::default().fg(Color::Black).bg(Color::Rgb(42, 161, 152))
+                                    Style::default().fg(self.theme.selected_fg).bg(self.theme.accent)
                                 } else {
-                                    Style::default() // terminal default — readable on both light and dark
+                                    Style::default()
                                 },
                             ),
                         ]);
@@ -1026,11 +1025,11 @@ impl App {
                     let marker = if is_current { "✦ " } else { "  " };
                     let label = format!("{}{}", marker, name);
                     let style = if i == self.model_picker_selection {
-                        Style::default().fg(Color::Black).bg(Color::Rgb(108, 113, 196)).add_modifier(Modifier::BOLD) // solarized violet
+                        Style::default().fg(self.theme.selected_fg).bg(self.theme.violet).add_modifier(Modifier::BOLD)
                     } else if is_current {
-                        Style::default().fg(Color::Rgb(108, 113, 196)) // violet accent, visible on light bg
+                        Style::default().fg(self.theme.violet)
                     } else {
-                        Style::default() // terminal default
+                        Style::default()
                     };
                     ListItem::new(Span::styled(label, style))
                 }).collect();
@@ -1046,7 +1045,7 @@ impl App {
                 .block(Block::default()
                     .borders(Borders::ALL)
                     .title(scroll_indicator)
-                    .border_style(Style::default().fg(Color::Rgb(108, 113, 196))));
+                    .border_style(Style::default().fg(self.theme.violet)));
             f.render_widget(Clear, picker_rect);
             f.render_widget(picker, picker_rect);
         }
