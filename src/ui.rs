@@ -784,12 +784,10 @@ impl App {
              • [TOOL: commit MSG] — git commit changes\n\
              • [TOOL: python SCRIPT ARGS] — run Python code\n\
              • [TOOL: ruste FILE] — compile & execute Rust code\n\
-             • [TOOL: think THOUGHT] — thinking block (show your reasoning, visible to user)\n\
              TOOL EXAMPLES:\n\
              [TOOL: rg TODO src/] — find TODO comments\n\
              [TOOL: editfile Cargo.toml] — read or update manifest\n\
              [TOOL: spawn ls -la] — list current directory\n\
-             [TOOL: think I should start by reading the task file to understand requirements]\n\
              Never say \"I cannot access files.\" Use [TOOL: rg] or [TOOL: spawn] instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
              \n\
