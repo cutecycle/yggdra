@@ -1,6 +1,8 @@
 mod config;
 mod message;
+mod notifications;
 mod session;
+mod steering;
 mod ui;
 
 use anyhow::Result;
@@ -19,6 +21,9 @@ async fn main() -> Result<()> {
     eprintln!("🌷 Yggdra v0.1 starting...");
     eprintln!("📁 Session: {}", session.id);
     eprintln!("📝 Messages file: {}", session.messages_file.display());
+
+    // Emit session creation notification
+    notifications::session_created(&session.id).await;
 
     // Run TUI
     let mut app = App::new(config, session);
