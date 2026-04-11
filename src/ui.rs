@@ -14,10 +14,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 use std::io;
@@ -27,6 +27,59 @@ use tokio::sync::{mpsc, oneshot};
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// A command that can be invoked from the palette
+struct PaletteCommand {
+    /// The slash command text (without leading /)
+    name: &'static str,
+    /// Short description shown in palette
+    description: &'static str,
+    /// Extra keywords for fuzzy matching (space-separated)
+    keywords: &'static str,
+    /// What to fill into the input when selected
+    fill: &'static str,
+}
+
+const PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
+    PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
+    PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
+    PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
+    PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
+    PaletteCommand { name: "tool spawn",    description: "Execute a local binary",      keywords: "run exec spawn binary program",     fill: "/tool spawn " },
+    PaletteCommand { name: "tool commit",   description: "Git commit with message",     keywords: "git save version commit history",   fill: "/tool commit " },
+    PaletteCommand { name: "tool python",   description: "Run a Python script",         keywords: "python py script run execute",      fill: "/tool python " },
+    PaletteCommand { name: "tool ruste",    description: "Compile and run Rust code",   keywords: "rust compile execute cargo rustc",  fill: "/tool ruste " },
+];
+
+/// Fuzzy match: returns a score > 0 if all query chars appear in target in order.
+/// Higher score = better match (chars close together and near the start).
+fn fuzzy_score(query: &str, target: &str) -> i32 {
+    if query.is_empty() {
+        return 1;
+    }
+    let query = query.to_lowercase();
+    let target = target.to_lowercase();
+    let mut qi = query.chars().peekable();
+    let mut last_match = 0usize;
+    let mut score = 100i32;
+
+    for (ti, tc) in target.chars().enumerate() {
+        if let Some(&qc) = qi.peek() {
+            if tc == qc {
+                if ti > 0 {
+                    score -= (ti - last_match) as i32; // penalise gaps
+                }
+                last_match = ti;
+                qi.next();
+            }
+        } else {
+            break;
+        }
+    }
+
+    if qi.peek().is_none() { score } else { 0 } // 0 = no match
+}
 
 /// RAII guard to restore terminal state on drop (including panics/errors)
 struct TerminalGuard;
@@ -93,6 +146,10 @@ pub struct App {
     mode: AppMode,
     /// Contents of AGENTS.md if found on startup
     agents_task: Option<String>,
+    /// Whether the command palette is open
+    palette_open: bool,
+    /// Which palette item is highlighted
+    palette_selection: usize,
 }
 
 impl App {
@@ -132,6 +189,8 @@ impl App {
             tool_result_rx: None,
             mode: AppMode::Build,
             agents_task: agents_md,
+            palette_open: false,
+            palette_selection: 0,
         }
     }
 
@@ -463,6 +522,51 @@ impl App {
             .block(Block::default().title(" 🌱 Input ").borders(Borders::ALL));
         f.render_widget(input, chunks[2]);
 
+        // Command palette overlay (above input box)
+        if self.palette_open {
+            let matches = self.palette_matches();
+            if !matches.is_empty() {
+                let palette_height = (matches.len().min(8) + 2) as u16;
+                let area = chunks[2];
+                // Float palette just above the input box
+                let palette_rect = Rect {
+                    x: area.x,
+                    y: area.y.saturating_sub(palette_height),
+                    width: area.width.min(60),
+                    height: palette_height,
+                };
+                let items: Vec<ListItem> = matches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cmd)| {
+                        let line = Line::from(vec![
+                            Span::styled(
+                                format!(" /{:<16}", cmd.name),
+                                if i == self.palette_selection {
+                                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Cyan)
+                                },
+                            ),
+                            Span::styled(
+                                format!(" {}", cmd.description),
+                                if i == self.palette_selection {
+                                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                                } else {
+                                    Style::default().fg(Color::Gray)
+                                },
+                            ),
+                        ]);
+                        ListItem::new(line)
+                    })
+                    .collect();
+                let palette = List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(" 🌼 Commands "));
+                f.render_widget(Clear, palette_rect);
+                f.render_widget(palette, palette_rect);
+            }
+        }
+
         // Status bar
         let status = format!(
             "🔢 {} | 💬 {} | {}",
@@ -484,20 +588,86 @@ impl App {
                     self.running = false;
                 }
             }
+            // Open palette on '/'
+            KeyCode::Char('/') if self.input_buffer.is_empty() => {
+                self.input_buffer.push('/');
+                self.palette_open = true;
+                self.palette_selection = 0;
+            }
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
+                if self.palette_open {
+                    self.palette_selection = 0; // reset selection on new char
+                }
             }
             KeyCode::Backspace => {
                 self.input_buffer.pop();
+                if self.palette_open && (self.input_buffer.is_empty() || !self.input_buffer.starts_with('/')) {
+                    self.palette_open = false;
+                }
+            }
+            KeyCode::Down if self.palette_open => {
+                let count = self.palette_matches().len();
+                if count > 0 {
+                    self.palette_selection = (self.palette_selection + 1) % count;
+                }
+            }
+            KeyCode::Up if self.palette_open => {
+                let count = self.palette_matches().len();
+                if count > 0 {
+                    self.palette_selection = self.palette_selection.saturating_sub(1);
+                }
+            }
+            KeyCode::Tab if self.palette_open => {
+                // Tab completes the highlighted item
+                let matches = self.palette_matches();
+                if let Some(&cmd) = matches.get(self.palette_selection) {
+                    self.input_buffer = cmd.fill.to_string();
+                    self.palette_open = false;
+                }
+            }
+            KeyCode::Enter if self.palette_open => {
+                let matches = self.palette_matches();
+                if let Some(&cmd) = matches.get(self.palette_selection) {
+                    self.input_buffer = cmd.fill.to_string();
+                    self.palette_open = false;
+                    // Only submit immediately if fill has no trailing space (i.e. doesn't need args)
+                    if !cmd.fill.ends_with(' ') {
+                        self.handle_command().await;
+                    }
+                } else {
+                    self.palette_open = false;
+                    self.handle_command().await;
+                }
             }
             KeyCode::Enter => {
                 self.handle_command().await;
             }
             KeyCode::Esc => {
-                self.input_buffer.clear();
+                if self.palette_open {
+                    self.palette_open = false;
+                    self.input_buffer.clear();
+                } else {
+                    self.input_buffer.clear();
+                }
             }
             _ => {}
         }
+    }
+
+    /// Return palette commands matching the current query, scored by relevance
+    fn palette_matches(&self) -> Vec<&'static PaletteCommand> {
+        let query = self.input_buffer.trim_start_matches('/');
+        let mut scored: Vec<(i32, &'static PaletteCommand)> = PALETTE_COMMANDS
+            .iter()
+            .filter_map(|cmd| {
+                let haystack = format!("{} {} {}", cmd.name, cmd.description, cmd.keywords);
+                let s = fuzzy_score(query, &haystack);
+                if s > 0 { Some((s, cmd)) } else { None }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, c)| c).collect()
     }
 
     /// Handle command submission
