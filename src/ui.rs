@@ -946,6 +946,8 @@ impl App {
             };
 
             rendered.push(RenderedMsg { text: text_content, style, height: height + 1 });
+            // Add blank line for breathing room
+            rendered.push(RenderedMsg { text: "\n".to_string(), style: Style::default(), height: 1 });
         }
 
         // Add streaming text as a virtual message at the end
@@ -1231,6 +1233,9 @@ impl App {
                         let raw = self.model_picker_items[orig_i].clone();
                         let model_name = raw.split_whitespace().next().unwrap_or(&raw).to_string();
                         self.config.model = model_name.clone();
+                        if let Err(e) = self.config.save() {
+                            eprintln!("⚠️ Failed to save config: {}", e);
+                        }
                         let endpoint = self.config.endpoint.clone();
                         match OllamaClient::new(&endpoint, &model_name).await {
                             Ok(client) => {

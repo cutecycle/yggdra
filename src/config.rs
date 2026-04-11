@@ -105,4 +105,17 @@ impl Config {
 
         Config { endpoint, model, context_window }
     }
+
+    /// Persist config to .yggdra/config.toml (creates dir if needed)
+    pub fn save(&self) -> std::io::Result<()> {
+        let dir = std::env::current_dir()?
+            .join(".yggdra");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        let toml_str = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, toml_str)?;
+        eprintln!("💾 Saved config to {}", path.display());
+        Ok(())
+    }
 }
