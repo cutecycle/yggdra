@@ -101,10 +101,32 @@ impl Tool for RipgrepTool {
 pub struct SpawnTool;
 
 impl SpawnTool {
+    /// Blocked absolute paths to prevent shell takeover
     fn is_absolute_dangerous_path(path: &str) -> bool {
-        // Block absolute paths to system directories
         let dangerous_prefixes = ["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"];
         dangerous_prefixes.iter().any(|p| path.starts_with(p))
+    }
+
+    /// Resolve a binary name via PATH, returning the full path if found.
+    /// Falls back to the given string if it looks like a relative/absolute path already.
+    fn resolve_binary(name: &str) -> Option<std::path::PathBuf> {
+        // Already an explicit path — check it directly
+        if name.contains('/') {
+            let p = std::path::Path::new(name);
+            return if p.exists() { Some(p.to_path_buf()) } else { None };
+        }
+
+        // Search each entry on PATH
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                let candidate = std::path::Path::new(dir).join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -121,14 +143,14 @@ impl Tool for SpawnTool {
         if parts.is_empty() {
             return Err(anyhow!("spawn: no binary specified"));
         }
-        let binary_path = parts[0];
-        
-        if Self::is_absolute_dangerous_path(binary_path) {
-            return Err(anyhow!("spawn: dangerous system path blocked: {}", binary_path));
+        let binary = parts[0];
+
+        if Self::is_absolute_dangerous_path(binary) {
+            return Err(anyhow!("spawn: dangerous system path blocked: {}", binary));
         }
-        
-        if !Path::new(binary_path).exists() {
-            return Err(anyhow!("spawn: binary not found: {}", binary_path));
+
+        if Self::resolve_binary(binary).is_none() {
+            return Err(anyhow!("spawn: binary not found: {}", binary));
         }
 
         Ok(())
@@ -138,15 +160,18 @@ impl Tool for SpawnTool {
         self.validate_input(args)?;
 
         let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        let binary_path = parts[0];
+        let binary = parts[0];
         let child_args = if parts.len() > 1 { parts[1] } else { "" };
 
+        let resolved = Self::resolve_binary(binary)
+            .ok_or_else(|| anyhow!("spawn: binary not found: {}", binary))?;
+
         let output = if child_args.is_empty() {
-            Command::new(binary_path)
+            Command::new(&resolved)
                 .output()
                 .map_err(|e| anyhow!("spawn: execution failed: {}", e))?
         } else {
-            Command::new(binary_path)
+            Command::new(&resolved)
                 .args(child_args.split_whitespace())
                 .output()
                 .map_err(|e| anyhow!("spawn: execution failed: {}", e))?
@@ -502,13 +527,32 @@ mod tests {
     #[test]
     fn test_spawn_validation() {
         let tool = SpawnTool;
-        
-        // Invalid system paths
+
+        // Absolute dangerous paths always blocked
         assert!(tool.validate_input("/bin/bash").is_err());
         assert!(tool.validate_input("/usr/bin/python").is_err());
-        
-        // Valid paths would need actual binaries
+
+        // Empty args always error
         assert!(tool.validate_input("").is_err());
+
+        // Non-existent binaries rejected
+        assert!(tool.validate_input("definitely_not_a_real_binary_xyzzy").is_err());
+
+        // Common Unix tools on PATH should resolve fine
+        // (ls, cat, echo are on every POSIX system)
+        assert!(tool.validate_input("ls").is_ok(), "ls should resolve via PATH");
+        assert!(tool.validate_input("echo hello").is_ok(), "echo should resolve via PATH");
+    }
+
+    #[test]
+    fn test_spawn_path_resolution() {
+        // resolve_binary("ls") should find something under /bin or /usr/bin
+        let resolved = SpawnTool::resolve_binary("ls");
+        assert!(resolved.is_some(), "ls must be resolvable on any POSIX system");
+        assert!(resolved.unwrap().exists());
+
+        // Non-existent names should return None
+        assert!(SpawnTool::resolve_binary("xyzzy_no_such_binary").is_none());
     }
 
     #[test]

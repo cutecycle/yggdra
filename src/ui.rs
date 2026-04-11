@@ -151,6 +151,10 @@ pub struct App {
     tool_result_rx: Option<oneshot::Receiver<ToolResult>>,
     /// Receives result from async gap query
     gap_rx: Option<oneshot::Receiver<Option<crate::gaps::Gap>>>,
+    /// Async writer for .yggdra/log hierarchy
+    log_sender: Option<crate::msglog::LogSender>,
+    /// Root of the .yggdra/log directory for searches
+    log_dir: std::path::PathBuf,
     /// Build (autonomous) vs Plan (interactive) mode
     mode: AppMode,
     /// Contents of AGENTS.md if found on startup
@@ -187,6 +191,13 @@ impl App {
             "❌ Ollama offline".to_string()
         };
 
+        // Start async log writer: .yggdra/log/ in cwd
+        let log_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".yggdra")
+            .join("log");
+        let log_sender = Some(crate::msglog::start(log_dir.clone()));
+
         Self {
             config,
             session,
@@ -204,6 +215,8 @@ impl App {
             tool_iteration_count: 0,
             tool_result_rx: None,
             gap_rx: None,
+            log_sender,
+            log_dir,
             mode: AppMode::Build,
             agents_task: agents_md,
             palette_open: false,
@@ -486,9 +499,17 @@ impl App {
     /// Push a system-level notice into the conversation (compaction, warnings, etc.)
     fn push_system_event(&mut self, text: impl Into<String>) {
         let msg = Message::new("system", text);
-        let _ = self.message_buffer.add_and_persist(msg);
+        self.persist_message(msg);
         self.cached_message_count = self.message_buffer.messages()
             .map(|v| v.len()).unwrap_or(0);
+    }
+
+    /// Persist a message to SQLite and asynchronously write it to .yggdra/log
+    fn persist_message(&mut self, msg: Message) -> bool {
+        if let Some(sender) = &self.log_sender as &Option<crate::msglog::LogSender> {
+            sender.log(&msg);
+        }
+        self.message_buffer.add_and_persist(msg).is_ok()
     }
 
     /// Draw UI frame
@@ -1102,39 +1123,33 @@ impl App {
         }
     }
 
-    /// Handle /tool mem command to search scrollback memory
+    /// Handle /tool mem command — searches .yggdra/log (the single source of truth)
     fn handle_mem_command(&mut self, query: &str) {
         if query.is_empty() {
             self.status_message = "❌ mem: search query required. Usage: /tool mem QUERY".to_string();
             return;
         }
 
-        match self.message_buffer.search_scrollback(query) {
-            Ok(results) => {
-                if results.is_empty() {
-                    self.status_message = format!("🔍 No scrollback results for '{}'", query);
-                    return;
-                }
+        let log_dir = self.log_dir.clone();
+        let results = crate::msglog::search_log(&log_dir, query, 10);
 
-                let summary = format!("🔍 Found {} results in scrollback for '{}'", results.len(), query);
-                self.push_system_event(&summary);
+        if results.is_empty() {
+            self.status_message = format!("🔍 No results for '{}' in .yggdra/log", query);
+            return;
+        }
 
-                // Add top results to conversation
-                let mut output = format!("Search results for '{}' in scrollback:\n\n", query);
-                for (msg, _archived_at) in results.iter().take(5) {
-                    output.push_str(&format!("{}: {}\n\n", msg.role.to_uppercase(), msg.content));
-                }
+        let mut output = format!("🔍 Search results for '{}' ({} found):\n\n", query, results.len());
+        for m in results.iter().take(5) {
+            // Show partition path relative to log_dir for context (e.g. 2026/04/11/0936)
+            let rel = m.path.strip_prefix(&log_dir).unwrap_or(&m.path);
+            output.push_str(&format!("**{}** ({})\n{}\n\n", m.role.to_uppercase(), rel.display(), m.excerpt));
+        }
 
-                let mem_msg = Message::new("tool", output);
-                if let Err(e) = self.message_buffer.add_and_persist(mem_msg) {
-                    self.status_message = format!("❌ Failed to save search results: {}", e);
-                } else {
-                    self.status_message = format!("✅ mem: {} results found", results.len());
-                }
-            }
-            Err(e) => {
-                self.status_message = format!("❌ mem search failed: {}", e);
-            }
+        let mem_msg = Message::new("tool", output);
+        if let Err(e) = self.message_buffer.add_and_persist(mem_msg) {
+            self.status_message = format!("❌ Failed to save search results: {}", e);
+        } else {
+            self.status_message = format!("🔍 {} results for '{}'", results.len(), query);
         }
     }
 
