@@ -1319,6 +1319,9 @@ impl App {
                     self.handle_command().await;
                 }
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.input_buffer.push('\n');
+            }
             KeyCode::Enter => {
                 self.handle_command().await;
             }
