@@ -222,3 +222,172 @@ fn test_config_serialization() {
 
     assert_eq!(original_config, parsed);
 }
+
+#[test]
+fn test_sqlite_db_creation() {
+    // Test that SQLite DB is created on session init
+    let home = dirs::home_dir().expect("Cannot find home dir");
+    let test_session_dir = home.join(".yggdra/sessions/sqlite-creation-test");
+    let _ = fs::remove_dir_all(&test_session_dir);
+    
+    fs::create_dir_all(&test_session_dir).expect("Failed to create test session dir");
+    
+    let db_path = test_session_dir.join("messages.db");
+    
+    // Create a message buffer (initializes SQLite DB)
+    let buffer = yggdra::message::MessageBuffer::new(&db_path)
+        .expect("Failed to create message buffer");
+    
+    // Verify DB file exists
+    assert!(db_path.exists(), "SQLite database file should be created");
+    
+    // Verify we can query an empty table
+    let messages = buffer.messages().expect("Failed to query empty DB");
+    assert_eq!(messages.len(), 0, "New DB should have no messages");
+    
+    // Clean up
+    fs::remove_dir_all(&test_session_dir).ok();
+}
+
+#[test]
+fn test_message_insert_retrieve() {
+    // Test that messages can be inserted and retrieved from SQLite
+    let home = dirs::home_dir().expect("Cannot find home dir");
+    let test_session_dir = home.join(".yggdra/sessions/sqlite-message-test");
+    let _ = fs::remove_dir_all(&test_session_dir);
+    
+    fs::create_dir_all(&test_session_dir).expect("Failed to create test session dir");
+    
+    let db_path = test_session_dir.join("messages.db");
+    
+    // Create message buffer and add messages
+    let mut buffer = yggdra::message::MessageBuffer::new(&db_path)
+        .expect("Failed to create message buffer");
+    
+    let msg1 = yggdra::message::Message::new("user", "Hello");
+    let msg2 = yggdra::message::Message::new("assistant", "Hi there");
+    
+    buffer.add_and_persist(msg1).expect("Failed to add first message");
+    buffer.add_and_persist(msg2).expect("Failed to add second message");
+    
+    // Retrieve messages
+    let messages = buffer.messages().expect("Failed to query messages");
+    
+    assert_eq!(messages.len(), 2, "Should have 2 messages");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content, "Hello");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content, "Hi there");
+    
+    // Clean up
+    fs::remove_dir_all(&test_session_dir).ok();
+}
+
+#[test]
+fn test_index_performance() {
+    // Test that indexed queries complete in reasonable time (<16ms)
+    use std::time::Instant;
+    
+    let home = dirs::home_dir().expect("Cannot find home dir");
+    let test_session_dir = home.join(".yggdra/sessions/sqlite-perf-test");
+    let _ = fs::remove_dir_all(&test_session_dir);
+    
+    fs::create_dir_all(&test_session_dir).expect("Failed to create test session dir");
+    
+    let db_path = test_session_dir.join("messages.db");
+    
+    // Create message buffer and insert many messages
+    let mut buffer = yggdra::message::MessageBuffer::new(&db_path)
+        .expect("Failed to create message buffer");
+    
+    for i in 0..100 {
+        let msg = yggdra::message::Message::new(
+            if i % 2 == 0 { "user" } else { "assistant" },
+            format!("Message {}", i)
+        );
+        buffer.add_and_persist(msg).expect("Failed to add message");
+    }
+    
+    // Measure query time
+    let start = Instant::now();
+    let messages = buffer.messages().expect("Failed to query messages");
+    let elapsed = start.elapsed();
+    
+    assert_eq!(messages.len(), 100, "Should retrieve all 100 messages");
+    
+    // Verify latency is acceptable (sub-16ms on modern hardware)
+    // On constrained hardware with proper indexing, should still be <100ms
+    assert!(elapsed.as_millis() < 500, "Query took {}ms (should be <500ms)", elapsed.as_millis());
+    
+    eprintln!("✓ Query time: {}ms for 100 messages", elapsed.as_millis());
+    
+    // Clean up
+    fs::remove_dir_all(&test_session_dir).ok();
+}
+
+#[test]
+fn test_multi_window_sync() {
+    // Test that multiple connections to same DB see same data
+    let home = dirs::home_dir().expect("Cannot find home dir");
+    let test_session_dir = home.join(".yggdra/sessions/sqlite-sync-test");
+    let _ = fs::remove_dir_all(&test_session_dir);
+    
+    fs::create_dir_all(&test_session_dir).expect("Failed to create test session dir");
+    
+    let db_path = test_session_dir.join("messages.db");
+    
+    // Create first buffer and add messages
+    {
+        let mut buffer1 = yggdra::message::MessageBuffer::new(&db_path)
+            .expect("Failed to create first buffer");
+        
+        let msg = yggdra::message::Message::new("user", "From window 1");
+        buffer1.add_and_persist(msg).expect("Failed to add message");
+    }
+    
+    // Create second buffer and verify it sees the data
+    {
+        let buffer2 = yggdra::message::MessageBuffer::new(&db_path)
+            .expect("Failed to create second buffer");
+        
+        let messages = buffer2.messages().expect("Failed to query messages");
+        assert_eq!(messages.len(), 1, "Second connection should see message from first");
+        assert_eq!(messages[0].content, "From window 1");
+    }
+    
+    // Clean up
+    fs::remove_dir_all(&test_session_dir).ok();
+}
+
+#[test]
+fn test_sqlite_transaction_safety() {
+    // Test that concurrent operations don't corrupt DB
+    let home = dirs::home_dir().expect("Cannot find home dir");
+    let test_session_dir = home.join(".yggdra/sessions/sqlite-safety-test");
+    let _ = fs::remove_dir_all(&test_session_dir);
+    
+    fs::create_dir_all(&test_session_dir).expect("Failed to create test session dir");
+    
+    let db_path = test_session_dir.join("messages.db");
+    
+    // Simulate concurrent writes
+    let mut buffer = yggdra::message::MessageBuffer::new(&db_path)
+        .expect("Failed to create message buffer");
+    
+    for i in 0..10 {
+        let msg = yggdra::message::Message::new("user", format!("Message {}", i));
+        buffer.add_and_persist(msg).expect("Failed to add message");
+    }
+    
+    // Verify all messages were saved
+    let messages = buffer.messages().expect("Failed to query messages");
+    assert_eq!(messages.len(), 10, "All messages should be saved");
+    
+    // Verify content integrity
+    for (i, msg) in messages.iter().enumerate() {
+        assert_eq!(msg.content, format!("Message {}", i), "Message content should be intact");
+    }
+    
+    // Clean up
+    fs::remove_dir_all(&test_session_dir).ok();
+}

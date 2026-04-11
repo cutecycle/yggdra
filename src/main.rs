@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
     eprintln!("🌷 Yggdra v0.1 starting...");
     eprintln!("📁 Session: {}", session.id);
-    eprintln!("📝 Messages file: {}", session.messages_file.display());
+    eprintln!("📝 Messages DB: {}", session.messages_db.display());
 
     // Create Ollama client and validate connection
     let ollama_client = match ollama::OllamaClient::new(&config.endpoint, &config.model).await {

@@ -8,7 +8,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
-    pub messages_file: PathBuf,
+    pub messages_db: PathBuf,
 }
 
 impl Session {
@@ -39,7 +39,7 @@ impl Session {
                     eprintln!("📂 Attached to session: {}", session_id);
                     return Ok(Session {
                         id: session_id,
-                        messages_file: session_dir.join("messages.jsonl"),
+                        messages_db: session_dir.join("messages.db"),
                     });
                 }
             }
@@ -50,9 +50,9 @@ impl Session {
         let session_dir = Self::session_dir(&session_id)?;
         fs::create_dir_all(&session_dir)?;
 
-        // Create empty messages file
-        let messages_file = session_dir.join("messages.jsonl");
-        fs::write(&messages_file, "")?;
+        // Create SQLite database for messages
+        let messages_db = session_dir.join("messages.db");
+        crate::message::MessageBuffer::new(&messages_db)?;
 
         // Write marker
         fs::write(&marker, &session_id)?;
@@ -61,7 +61,7 @@ impl Session {
 
         Ok(Session {
             id: session_id,
-            messages_file,
+            messages_db,
         })
     }
 }

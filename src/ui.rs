@@ -32,7 +32,6 @@ pub struct App {
     status_message: String,
     running: bool,
     message_buffer: MessageBuffer,
-    last_file_size: u64,
     ollama_client: Option<OllamaClient>,
     waiting_for_response: bool,
 }
@@ -44,7 +43,8 @@ impl App {
         session: Session,
         ollama_client: Option<OllamaClient>,
     ) -> Self {
-        let message_buffer = MessageBuffer::from_file(&session.messages_file);
+        let message_buffer = MessageBuffer::from_db(&session.messages_db)
+            .unwrap_or_else(|_| MessageBuffer::from_jsonl_file(&session.messages_db));
         let status_message = if ollama_client.is_some() {
             "✅ Ollama connected".to_string()
         } else {
@@ -58,7 +58,6 @@ impl App {
             status_message,
             running: true,
             message_buffer,
-            last_file_size: 0,
             ollama_client,
             waiting_for_response: false,
         }
@@ -74,14 +73,6 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
-
-        // Track last file size for polling
-        self.last_file_size = self
-            .session
-            .messages_file
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
 
         let waiting_flag = Arc::new(Mutex::new(false));
 
@@ -100,7 +91,7 @@ impl App {
                     }
                 }
             } else {
-                // Timeout: poll for changes
+                // Timeout: poll for changes (reload from DB)
                 self.poll_for_updates()?;
             }
         }
@@ -141,6 +132,7 @@ impl App {
         let messages_text: Vec<Line> = self
             .message_buffer
             .messages()
+            .unwrap_or_default()
             .iter()
             .map(|m| {
                 let emoji = if m.role == "user" { "🌷" } else { "🌻" };
@@ -164,12 +156,13 @@ impl App {
         } else {
             "❌ Offline"
         };
+        let msg_count = self.message_buffer.messages().map(|m| m.len()).unwrap_or(0);
         let status = format!(
             "{} | Session: {} | Model: {} | Msgs: {} | Ctrl+C to exit",
             ollama_status,
             &self.session.id[..8],
             self.config.model,
-            self.message_buffer.messages().len()
+            msg_count
         );
         let status_bar = Paragraph::new(status);
         f.render_widget(status_bar, chunks[3]);
@@ -248,7 +241,7 @@ impl App {
     async fn handle_message(&mut self, message: &str) {
         // Save user message
         let user_msg = Message::new("user", message.to_string());
-        if let Err(e) = self.message_buffer.add_and_persist(user_msg, &self.session.messages_file) {
+        if let Err(e) = self.message_buffer.add_and_persist(user_msg) {
             eprintln!("Failed to save user message: {}", e);
             self.status_message = "🌹 Failed to save message".to_string();
             return;
@@ -267,9 +260,7 @@ impl App {
         let messages_for_ollama: Vec<Message> = self
             .message_buffer
             .messages()
-            .iter()
-            .cloned()
-            .collect();
+            .unwrap_or_default();
 
         // Apply steering directive
         let steering_directive = SteeringDirective::custom("Be concise and helpful");
@@ -283,10 +274,7 @@ impl App {
             {
                 Ok(response) => {
                     let model_msg = Message::new("assistant", response.clone());
-                    if let Err(e) = self
-                        .message_buffer
-                        .add_and_persist(model_msg, &self.session.messages_file)
-                    {
+                    if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
                         eprintln!("Failed to save model response: {}", e);
                         self.status_message = "🌹 Failed to save response".to_string();
                     } else {
@@ -305,15 +293,10 @@ impl App {
         self.waiting_for_response = false;
     }
 
-    /// Poll for file changes
+    /// Poll for database changes by reloading from SQLite
     fn poll_for_updates(&mut self) -> Result<()> {
-        if let Ok(metadata) = self.session.messages_file.metadata() {
-            let new_size = metadata.len();
-            if new_size > self.last_file_size {
-                // File grew - reload messages
-                self.message_buffer = MessageBuffer::from_file(&self.session.messages_file);
-                self.last_file_size = new_size;
-            }
+        if let Ok(new_buffer) = MessageBuffer::from_db(&self.session.messages_db) {
+            self.message_buffer = new_buffer;
         }
         Ok(())
     }
