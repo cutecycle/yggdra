@@ -270,18 +270,34 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        // In Build mode, fire kick prompt to start autonomous loop
-        if self.mode == AppMode::Build && self.agents_context.is_some() {
+        // In Build mode, always fire a kick prompt to orient the agent
+        if self.mode == AppMode::Build {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
-            let kick = format!(
-                "New session started in `{cwd}`. \
-                 Orient yourself: list the directory, review any existing tasks, \
-                 and begin working autonomously. \
-                 Use tools to explore. When a task is fully complete, say [DONE] \
-                 to notify the user, then immediately continue to the next task."
-            );
+
+            let kick = if self.agents_context.is_none() {
+                // No AGENTS.md — terraforming mode: explore and create it
+                format!(
+                    "New session started in `{cwd}`. \
+                     This directory has no AGENTS.md yet — you need to terraform it. \
+                     First, explore the directory: [TOOL: spawn ls -la .] and read any \
+                     key files (README, Cargo.toml, package.json, etc.). \
+                     Then write an AGENTS.md that describes the project: its purpose, \
+                     structure, build commands, conventions, and any gotchas. \
+                     After writing AGENTS.md, continue with normal autonomous work. \
+                     Say [DONE] at each milestone."
+                )
+            } else {
+                // AGENTS.md exists — normal autonomous kick
+                format!(
+                    "New session started in `{cwd}`. \
+                     Orient yourself: list the directory, review any existing tasks, \
+                     and begin working autonomously. \
+                     Use tools to explore. When a task is fully complete, say [DONE] \
+                     to notify the user, then immediately continue to the next task."
+                )
+            };
             self.handle_message(&kick).await;
         }
 
@@ -683,6 +699,9 @@ impl App {
         if let Some(ctx) = &self.agents_context {
             base.push_str("\n\n--- AGENTS.md ---\n");
             base.push_str(ctx);
+        } else {
+            base.push_str("\n\nNo AGENTS.md exists yet. If you haven't already, explore the \
+                directory and create one with [TOOL: editfile AGENTS.md].");
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
     }

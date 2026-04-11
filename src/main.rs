@@ -23,15 +23,23 @@ async fn main() -> Result<()> {
     #[cfg(unix)]
     unsafe { libc::setpgid(0, 0); }
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // Terraform: ensure git repo exists
+    if !cwd.join(".git").exists() {
+        eprintln!("🌱 No git repo found — running git init");
+        let _ = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&cwd)
+            .output();
+    }
+
     let config = config::Config::load_with_smart_model().await;
     let session = Session::load_or_create()?;
 
     // Load AGENTS.md from CWD if present
-    let agents_md = std::env::current_dir()
+    let agents_md = std::fs::read_to_string(cwd.join("AGENTS.md"))
         .ok()
-        .map(|p| p.join("AGENTS.md"))
-        .filter(|p| p.exists())
-        .and_then(|p| std::fs::read_to_string(&p).ok())
         .filter(|c| !c.trim().is_empty());
 
     // Create Ollama client (reuses the validated endpoint from config)
