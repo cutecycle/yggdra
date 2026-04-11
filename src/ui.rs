@@ -1000,30 +1000,50 @@ impl App {
         // Model picker overlay — centered popup over entire screen
         if self.model_picker_open && !self.model_picker_items.is_empty() {
             let area = f.area();
-            let picker_width = (area.width * 2 / 3).max(40).min(70);
-            let picker_height = (self.model_picker_items.len() as u16 + 4).min(area.height - 4);
+            // Wide: use 90% of terminal width, tall: up to 80% height
+            let picker_width = ((area.width * 9 / 10)).max(50).min(area.width.saturating_sub(4));
+            let visible_rows = (area.height * 4 / 5).saturating_sub(4).max(4);
+            let picker_height = (self.model_picker_items.len() as u16 + 4).min(area.height - 4).min(visible_rows + 4);
             let picker_x = (area.width.saturating_sub(picker_width)) / 2;
             let picker_y = (area.height.saturating_sub(picker_height)) / 2;
             let picker_rect = Rect { x: picker_x, y: picker_y, width: picker_width, height: picker_height };
 
-            let items: Vec<ListItem> = self.model_picker_items.iter().enumerate().map(|(i, name)| {
-                let is_current = name.starts_with(&self.config.model);
-                let marker = if is_current { "✦ " } else { "  " };
-                let label = format!("{}{}", marker, name);
-                let style = if i == self.model_picker_selection {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 200)).add_modifier(Modifier::BOLD)
-                } else if is_current {
-                    Style::default().fg(Color::Rgb(180, 120, 200))
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(Span::styled(label, style))
-            }).collect();
+            // Compute scroll offset so selected item stays in view
+            let inner_rows = picker_height.saturating_sub(2) as usize; // subtract borders
+            let scroll_top = if self.model_picker_selection >= inner_rows {
+                self.model_picker_selection - inner_rows + 1
+            } else {
+                0
+            };
+
+            let items: Vec<ListItem> = self.model_picker_items.iter().enumerate()
+                .skip(scroll_top)
+                .take(inner_rows)
+                .map(|(i, name)| {
+                    let is_current = name.starts_with(&self.config.model);
+                    let marker = if is_current { "✦ " } else { "  " };
+                    let label = format!("{}{}", marker, name);
+                    let style = if i == self.model_picker_selection {
+                        Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 200)).add_modifier(Modifier::BOLD)
+                    } else if is_current {
+                        Style::default().fg(Color::Rgb(180, 120, 200))
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(Span::styled(label, style))
+                }).collect();
+
+            let total = self.model_picker_items.len();
+            let scroll_indicator = if total > inner_rows {
+                format!(" 🌸 Select Model ({}/{})  ↑↓ scroll · Enter select · Esc cancel ", self.model_picker_selection + 1, total)
+            } else {
+                " 🌸 Select Model  ↑↓ navigate · Enter select · Esc cancel ".to_string()
+            };
 
             let picker = List::new(items)
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .title(" 🌸 Select Model  ↑↓ navigate · Enter select · Esc cancel ")
+                    .title(scroll_indicator)
                     .border_style(Style::default().fg(Color::Rgb(180, 120, 200))));
             f.render_widget(Clear, picker_rect);
             f.render_widget(picker, picker_rect);
