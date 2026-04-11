@@ -5,8 +5,9 @@
 ## ✨ Features
 
 - **Airgapped by Design**: No internet connectivity required. All computation stays local.
+- **Build & Plan Modes**: Autonomous (Build) or interactive (Plan) workflows
 - **Local Model Inference**: Chat with Ollama-hosted LLMs (Qwen, Llama, Mistral, etc.)
-- **Tool Execution**: Run local tools directly from the TUI (grep, git, ripgrep, bash scripts)
+- **Tool Execution**: Run local tools directly from the TUI (ripgrep, git, python, rust)
 - **Session Management**: Per-directory sessions that persist across restarts
 - **SQLite Backend**: Fast, transactional storage with multi-window sync via polling
 - **Steering Directives**: Inject system-level constraints ("be concise", "output JSON", etc.)
@@ -107,6 +108,42 @@ chmod +x yggdra
 ```
 /tool stat src/main.rs
 ```
+
+## ⚡ Build & Plan Modes
+
+Yggdra supports two operating modes:
+
+### Build Mode (Autonomous) 🏗️
+
+By default, Yggdra launches in **Build mode**. If an `AGENTS.md` file exists in the current directory, Yggdra reads it and immediately begins executing the task described there. Perfect for:
+
+- Running automated workflows
+- Executing pre-defined agent tasks
+- Batch processing with no user interaction
+
+**Example `AGENTS.md`:**
+```
+Search for all TODO comments in src/ and create a summary.
+```
+
+On startup, Yggdra will:
+1. Load the task from `AGENTS.md`
+2. Send it to the model
+3. Let the model use tools autonomously (ripgrep, editfile, etc.)
+4. Display results as they arrive
+
+### Plan Mode (Interactive) 🧠
+
+Switch to **Plan mode** for hands-on control:
+
+```bash
+/plan
+```
+
+In Plan mode, you stay in the driver's seat:
+- Send messages and receive responses
+- Approve or reject tool executions before they run
+- Iterate on solutions interactively
 
 ## ⚙️ Configuration
 
