@@ -193,6 +193,56 @@ The SQLite migration is complete and verified. Phase 2 achieves its latency goal
 2. **Indexed Schema**: Timestamp index ensures <5ms message retrieval
 3. **Hardware Optimization**: WAL + NORMAL sync + cache tuning for ARM
 4. **Safety**: Transaction isolation prevents data corruption under concurrent access
-5. **Compatibility**: All Phase 2 features preserved, all 42 tests pass
+5. **Compatibility**: All Phase 2 features preserved, all 43 tests pass
 
 The system is production-ready for deployment on constrained environments.
+
+## Additional Feature: Smart Default Model Detection
+
+### What Was Added
+
+In addition to the SQLite migration, implemented intelligent default model selection on startup:
+
+1. **OllamaClient::get_last_loaded_model()**
+   - Queries `/api/tags` to get all available models
+   - Finds model with most recent `modified_at` timestamp
+   - Returns name of the most recently used model
+   - Enables auto-detection without user input
+
+2. **Config::load_with_smart_model()**
+   - Replaces `Config::load()` for intelligent model selection
+   - Priority chain:
+     ```
+     1. OLLAMA_MODEL env var (explicit, highest priority)
+     2. Last loaded model from Ollama (auto-detected)
+     3. Hardcoded default "qwen:3.5"
+     4. Fallback if Ollama is offline
+     ```
+   - Async method that queries Ollama during startup
+   - Logs which model selection method was used
+
+3. **Updated Startup Flow** (main.rs)
+   - Changed from `Config::load()` → `Config::load_with_smart_model().await`
+   - Now auto-detects your most recently used model
+   - Eliminates need to specify model each session
+   - Falls back gracefully if Ollama is unavailable
+
+### Benefits
+
+- **User Experience**: Yggdra remembers which model you've been using
+- **No Configuration**: Works out-of-the-box without env var setup
+- **Intelligent Fallback**: Always has a working model, even if auto-detection fails
+- **Override Support**: OLLAMA_MODEL env var still takes highest priority
+
+### Testing
+
+Added: `test_last_loaded_model_detection()`
+- Verifies correct model identification from models response
+- Tests timestamp-based sorting logic
+- Confirms "last loaded" logic works with multiple models
+
+### Test Count Update
+
+- Previous: 42 tests
+- New: 43 tests (+1 model detection test)
+- All passing ✅
