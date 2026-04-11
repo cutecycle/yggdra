@@ -492,7 +492,7 @@ impl App {
         let mut total_lines_skipped: u16 = 0;
         
         for msg in messages_list.iter() {
-            let (emoji, fg_color, bg_tint, show_band) = match msg.role.as_str() {
+            let (emoji, _fg_color, bg_tint, show_band) = match msg.role.as_str() {
                 "user" => {
                     exchange_idx += 1;
                     let tint = if exchange_idx % 2 == 0 {
