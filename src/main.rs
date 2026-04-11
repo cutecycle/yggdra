@@ -1,6 +1,7 @@
 mod config;
 mod message;
 mod notifications;
+mod ollama;
 mod session;
 mod steering;
 mod ui;
@@ -22,11 +23,24 @@ async fn main() -> Result<()> {
     eprintln!("📁 Session: {}", session.id);
     eprintln!("📝 Messages file: {}", session.messages_file.display());
 
+    // Create Ollama client and validate connection
+    let ollama_client = match ollama::OllamaClient::new(&config.endpoint, &config.model).await {
+        Ok(client) => {
+            eprintln!("🌻 Ollama client initialized");
+            Some(client)
+        }
+        Err(e) => {
+            eprintln!("🌹 Warning: Could not connect to Ollama: {}", e);
+            notifications::error_occurred(&format!("Ollama connection failed: {}", e)).await;
+            None
+        }
+    };
+
     // Emit session creation notification
     notifications::session_created(&session.id).await;
 
     // Run TUI
-    let mut app = App::new(config, session);
+    let mut app = App::new(config, session, ollama_client);
     app.run().await?;
 
     eprintln!("👋 Goodbye!");
