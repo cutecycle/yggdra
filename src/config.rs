@@ -1,6 +1,43 @@
 /// Configuration module: load Ollama endpoint and model from environment or .yggdra/config.toml
 use serde::{Deserialize, Serialize};
 
+/// Application mode
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppMode {
+    Ask,
+    Build,
+    Plan,
+}
+
+impl Default for AppMode {
+    fn default() -> Self {
+        AppMode::Plan
+    }
+}
+
+impl std::fmt::Display for AppMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            AppMode::Ask => write!(f, "ask"),
+            AppMode::Build => write!(f, "build"),
+            AppMode::Plan => write!(f, "plan"),
+        }
+    }
+}
+
+impl std::str::FromStr for AppMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ask" => Ok(AppMode::Ask),
+            "build" => Ok(AppMode::Build),
+            "plan" => Ok(AppMode::Plan),
+            _ => Err(format!("Unknown mode: {}", s)),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -8,6 +45,9 @@ pub struct Config {
     pub model: String,
     /// Context window size in tokens (None = use 4096 default)
     pub context_window: Option<u32>,
+    /// Application mode: ask, build, or plan
+    #[serde(default)]
+    pub mode: AppMode,
 }
 
 /// Optional file-based config (.yggdra/config.toml)
@@ -16,6 +56,7 @@ struct FileConfig {
     endpoint: Option<String>,
     model: Option<String>,
     context_window: Option<u32>,
+    mode: Option<String>,
 }
 
 impl FileConfig {
@@ -50,6 +91,7 @@ impl Default for Config {
             endpoint: "http://localhost:11435".to_string(),
             model: "qwen:3.5".to_string(),
             context_window: None,
+            mode: AppMode::Plan,
         }
     }
 }
@@ -70,10 +112,14 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .or(file.context_window);
+        
+        let mode = file.mode
+            .and_then(|m| m.parse::<AppMode>().ok())
+            .unwrap_or(AppMode::Plan);
 
-        eprintln!("🔧 Config: endpoint={}, model={}", endpoint, model);
+        eprintln!("🔧 Config: endpoint={}, model={}, mode={}", endpoint, model, mode);
 
-        Config { endpoint, model, context_window }
+        Config { endpoint, model, context_window, mode }
     }
 
     /// Load config with smart model detection from Ollama
@@ -113,19 +159,23 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .or(file.context_window);
+        
+        let mode = file.mode
+            .and_then(|m| m.parse::<AppMode>().ok())
+            .unwrap_or(AppMode::Plan);
 
-        Config { endpoint, model, context_window }
+        Config { endpoint, model, context_window, mode }
     }
 
-    /// Persist config to .yggdra/config.toml (creates dir if needed)
+    /// Persist config to .yggdra/config.json (creates dir if needed)
     pub fn save(&self) -> std::io::Result<()> {
         let dir = std::env::current_dir()?
             .join(".yggdra");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join("config.toml");
-        let toml_str = toml::to_string_pretty(self)
+        let path = dir.join("config.json");
+        let json_str = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, toml_str)?;
+        std::fs::write(&path, json_str)?;
         eprintln!("💾 Saved config to {}", path.display());
         Ok(())
     }

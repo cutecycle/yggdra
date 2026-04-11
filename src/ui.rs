@@ -8,6 +8,7 @@ use crate::steering::SteeringDirective;
 use crate::task::{TaskManager, Checkpoint};
 use crate::theme::Theme;
 use crate::tools::ToolRegistry;
+use crate::metrics::MetricsTracker;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
@@ -45,6 +46,7 @@ struct PaletteCommand {
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "shell",  description: "Run a shell command inline",          keywords: "run exec shell bash command terminal", fill: "/shell " },
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
+    PaletteCommand { name: "estimate", description: "Show project completion estimate",  keywords: "progress percentage done metrics", fill: "/estimate" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
@@ -203,6 +205,8 @@ pub struct App {
     model_picker_query: String,
     /// Detected terminal theme (light/dark + colour palette)
     theme: Theme,
+    /// Tracks project completion metrics
+    metrics: MetricsTracker,
 }
 
 impl App {
@@ -276,6 +280,7 @@ impl App {
             model_picker_selection: 0,
             model_picker_query: String::new(),
             theme: Theme::detect(),
+            metrics: MetricsTracker::new(),
         }
     }
 
@@ -778,31 +783,34 @@ impl App {
             "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
              You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
              AVAILABLE TOOLS:\n\
-             • [TOOL: rg PATTERN PATH] — ripgrep search: find patterns in files/dirs\n\
-             • [TOOL: editfile PATH] — read files (or create if missing)\n\
-             • [TOOL: spawn BINARY ARGS] — execute commands: ls, git, cargo, python, etc.\n\
-             • [TOOL: commit MSG] — git commit changes\n\
-             • [TOOL: python SCRIPT ARGS] — run Python code\n\
-             • [TOOL: ruste FILE] — compile & execute Rust code\n\
-             • [TOOL: think THOUGHT] — reasoning block (think whenever you want)\n\
+             • rg — ripgrep search: find patterns in files/dirs\n\
+             • editfile — read files (or create if missing)\n\
+             • spawn — execute commands: ls, git, cargo, python, etc.\n\
+             • commit — git commit changes\n\
+             • python — run Python code\n\
+             • ruste — compile & execute Rust code\n\
+             • think — reasoning block (think whenever you want)\n\
+             TOOL FORMAT (Qwen/Gemma):\n\
+             <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
              TOOL EXAMPLES:\n\
-             [TOOL: rg TODO src/] — find TODO comments\n\
-             [TOOL: editfile Cargo.toml] — read or update manifest\n\
-             [TOOL: spawn ls -la] — list current directory\n\
-             Never say \"I cannot access files.\" Use [TOOL: rg] or [TOOL: spawn] instead.\n\
+             <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
+             <|tool>editfile<|tool_sep>Cargo.toml<|end_tool> — read or update manifest\n\
+             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list current directory\n\
+             <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit changes\n\
+             Never say \"I cannot access files.\" Use rg or spawn instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
              \n\
              PROJECT DIRECTORIES:\n\
-             • .yggdra/todo/ — markdown task files (status, requirements, hints). Discover with [TOOL: rg TODO .yggdra/todo/]\n\
-             • .yggdra/log/ — session history by timestamp. Review with [TOOL: spawn ls .yggdra/log/]\n\
-             • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with [TOOL: rg PATTERN .yggdra/knowledge/]\n\
+             • .yggdra/todo/ — markdown task files (status, requirements, hints). Discover with rg\n\
+             • .yggdra/log/ — session history by timestamp. Review with spawn\n\
+             • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
              \n\
              WORKFLOW:\n\
-             1. Discover pending todos: [TOOL: rg TODO .yggdra/todo/]\n\
-             2. Read task details: [TOOL: editfile .yggdra/todo/TASKNAME.md]\n\
+             1. Discover pending todos: rg TODO .yggdra/todo/\n\
+             2. Read task details: editfile .yggdra/todo/TASKNAME.md\n\
              3. Work on task (use all tools freely)\n\
              4. Update todo status to done\n\
-             5. Commit: [TOOL: commit 'message']\n\
+             5. Commit: commit 'message'\n\
              6. Say [DONE] when milestone reached, then continue to next task\n\
              \n\
              Say [DONE] when a task is complete — this notifies the user as a milestone.\n\
@@ -814,7 +822,7 @@ impl App {
             base.push_str(ctx);
         } else {
             base.push_str("\n\nNo AGENTS.md exists yet. If you haven't already, explore the \
-                directory and create one with [TOOL: editfile AGENTS.md].");
+                directory and create one with editfile AGENTS.md.");
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
@@ -1497,6 +1505,8 @@ impl App {
             self.handle_models_command().await;
         } else if command == "/help" {
             self.show_help();
+        } else if command == "/estimate" {
+            self.show_estimate();
         } else if command == "/clear" {
             self.handle_clear_command();
         } else if command == "/tasks" {
@@ -1577,11 +1587,21 @@ impl App {
         self.status_message = 
             "📖 Commands:\n\
              /help         - Show this help\n\
+             /estimate     - Show project completion estimate\n\
              /models       - List models\n\
              /plan         - Switch to Plan mode\n\
              /tool CMD     - Execute tool\n\n\
              Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive)\n\n\
              Keybindings: Enter-Submit | Esc-Clear | Ctrl+C-Exit".to_string();
+    }
+
+    fn show_estimate(&mut self) {
+        let metrics_display = self.metrics.format_detailed();
+        self.status_message = format!(
+            "{}{}",
+            metrics_display,
+            "\nUse /estimate more to ask agent for completion prediction."
+        );
     }
 
     /// Handle /tool command for local tool execution
@@ -1621,6 +1641,9 @@ impl App {
         }
 
         self.status_message = format!("⏳ Executing tool: {}", tool_name);
+
+        // Record tool usage in metrics
+        self.metrics.record_tool_use(tool_name);
 
         // Execute tool via registry
         let result = self.tool_registry.execute(tool_name, args);

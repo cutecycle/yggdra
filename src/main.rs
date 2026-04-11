@@ -12,16 +12,39 @@ mod agent;
 mod spawner;
 mod task;
 mod ui;
+mod metrics;
 
 use anyhow::Result;
 use session::Session;
 use ui::App;
+use config::AppMode;
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Become process group leader so all children die when we exit
     #[cfg(unix)]
     unsafe { libc::setpgid(0, 0); }
+
+    // Parse CLI arguments for mode override
+    let mut mode_override: Option<AppMode> = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--ask" => mode_override = Some(AppMode::Ask),
+            "--build" => mode_override = Some(AppMode::Build),
+            "--plan" => mode_override = Some(AppMode::Plan),
+            "--help" | "-h" => {
+                eprintln!("Usage: yggdra [OPTIONS]");
+                eprintln!("Options:");
+                eprintln!("  --ask       Start in ask-only mode");
+                eprintln!("  --build     Start in build mode");
+                eprintln!("  --plan      Start in plan mode (default)");
+                eprintln!("  --help      Show this help message");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
@@ -56,6 +79,14 @@ async fn main() -> Result<()> {
     }
 
     let config = config::Config::load_with_smart_model().await;
+    let mut config = if let Some(mode) = mode_override {
+        let mut c = config;
+        c.mode = mode;
+        eprintln!("🔧 CLI override: mode={}", mode);
+        c
+    } else {
+        config
+    };
     let session = Session::load_or_create()?;
 
     // Load AGENTS.md from CWD if present
@@ -72,8 +103,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mut app = App::new(config, session, ollama_client, agents_md);
+    let mut app = App::new(config.clone(), session, ollama_client, agents_md);
     let result = app.run().await;
+    
+    // Save config with current mode on exit (mode may have changed)
+    if let Err(e) = config.save() {
+        eprintln!("⚠️  Failed to save config: {}", e);
+    }
 
     // Kill entire process group on exit (catches spawned subagents)
     #[cfg(unix)]

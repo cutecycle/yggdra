@@ -12,3 +12,4 @@ pub mod tools;
 pub mod agent;
 pub mod spawner;
 pub mod task;
+pub mod metrics;

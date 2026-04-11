@@ -14,20 +14,51 @@ pub struct ToolCall {
     pub args: String,
 }
 
-/// Parse tool calls from LLM output (module-level for reuse from UI)
-/// Format: [TOOL: name "arg1" "arg2"] or [TOOL: name arg1]
+/// Parse tool calls from LLM output
+/// Supports two formats:
+/// 1. Qwen/Gemma: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
+/// 2. Legacy: [TOOL: name args]
 pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
-    if let Ok(re) = Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]") {
+    
+    // Parse Qwen/Gemma format: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
+    if let Ok(re) = Regex::new(r"<\|tool>(\w+)(<\|tool_sep>[^<]*)*<\|end_tool>") {
         for cap in re.captures_iter(output) {
-            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                calls.push(ToolCall {
-                    name: name_match.as_str().to_string(),
-                    args: args_match.as_str().trim().to_string(),
-                });
+            if let Some(name_match) = cap.get(1) {
+                let name = name_match.as_str().to_string();
+                // Extract all arguments after the tool name
+                let full_match = cap.get(0).unwrap().as_str();
+                let args_section = full_match
+                    .trim_start_matches(&format!("<|tool>{}", name))
+                    .trim_end_matches("<|end_tool>");
+                
+                let args = args_section
+                    .split("<|tool_sep>")
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                
+                if !name.is_empty() {
+                    calls.push(ToolCall { name, args: args.trim().to_string() });
+                }
             }
         }
     }
+    
+    // If no Qwen format found, try legacy format: [TOOL: name args]
+    if calls.is_empty() {
+        if let Ok(re) = Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]") {
+            for cap in re.captures_iter(output) {
+                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
+                    calls.push(ToolCall {
+                        name: name_match.as_str().to_string(),
+                        args: args_match.as_str().trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    
     calls
 }
 
