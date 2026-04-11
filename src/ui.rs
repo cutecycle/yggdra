@@ -54,6 +54,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
     PaletteCommand { name: "plan",   description: "Switch to Plan mode (reflective)",   keywords: "interactive manual control plan",   fill: "/plan" },
     PaletteCommand { name: "build",  description: "Switch to Build mode (autonomous)",  keywords: "build auto run execute work",       fill: "/build" },
+    PaletteCommand { name: "ask",    description: "Switch to Ask-only mode (read-only)", keywords: "ask only read no modify block",   fill: "/ask" },
     PaletteCommand { name: "copycode",  description: "Copy code block from last reply",   keywords: "copy code block clipboard snippet", fill: "/copycode" },
     PaletteCommand { name: "copytext",  description: "Copy full last reply as plain text", keywords: "copy text clipboard message",      fill: "/copytext" },
     PaletteCommand { name: "copylink",  description: "Copy URL from last reply",           keywords: "copy link url clipboard",          fill: "/copylink" },
@@ -133,6 +134,7 @@ struct ToolResult {
 enum AppMode {
     Build,
     Plan,
+    AskOnly,
 }
 
 /// Minimal TUI application
@@ -291,6 +293,8 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
 
+            let is_new_session = self.message_buffer.count().unwrap_or(0) == 0;
+            
             let kick = if self.agents_context.is_none() {
                 // No AGENTS.md — terraforming mode: explore and create it
                 format!(
@@ -303,14 +307,22 @@ impl App {
                      After writing AGENTS.md, continue with normal autonomous work. \
                      Say [DONE] at each milestone."
                 )
-            } else {
-                // AGENTS.md exists — normal autonomous kick
+            } else if is_new_session {
+                // AGENTS.md exists, new session — normal autonomous kick
                 format!(
                     "New session started in `{cwd}`. \
-                     Orient yourself: list the directory, review any existing tasks, \
-                     and begin working autonomously. \
+                     Orient yourself: list the directory, check .yggdra/todo/ for pending tasks, \
+                     review .yggdra/log/ history, and begin working autonomously. \
                      Use tools to explore. When a task is fully complete, say [DONE] \
                      to notify the user, then immediately continue to the next task."
+                )
+            } else {
+                // Session restored with messages — continue work
+                format!(
+                    "Session restored in `{cwd}`. \
+                     Review recent work in chat history. Check .yggdra/todo/ for pending tasks. \
+                     Continue working autonomously. Use tools to explore and progress. \
+                     Say [DONE] at milestones, then immediately move to the next task."
                 )
             };
             self.handle_message(&kick).await;
@@ -526,6 +538,18 @@ impl App {
 
     /// Spawn tool execution off the UI thread
     fn execute_tool_async(&mut self, tool_name: String, args: String) {
+        // Block modifying tools in Ask-only mode
+        if self.mode == AppMode::AskOnly {
+            match tool_name.as_str() {
+                "editfile" | "commit" | "python" | "ruste" => {
+                    self.push_system_event(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
+                    self.turn_phase = TurnPhase::Idle;
+                    return;
+                }
+                _ => {} // rg and spawn are allowed
+            }
+        }
+
         let (tx, rx) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
@@ -636,6 +660,33 @@ impl App {
             Ok(result) => {
                 self.tool_result_rx = None;
 
+                // In Ask-only mode, detect and revert any file changes
+                if self.mode == AppMode::AskOnly {
+                    if let Ok(output) = std::process::Command::new("git")
+                        .args(&["diff", "--name-only"])
+                        .current_dir(".")
+                        .output()
+                    {
+                        if !output.stdout.is_empty() {
+                            let changed_files = String::from_utf8_lossy(&output.stdout);
+                            if !changed_files.trim().is_empty() {
+                                // Revert changes
+                                let _ = std::process::Command::new("git")
+                                    .args(&["checkout", "."])
+                                    .current_dir(".")
+                                    .output();
+                                self.push_system_event(format!(
+                                    "🔒 Ask-only mode: {} tried to modify files (reverted):\n{}",
+                                    result.tool_name, changed_files
+                                ));
+                                self.turn_phase = TurnPhase::Idle;
+                                self.tool_iteration_count = 0;
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 let output_text = match &result.output {
                     Ok(output) => {
                         let truncated = if output.len() > 4000 {
@@ -720,8 +771,7 @@ impl App {
         }
     }
 
-    /// Build the steering system prompt (shared between handle_message and check_tool_result)
-    fn steering_text(&self) -> String {
+     fn steering_text(&self) -> String {
         let os = std::env::consts::OS;
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         let mut base = format!(
@@ -734,14 +784,30 @@ impl App {
              • [TOOL: commit MSG] — git commit changes\n\
              • [TOOL: python SCRIPT ARGS] — run Python code\n\
              • [TOOL: ruste FILE] — compile & execute Rust code\n\
+             • [TOOL: think THOUGHT] — thinking block (show your reasoning, visible to user)\n\
              TOOL EXAMPLES:\n\
              [TOOL: rg TODO src/] — find TODO comments\n\
              [TOOL: editfile Cargo.toml] — read or update manifest\n\
              [TOOL: spawn ls -la] — list current directory\n\
+             [TOOL: think I should start by reading the task file to understand requirements]\n\
              Never say \"I cannot access files.\" Use [TOOL: rg] or [TOOL: spawn] instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
+             \n\
+             PROJECT DIRECTORIES:\n\
+             • .yggdra/todo/ — markdown task files (status, requirements, hints). Discover with [TOOL: rg TODO .yggdra/todo/]\n\
+             • .yggdra/log/ — session history by timestamp. Review with [TOOL: spawn ls .yggdra/log/]\n\
+             • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with [TOOL: rg PATTERN .yggdra/knowledge/]\n\
+             \n\
+             WORKFLOW:\n\
+             1. Discover pending todos: [TOOL: rg TODO .yggdra/todo/]\n\
+             2. Read task details: [TOOL: editfile .yggdra/todo/TASKNAME.md]\n\
+             3. Work on task (use all tools freely)\n\
+             4. Update todo status to done\n\
+             5. Commit: [TOOL: commit 'message']\n\
+             6. Say [DONE] when milestone reached, then continue to next task\n\
+             \n\
              Say [DONE] when a task is complete — this notifies the user as a milestone.\n\
-             After [DONE], immediately find and begin the next task: improve, refactor, document, explore.\n\
+             After [DONE], immediately find and begin the next task: todos, improvements, refactoring, documentation.\n\
              Work is continuous; [DONE] is a checkpoint, not a stop."
         );
         if let Some(ctx) = &self.agents_context {
@@ -863,6 +929,7 @@ impl App {
         let (mode_label, mode_color) = match self.mode {
             AppMode::Build => ("⚡ BUILD", self.theme.violet),
             AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
+            AppMode::AskOnly => ("🔍 ASK", Color::Yellow),
         };
 
         // Token usage indicator — real counts when available, estimate otherwise
@@ -1453,9 +1520,20 @@ impl App {
         } else if command == "/plan" {
             self.mode = AppMode::Plan;
             self.notify("🧠 Switched to Plan mode — reflective & interactive");
+        } else if command == "/ask" {
+            self.mode = AppMode::AskOnly;
+            self.notify("🔍 Switched to Ask-only mode — read-only, no modifications");
         } else if command == "/mode" {
-            self.mode = match self.mode { AppMode::Build => AppMode::Plan, AppMode::Plan => AppMode::Build };
-            let label = match self.mode { AppMode::Build => "⚡ Build", AppMode::Plan => "🧠 Plan" };
+            self.mode = match self.mode {
+                AppMode::Build => AppMode::Plan,
+                AppMode::Plan => AppMode::AskOnly,
+                AppMode::AskOnly => AppMode::Build,
+            };
+            let label = match self.mode {
+                AppMode::Build => "⚡ Build",
+                AppMode::Plan => "🧠 Plan",
+                AppMode::AskOnly => "🔍 Ask",
+            };
             self.notify(format!("Switched to {} mode", label));
         } else if command.starts_with("/ctx ") {
             let ctx_str = command.strip_prefix("/ctx ").unwrap_or("").trim();
@@ -1525,6 +1603,17 @@ impl App {
 
         let tool_name = parts[0];
         let args = if parts.len() > 1 { parts[1] } else { "" };
+
+        // Block modifying tools in Ask-only mode
+        if self.mode == AppMode::AskOnly {
+            match tool_name {
+                "editfile" | "commit" | "python" | "ruste" => {
+                    self.notify(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
+                    return;
+                }
+                _ => {} // rg and spawn are allowed (read-only)
+            }
+        }
 
         // Handle special "mem" tool for searching scrollback
         if tool_name == "mem" {
