@@ -493,23 +493,8 @@ impl App {
                 self.notify("⚠️ Max tool iterations reached — pausing");
             } else if self.mode == AppMode::Build {
                 // Build mode: agent gave plain text without [DONE] — nudge it to keep going
-                let kick = Message::new("system", "Keep going. Find the next task or improvement.");
-                if let Err(e) = self.message_buffer.add_and_persist(kick) {
-                    eprintln!("Build kick persist error: {}", e);
-                }
-                self.cached_message_count = self.message_buffer.count()
-                    .unwrap_or(self.cached_message_count + 1);
-                let steering = self.steering_text();
-                let messages = self.message_buffer.messages().unwrap_or_default();
-                if let Some(client) = &self.ollama_client {
-                    self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
-                    self.streaming_text.clear();
-                    self.turn_phase = TurnPhase::Streaming;
-                    self.tool_iteration_count = 0;
-                    self.streaming_text.clear();
-                    self.stream_rx = self.stream_rx.take(); // already set above
-                    return; // skip clearing stream_rx below
-                }
+                self.inject_continue_kick();
+                return; // skip clearing stream_rx below
             } else {
                 self.status_message = "✅ Response complete".to_string();
             }
@@ -519,6 +504,24 @@ impl App {
 
         self.streaming_text.clear();
         self.stream_rx = None;
+    }
+
+    /// Inject a system message and immediately start a new streaming turn (for Build mode & /ctx)
+    fn inject_continue_kick(&mut self) {
+        let kick = Message::new("system", "Keep going. Find the next task or improvement.");
+        if let Err(e) = self.message_buffer.add_and_persist(kick) {
+            eprintln!("Continue kick persist error: {}", e);
+        }
+        self.cached_message_count = self.message_buffer.count()
+            .unwrap_or(self.cached_message_count + 1);
+        let steering = self.steering_text();
+        let messages = self.message_buffer.messages().unwrap_or_default();
+        if let Some(client) = &self.ollama_client {
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+            self.streaming_text.clear();
+            self.turn_phase = TurnPhase::Streaming;
+            self.tool_iteration_count = 0;
+        }
     }
 
     /// Spawn tool execution off the UI thread
@@ -1452,6 +1455,7 @@ impl App {
                     self.config.context_window = Some(new_ctx);
                     let _ = self.config.save();
                     self.notify(format!("🎯 Context window set to {} tokens", new_ctx));
+                    self.inject_continue_kick();
                 }
             } else {
                 let current = self.config.context_window.unwrap_or(4096);
