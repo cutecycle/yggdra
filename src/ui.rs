@@ -801,38 +801,35 @@ impl App {
                 ).await {
                     Ok(Ok(models)) => {
                         if models.is_empty() {
-                            self.status_message = "ℹ️ No models found. Pull a model using: ollama pull <model_name>".to_string();
+                            self.push_system_event("ℹ️ No models found. Run: ollama pull <model>");
                         } else {
-                            let mut output = "📦 Available Models:\n".to_string();
-                            for (i, model) in models.iter().enumerate() {
-                                if i < 10 {
-                                    output.push_str(&format!("  • {}\n", model.name));
-                                }
-                            }
-                            if models.len() > 10 {
-                                output.push_str(&format!("  ... and {} more\n", models.len() - 10));
-                            }
-                            self.status_message = output;
+                            let list = models.iter()
+                                .map(|m| {
+                                    let size = m.size
+                                        .map(|b| format!(" ({:.1}GB)", b as f64 / 1_073_741_824.0))
+                                        .unwrap_or_default();
+                                    format!("  🌸 {}{}", m.name, size)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.push_system_event(format!("📦 Models:\n{}", list));
                         }
-                        eprintln!("Models: {:?}", models);
                     }
                     Ok(Err(e)) => {
-                        let friendly_msg = if e.to_string().contains("connection refused") {
-                            "Ollama is not running. Start it with: ollama serve".to_string()
+                        let msg = if e.to_string().contains("connection refused") {
+                            "🦙 Ollama not running — start with: ollama serve".to_string()
                         } else {
-                            self.friendly_error(&e.to_string())
+                            format!("❌ Models fetch failed: {}", self.friendly_error(&e.to_string()))
                         };
-                        self.status_message = format!("❌ Failed to fetch models: {}", friendly_msg);
-                        eprintln!("Error listing models: {}", e);
+                        self.push_system_event(msg);
                     }
                     Err(_) => {
-                        self.status_message = "❌ Model fetch timeout: Ollama is not responding".to_string();
+                        self.push_system_event("❌ Model fetch timed out — Ollama not responding");
                     }
                 }
-
             }
             None => {
-                self.status_message = "⚠️ Ollama not connected. Check that Ollama is running on http://localhost:11434".to_string();
+                self.push_system_event("⚠️ Ollama not connected");
             }
         }
     }
