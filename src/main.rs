@@ -13,8 +13,8 @@ use ui::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load config from environment
-    let config = Config::load();
+    // Load config with smart model detection from Ollama
+    let config = config::Config::load_with_smart_model().await;
 
     // Load or create session for this directory
     let session = Session::load_or_create()?;

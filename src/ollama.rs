@@ -94,6 +94,23 @@ impl OllamaClient {
         Ok(data.models)
     }
 
+    /// Get the last loaded model (most recently modified) from Ollama
+    pub async fn get_last_loaded_model(&self) -> Result<String> {
+        let models = self.list_models().await?;
+
+        if models.is_empty() {
+            return Err(anyhow!("No models available in Ollama"));
+        }
+
+        // Find model with most recent modified_at timestamp
+        let last_model = models
+            .iter()
+            .max_by_key(|m| m.modified_at.as_deref().unwrap_or(""))
+            .ok_or_else(|| anyhow!("Failed to determine last loaded model"))?;
+
+        Ok(last_model.name.clone())
+    }
+
     /// Send a message to Ollama and get response
     /// If steering is provided, it will be prepended to the system prompt
     pub async fn generate(

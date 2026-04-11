@@ -211,3 +211,45 @@ fn test_connection_status_indicators() {
     let response_format = "🌻 Model responded";
     assert!(response_format.contains("🌻"));
 }
+
+#[test]
+fn test_last_loaded_model_detection() {
+    // Test that we can identify the last loaded model from a models response
+    // Last modified model should be selected
+    let response_json = r#"{
+        "models": [
+            {
+                "name": "llama2",
+                "modified_at": "2024-04-10T10:00:00Z",
+                "size": 3800000000
+            },
+            {
+                "name": "qwen:3.5",
+                "modified_at": "2024-04-10T14:30:00Z",
+                "size": 4294967296
+            },
+            {
+                "name": "mistral",
+                "modified_at": "2024-04-10T12:00:00Z",
+                "size": 3000000000
+            }
+        ]
+    }"#;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(response_json).expect("Should parse response");
+    
+    let models = parsed.get("models").unwrap().as_array().unwrap();
+    
+    // Find model with most recent timestamp (qwen:3.5 at 14:30)
+    let last_model = models
+        .iter()
+        .max_by_key(|m| m.get("modified_at").and_then(|v| v.as_str()).unwrap_or(""))
+        .expect("Should find a model");
+    
+    assert_eq!(
+        last_model.get("name").unwrap().as_str().unwrap(),
+        "qwen:3.5",
+        "Should identify qwen:3.5 as the last loaded model (most recent timestamp)"
+    );
+}
