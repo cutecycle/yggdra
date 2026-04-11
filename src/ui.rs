@@ -795,30 +795,32 @@ impl App {
         let mut exchange_idx: usize = 0;
 
         for msg in messages_list.iter() {
-            let (emoji, _fg_color, bg_tint, show_band) = match msg.role.as_str() {
+            // Solarized-light-friendly pastel bands — no explicit fg so terminal default
+            // dark text shows through. Works on both light and dark terminals.
+            let (emoji, bg_tint, show_band) = match msg.role.as_str() {
                 "user" => {
                     exchange_idx += 1;
                     let tint = if exchange_idx % 2 == 0 {
-                        Color::Rgb(30, 30, 45)
+                        Color::Rgb(218, 228, 242) // soft blue
                     } else {
-                        Color::Rgb(20, 35, 20)
+                        Color::Rgb(220, 238, 220) // soft green
                     };
-                    ("👤", Color::Cyan, Some(tint), true)
+                    ("👤", Some(tint), true)
                 }
                 "assistant" => {
                     exchange_idx += 1;
                     let tint = if exchange_idx % 2 == 0 {
-                        Color::Rgb(30, 30, 45)
+                        Color::Rgb(218, 228, 242)
                     } else {
-                        Color::Rgb(20, 35, 20)
+                        Color::Rgb(220, 238, 220)
                     };
-                    ("🤖", Color::Yellow, Some(tint), true)
+                    ("🤖", Some(tint), true)
                 }
-                "tool" => ("🔧", Color::Green, None, false),
-                "system" => ("⚙️", Color::Rgb(180, 120, 0), None, false),
-                "clock" => ("🕐", Color::Rgb(120, 120, 120), None, false),
-                "spawn" => ("🤖", Color::White, Some(Color::Rgb(20, 40, 55)), true),
-                _ => ("💬", Color::Gray, None, false),
+                "tool"   => ("🔧", None, false),
+                "system" => ("⚙️", None, false),
+                "clock"  => ("🕐", None, false),
+                "spawn"  => ("🤖", Some(Color::Rgb(210, 238, 235)), true),
+                _        => ("💬", None, false),
             };
 
             let text_content = if msg.role == "tool" || msg.role == "spawn" {
@@ -837,7 +839,7 @@ impl App {
             let height = (line_count + wrap_extra).max(1) as u16;
 
             let style = if show_band {
-                Style::default().fg(Color::White).bg(bg_tint.unwrap())
+                Style::default().bg(bg_tint.unwrap()) // no explicit fg → terminal default text color
             } else {
                 Style::default()
             };
@@ -848,9 +850,9 @@ impl App {
         // Add streaming text as a virtual message at the end
         if !self.streaming_text.is_empty() {
             let tint = if exchange_idx % 2 == 0 {
-                Color::Rgb(30, 30, 45)
+                Color::Rgb(218, 228, 242)
             } else {
-                Color::Rgb(20, 35, 20)
+                Color::Rgb(220, 238, 220)
             };
             let agent_badge = if self.active_subagents > 0 {
                 format!(" [🤖{}]", self.active_subagents)
@@ -867,7 +869,7 @@ impl App {
             let height = (line_count + wrap_extra).max(1) as u16;
             rendered.push(RenderedMsg {
                 text: stream_text,
-                style: Style::default().fg(Color::White).bg(tint),
+                style: Style::default().bg(tint),
                 height,
             });
         }
@@ -973,17 +975,17 @@ impl App {
                             Span::styled(
                                 format!(" /{:<16}", cmd.name),
                                 if i == self.palette_selection {
-                                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                                    Style::default().fg(Color::Black).bg(Color::Rgb(42, 161, 152)).add_modifier(Modifier::BOLD)
                                 } else {
-                                    Style::default().fg(Color::Cyan)
+                                    Style::default().fg(Color::Rgb(42, 161, 152))
                                 },
                             ),
                             Span::styled(
                                 format!(" {}", cmd.description),
                                 if i == self.palette_selection {
-                                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                                    Style::default().fg(Color::Black).bg(Color::Rgb(42, 161, 152))
                                 } else {
-                                    Style::default().fg(Color::Gray)
+                                    Style::default() // terminal default — readable on both light and dark
                                 },
                             ),
                         ]);
@@ -1024,11 +1026,11 @@ impl App {
                     let marker = if is_current { "✦ " } else { "  " };
                     let label = format!("{}{}", marker, name);
                     let style = if i == self.model_picker_selection {
-                        Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 200)).add_modifier(Modifier::BOLD)
+                        Style::default().fg(Color::Black).bg(Color::Rgb(108, 113, 196)).add_modifier(Modifier::BOLD) // solarized violet
                     } else if is_current {
-                        Style::default().fg(Color::Rgb(180, 120, 200))
+                        Style::default().fg(Color::Rgb(108, 113, 196)) // violet accent, visible on light bg
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default() // terminal default
                     };
                     ListItem::new(Span::styled(label, style))
                 }).collect();
@@ -1044,7 +1046,7 @@ impl App {
                 .block(Block::default()
                     .borders(Borders::ALL)
                     .title(scroll_indicator)
-                    .border_style(Style::default().fg(Color::Rgb(180, 120, 200))));
+                    .border_style(Style::default().fg(Color::Rgb(108, 113, 196))));
             f.render_widget(Clear, picker_rect);
             f.render_widget(picker, picker_rect);
         }
