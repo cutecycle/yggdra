@@ -383,8 +383,12 @@ impl App {
             self.subagent_count += 1;
             self.active_subagents += 1;
             let n = self.subagent_count;
-            let indicator = format!("🤖 {}  {} — {}", n, task_id, task_desc);
-            self.push_system_event(indicator);
+            let spawn_msg = Message::new("spawn",
+                format!("#{n} spawning  {task_id}\n{task_desc}"));
+            self.persist_message(spawn_msg);
+            self.cached_message_count = self.message_buffer.count()
+                .unwrap_or(self.cached_message_count + 1);
+            self.status_message = format!("🤖 #{n} running: {task_id}");
             self.execute_subagent_async(task_id.clone(), task_desc.clone());
             self.turn_phase = TurnPhase::ExecutingTool(format!("spawn_agent:{}", task_id));
         } else if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
@@ -469,9 +473,23 @@ impl App {
         };
 
         self.active_subagents = self.active_subagents.saturating_sub(1);
-        let status = if result.success { "✅" } else { "❌" };
-        let done_msg = format!("🤖 {} {}  {}", self.subagent_count, status, result.agent_id);
-        self.push_system_event(done_msg);
+        let status_icon = if result.success { "✅ done" } else { "❌ failed" };
+        // Show a truncated preview of the output (first 3 lines, max 200 chars)
+        let preview: String = result.output.lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = if preview.len() > 200 {
+            format!("{}…", &preview[..200])
+        } else {
+            preview
+        };
+        let done_content = format!("#{} {}  {}\n{}",
+            self.subagent_count, status_icon, result.agent_id, preview);
+        let done_msg = Message::new("spawn", done_content);
+        self.persist_message(done_msg);
+        self.cached_message_count = self.message_buffer.count()
+            .unwrap_or(self.cached_message_count + 1);
 
         // Inject result back into conversation and continue streaming
         let injection = result.to_injection();
@@ -702,10 +720,15 @@ impl App {
                 }
                 "tool" => ("🔧", Color::Green, None, false),
                 "system" => ("⚙️", Color::Rgb(180, 120, 0), None, false),
+                "spawn" => ("🤖", Color::White, Some(Color::Rgb(20, 40, 55)), true),
                 _ => ("💬", Color::Gray, None, false),
             };
 
-            let text_content = format!("{} {}", emoji, self.format_message_content(&msg.content));
+            let text_content = if msg.role == "tool" || msg.role == "spawn" {
+                format!("{} {}", emoji, self.format_tool_content(&msg.content))
+            } else {
+                format!("{} {}", emoji, self.format_message_content(&msg.content))
+            };
             let msg_para = Paragraph::new(text_content)
                 .wrap(ratatui::widgets::Wrap { trim: true });
 
@@ -1213,6 +1236,18 @@ impl App {
         if result.ends_with('\n') {
             result.pop();
         }
+        result
+    }
+
+    /// Format tool output with indented bordered block
+    fn format_tool_content(&self, content: &str) -> String {
+        let mut result = String::new();
+        for line in content.lines() {
+            result.push_str("│  ");
+            result.push_str(line);
+            result.push('\n');
+        }
+        if result.ends_with('\n') { result.pop(); }
         result
     }
 
