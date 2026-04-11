@@ -125,41 +125,28 @@ impl OllamaClient {
     }
 
     /// Send a message to Ollama and get response (using Message type)
-    /// If steering is provided, it will be prepended to the system prompt
+    /// Steering is always injected as an explicit system message
     pub async fn generate(
         &self,
         messages: Vec<Message>,
         steering: Option<&str>,
     ) -> Result<String> {
-        // Convert messages to Ollama format, injecting steering into system prompt if needed
         let mut ollama_messages = Vec::new();
 
-        for (i, msg) in messages.iter().enumerate() {
-            let content = if i == 0 {
-                if let Some(steer) = steering {
-                    // Inject steering directive into first (system) message
-                    format!("{}\n{}", steer, msg.content)
-                } else {
-                    msg.content.clone()
-                }
-            } else {
-                msg.content.clone()
-            };
-
+        // Always prepend steering as a dedicated system message
+        if let Some(steer) = steering {
             ollama_messages.push(OllamaMessage {
-                role: msg.role.clone(),
-                content,
+                role: "system".to_string(),
+                content: steer.to_string(),
             });
         }
 
-        // If no messages but steering exists, prepend a system message
-        if ollama_messages.is_empty() {
-            if let Some(steer) = steering {
-                ollama_messages.push(OllamaMessage {
-                    role: "system".to_string(),
-                    content: steer.to_string(),
-                });
-            }
+        // Convert conversation messages to Ollama format
+        for msg in &messages {
+            ollama_messages.push(OllamaMessage {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
         }
 
         let request = GenerateRequest {

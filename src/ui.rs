@@ -19,11 +19,27 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// RAII guard to restore terminal state on drop (including panics/errors)
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
 
 /// Minimal TUI application
 pub struct App {
@@ -36,6 +52,7 @@ pub struct App {
     ollama_client: Option<OllamaClient>,
     waiting_for_response: bool,
     tool_registry: ToolRegistry,
+    cached_message_count: usize,
 }
 
 impl App {
@@ -46,7 +63,12 @@ impl App {
         ollama_client: Option<OllamaClient>,
     ) -> Self {
         let message_buffer = MessageBuffer::from_db(&session.messages_db)
-            .unwrap_or_else(|_| MessageBuffer::from_jsonl_file(&session.messages_db));
+            .unwrap_or_else(|e| {
+                eprintln!("🌹 Failed to open messages DB: {}", e);
+                // Last resort: create fresh DB
+                MessageBuffer::new(&session.messages_db)
+                    .expect("Cannot create message database")
+            });
         let status_message = if ollama_client.is_some() {
             "✅ Ollama connected".to_string()
         } else {
@@ -63,30 +85,24 @@ impl App {
             ollama_client,
             waiting_for_response: false,
             tool_registry: ToolRegistry::new(),
+            cached_message_count: 0,
         }
     }
 
     /// Run the TUI
     pub async fn run(&mut self) -> Result<()> {
-        // Setup terminal
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        let _guard = TerminalGuard::new()?;
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        let waiting_flag = Arc::new(Mutex::new(false));
-
         loop {
-            // Draw UI
             terminal.draw(|f| self.draw(f))?;
 
-            // Handle events with timeout
             if crossterm::event::poll(Duration::from_millis(500))? {
                 if let Event::Key(key) = event::read()? {
-                    if !*waiting_flag.lock().await {
+                    if !self.waiting_for_response {
                         self.handle_key(key).await;
                         if !self.running {
                             break;
@@ -94,14 +110,9 @@ impl App {
                     }
                 }
             } else {
-                // Timeout: poll for changes (reload from DB)
-                self.poll_for_updates()?;
+                self.poll_for_updates();
             }
         }
-
-        // Cleanup terminal
-        disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
 
         Ok(())
     }
@@ -177,11 +188,11 @@ impl App {
             .block(Block::default().title(" Input ").borders(Borders::ALL));
         f.render_widget(input, chunks[2]);
 
-        // Status bar with helpful info
+        // Status bar
         let status = format!(
             "Session: {} | Msgs: {} | {} | [Ctrl+C] Exit [ESC] Clear",
             &self.session.id[..8],
-            self.message_buffer.messages().map(|m| m.len()).unwrap_or(0),
+            self.cached_message_count,
             self.status_message.lines().next().unwrap_or("")
         );
         let status_bar = Paragraph::new(status);
@@ -370,7 +381,6 @@ impl App {
 
     /// Handle user message - send to Ollama with steering
     async fn handle_message(&mut self, message: &str) {
-        // Validate message
         if message.is_empty() {
             self.status_message = "❌ Message cannot be empty".to_string();
             return;
@@ -388,8 +398,8 @@ impl App {
             self.status_message = format!("❌ Storage error: Cannot save message - {}", self.friendly_error(&e.to_string()));
             return;
         }
+        self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
 
-        // If no Ollama client, store message but explain limitation
         if self.ollama_client.is_none() {
             self.status_message = "⚠️ Ollama offline: Message saved locally but not sent to model. Try /help for more info.".to_string();
             return;
@@ -398,17 +408,15 @@ impl App {
         self.waiting_for_response = true;
         self.status_message = "⏳ Sending message to model...".to_string();
 
-        // Prepare messages for Ollama
+        // Prepare messages for Ollama with explicit system message for steering
+        let steering_directive = SteeringDirective::custom("Be concise and helpful");
+        let steering_text = steering_directive.format_for_system_prompt();
+
         let messages_for_ollama: Vec<Message> = self
             .message_buffer
             .messages()
             .unwrap_or_default();
 
-        // Apply steering directive
-        let steering_directive = SteeringDirective::custom("Be concise and helpful");
-        let steering_text = steering_directive.format_for_system_prompt();
-
-        // Send to Ollama with timeout handling
         if let Some(client) = &self.ollama_client {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -421,14 +429,15 @@ impl App {
                         self.status_message = format!("⚠️ Response received but not saved: {}", self.friendly_error(&e.to_string()));
                     } else {
                         self.status_message = "✅ Model responded".to_string();
-                        crate::notifications::model_responded(&response[..std::cmp::min(100, response.len())]).await;
+                        self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
+                        crate::notifications::model_responded("🌻 New response ready").await;
                     }
                 }
                 Ok(Err(e)) => {
                     let friendly_msg = self.friendly_error(&e.to_string());
                     eprintln!("Error sending message to Ollama: {}", e);
                     self.status_message = format!("❌ Model error: {}", friendly_msg);
-                    crate::notifications::error_occurred(&format!("Failed to get response: {}", friendly_msg)).await;
+                    crate::notifications::error_occurred(&friendly_msg).await;
                 }
                 Err(_) => {
                     eprintln!("Timeout waiting for Ollama response");
@@ -464,12 +473,13 @@ impl App {
         }
     }
 
-    /// Poll for database changes by reloading from SQLite
-    fn poll_for_updates(&mut self) -> Result<()> {
-        if let Ok(new_buffer) = MessageBuffer::from_db(&self.session.messages_db) {
-            self.message_buffer = new_buffer;
+    /// Poll for database changes via existing connection (multi-window sync)
+    fn poll_for_updates(&mut self) {
+        if let Ok(count) = self.message_buffer.count() {
+            if count != self.cached_message_count {
+                self.cached_message_count = count;
+            }
         }
-        Ok(())
     }
 }
 

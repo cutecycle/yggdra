@@ -91,12 +91,9 @@ impl Agent {
         steering.format_for_system_prompt()
     }
 
-    /// Check if LLM output indicates completion
+    /// Check if LLM output indicates completion (explicit marker only)
     fn is_done(output: &str) -> bool {
-        output.contains("[DONE]") || 
-        output.contains("done") ||
-        output.contains("complete") ||
-        output.contains("finished")
+        output.contains("[DONE]")
     }
 
     /// Execute query with agentic loop
@@ -227,8 +224,9 @@ mod tests {
     #[test]
     fn test_is_done() {
         assert!(Agent::is_done("Task completed [DONE]"));
-        assert!(Agent::is_done("Everything is done"));
-        assert!(Agent::is_done("We have finished"));
+        assert!(Agent::is_done("[DONE]"));
+        assert!(!Agent::is_done("Everything is done"));
+        assert!(!Agent::is_done("We have finished"));
         assert!(!Agent::is_done("Still working..."));
     }
 

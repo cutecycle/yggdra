@@ -25,13 +25,17 @@ pub struct RipgrepTool;
 
 impl RipgrepTool {
     fn is_potentially_dangerous(s: &str) -> bool {
-        // Block obvious escape attempts
-        let dangerous_patterns = vec![
-            "|", "&", ";", ">", "<", "$", "`", "rm", "dd", "curl", "wget",
-            "nc", "bash", "/bin/", "/usr/bin/", "python", "node", "perl",
+        // Block shell metacharacters and obvious escape attempts
+        let shell_metacharacters = vec![
+            "|", "&", ";", ">", "<", "$", "`",
+        ];
+        let dangerous_commands = vec![
+            "rm ", "dd ", "curl ", "wget ",
+            "nc ", "/bin/", "/usr/bin/",
         ];
         let lower = s.to_lowercase();
-        dangerous_patterns.iter().any(|p| lower.contains(p))
+        shell_metacharacters.iter().any(|p| lower.contains(p))
+            || dangerous_commands.iter().any(|p| lower.contains(p))
     }
 }
 
@@ -408,40 +412,16 @@ impl Tool for RusteTool {
         let binary_name = format!("yggdra_out_{}", &uuid_str[0..8]);
         let out_path = format!("/tmp/{}", binary_name);
 
-        // Try native rustc first, fall back to docker if needed
         let compile_result = Command::new("rustc")
             .arg(file_path)
             .arg("-o")
             .arg(&out_path)
-            .output();
+            .output()
+            .map_err(|_| anyhow!("ruste: rustc not found in PATH"))?;
 
-        match compile_result {
-            Ok(output) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(anyhow!("ruste: compilation failed: {}", stderr));
-                }
-            }
-            Err(_) => {
-                // Try docker as fallback
-                let docker_result = Command::new("docker")
-                    .arg("run")
-                    .arg("--rm")
-                    .arg("-v")
-                    .arg(format!("{}:/src:ro", std::fs::canonicalize(file_path)?.display()))
-                    .arg("rust:alpine")
-                    .arg("rustc")
-                    .arg("/src")
-                    .arg("-o")
-                    .arg("/tmp/out")
-                    .output()
-                    .map_err(|e| anyhow!("ruste: no rustc or docker available: {}", e))?;
-
-                if !docker_result.status.success() {
-                    let stderr = String::from_utf8_lossy(&docker_result.stderr);
-                    return Err(anyhow!("ruste: docker compilation failed: {}", stderr));
-                }
-            }
+        if !compile_result.status.success() {
+            let stderr = String::from_utf8_lossy(&compile_result.stderr);
+            return Err(anyhow!("ruste: compilation failed: {}", stderr));
         }
 
         // Execute the binary
@@ -513,14 +493,16 @@ mod tests {
     fn test_ripgrep_validation() {
         let tool = RipgrepTool;
         
-        // Valid inputs
+        // Valid inputs (including language names as search patterns)
         assert!(tool.validate_input(r#""pattern" "/path""#).is_ok());
+        assert!(tool.validate_input("python .").is_ok());
+        assert!(tool.validate_input("bash_script test/").is_ok());
         
-        // Invalid inputs
+        // Invalid inputs (shell metacharacters and dangerous commands)
         assert!(tool.validate_input("").is_err());
         assert!(tool.validate_input("pattern | other").is_err());
         assert!(tool.validate_input("pattern; rm -rf").is_err());
-        assert!(tool.validate_input("pattern && curl").is_err());
+        assert!(tool.validate_input("pattern && curl foo").is_err());
     }
 
     #[test]
