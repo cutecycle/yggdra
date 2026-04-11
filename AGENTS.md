@@ -39,12 +39,33 @@ Always run `cargo test --lib` after any change. Do not leave tests failing.
 - Tool results injected as: `[TOOL_OUTPUT: name = result]`
 - Completion signal: `[DONE]`
 - Session data lives in `~/.yggdra/sessions/<uuid>/`
-- Per-project data lives in `.yggdra/` (log/, gaps, session marker, **todo/**)
+- Per-project data lives in `.yggdra/` (log/, gaps, session marker, todo/*, knowledge -> offlinebase)
 - **Todos:** discoverable markdown files in `.yggdra/todo/` — see `.yggdra/todo/README.md`
+- **Knowledge base:** symlink `.yggdra/knowledge` → `~/source/repos/offlinebase` (135,000+ offline docs)
 
 ## UI commands
 
 `/checkpoint NAME`, `/clear`, `/tasks`, `/gaps`, `/tool mem QUERY`, `/models`, `/help`
+
+## Knowledge Base Access
+
+Agents can search the offline knowledge base at `.yggdra/knowledge` (symlink to `~/source/repos/offlinebase`):
+
+```bash
+# Search Rust docs
+[TOOL: rg "async|trait|lifetime" .yggdra/knowledge/rust/]
+
+# Search Godot tutorials
+[TOOL: rg "Node3D|physics" .yggdra/knowledge/godot/]
+
+# List categories
+[TOOL: spawn ls .yggdra/knowledge/]
+
+# Read a specific doc
+[TOOL: editfile .yggdra/knowledge/README.md]
+```
+
+The knowledge base contains 135,000+ files across 73 categories: spacecraft systems, programming (Rust/Python), graphics (Godot), life support, navigation, and reference materials.
 
 ## Constraints — never break these
 
