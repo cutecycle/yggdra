@@ -179,6 +179,12 @@ pub struct App {
     palette_open: bool,
     /// Which palette item is highlighted
     palette_selection: usize,
+    /// Whether the model picker overlay is open
+    model_picker_open: bool,
+    /// Available models for the picker
+    model_picker_items: Vec<String>,
+    /// Currently highlighted model in picker
+    model_picker_selection: usize,
 }
 
 impl App {
@@ -245,6 +251,9 @@ impl App {
             last_clock: std::time::Instant::now(),
             palette_open: false,
             palette_selection: 0,
+            model_picker_open: false,
+            model_picker_items: Vec::new(),
+            model_picker_selection: 0,
         }
     }
 
@@ -940,6 +949,38 @@ impl App {
             }
         }
 
+        // Model picker overlay — centered popup over entire screen
+        if self.model_picker_open && !self.model_picker_items.is_empty() {
+            let area = f.area();
+            let picker_width = (area.width * 2 / 3).max(40).min(70);
+            let picker_height = (self.model_picker_items.len() as u16 + 4).min(area.height - 4);
+            let picker_x = (area.width.saturating_sub(picker_width)) / 2;
+            let picker_y = (area.height.saturating_sub(picker_height)) / 2;
+            let picker_rect = Rect { x: picker_x, y: picker_y, width: picker_width, height: picker_height };
+
+            let items: Vec<ListItem> = self.model_picker_items.iter().enumerate().map(|(i, name)| {
+                let is_current = name.starts_with(&self.config.model);
+                let marker = if is_current { "✦ " } else { "  " };
+                let label = format!("{}{}", marker, name);
+                let style = if i == self.model_picker_selection {
+                    Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 200)).add_modifier(Modifier::BOLD)
+                } else if is_current {
+                    Style::default().fg(Color::Rgb(180, 120, 200))
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(Span::styled(label, style))
+            }).collect();
+
+            let picker = List::new(items)
+                .block(Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 🌸 Select Model  ↑↓ navigate · Enter select · Esc cancel ")
+                    .border_style(Style::default().fg(Color::Rgb(180, 120, 200))));
+            f.render_widget(Clear, picker_rect);
+            f.render_widget(picker, picker_rect);
+        }
+
         // Status bar
         let token_info = if self.total_tokens_used > 0 {
             format!("🪙 {}tok", self.total_tokens_used)
@@ -960,6 +1001,50 @@ impl App {
     /// Handle keyboard input
     async fn handle_key(&mut self, key: KeyEvent) {
         use crossterm::event::KeyModifiers;
+
+        // Model picker takes over all input when open
+        if self.model_picker_open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.model_picker_open = false;
+                    self.status_message = "Model picker cancelled".to_string();
+                }
+                KeyCode::Down => {
+                    let count = self.model_picker_items.len();
+                    if count > 0 {
+                        self.model_picker_selection = (self.model_picker_selection + 1) % count;
+                    }
+                }
+                KeyCode::Up => {
+                    let count = self.model_picker_items.len();
+                    if count > 0 {
+                        self.model_picker_selection = self.model_picker_selection
+                            .checked_sub(1).unwrap_or(count - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(raw) = self.model_picker_items.get(self.model_picker_selection) {
+                        // Strip size suffix (everything after the first space)
+                        let model_name = raw.split_whitespace().next().unwrap_or(raw).to_string();
+                        self.config.model = model_name.clone();
+                        // Reconnect ollama client with new model
+                        let endpoint = self.config.endpoint.clone();
+                        match OllamaClient::new(&endpoint, &model_name).await {
+                            Ok(client) => {
+                                self.ollama_client = Some(client);
+                                self.status_message = format!("🌸 Switched to {}", model_name);
+                            }
+                            Err(e) => {
+                                self.status_message = format!("❌ Failed to connect with {}: {}", model_name, e);
+                            }
+                        }
+                        self.model_picker_open = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         match key.code {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1184,31 +1269,32 @@ impl App {
         }
     }
 
-    /// Handle /models command
+    /// Handle /models command — fetch model list and open interactive picker
     async fn handle_models_command(&mut self) {
         match &self.ollama_client {
             Some(client) => {
-                self.status_message = "⏳ Fetching models from Ollama...".to_string();
-
+                self.status_message = "⏳ Fetching models...".to_string();
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     client.list_models()
                 ).await {
-                    Ok(Ok(models)) => {
-                        if models.is_empty() {
-                            self.push_system_event("ℹ️ No models found. Run: ollama pull <model>");
-                        } else {
-                            let list = models.iter()
-                                .map(|m| {
-                                    let size = m.size
-                                        .map(|b| format!(" ({:.1}GB)", b as f64 / 1_073_741_824.0))
-                                        .unwrap_or_default();
-                                    format!("  🌸 {}{}", m.name, size)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.push_system_event(format!("📦 Models:\n{}", list));
-                        }
+                    Ok(Ok(models)) if !models.is_empty() => {
+                        // Mark current model with ✦
+                        self.model_picker_items = models.iter().map(|m| {
+                            let size = m.size
+                                .map(|b| format!(" {:.1}GB", b as f64 / 1_073_741_824.0))
+                                .unwrap_or_default();
+                            format!("{}{}", m.name, size)
+                        }).collect();
+                        // Pre-select the current model
+                        self.model_picker_selection = models.iter()
+                            .position(|m| m.name == self.config.model)
+                            .unwrap_or(0);
+                        self.model_picker_open = true;
+                        self.status_message = "🌸 Select model — ↑↓ navigate, Enter select, Esc cancel".to_string();
+                    }
+                    Ok(Ok(_)) => {
+                        self.push_system_event("ℹ️ No models found. Run: ollama pull <model>");
                     }
                     Ok(Err(e)) => {
                         let msg = if e.to_string().contains("connection refused") {
@@ -1219,7 +1305,7 @@ impl App {
                         self.push_system_event(msg);
                     }
                     Err(_) => {
-                        self.push_system_event("❌ Model fetch timed out — Ollama not responding");
+                        self.push_system_event("❌ Model fetch timed out");
                     }
                 }
             }
@@ -1228,6 +1314,7 @@ impl App {
             }
         }
     }
+
 
     /// Handle user message — kick off streaming generation
     async fn handle_message(&mut self, message: &str) {
