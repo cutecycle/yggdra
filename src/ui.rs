@@ -15,7 +15,8 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    text::Line,
+    style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
@@ -60,6 +61,13 @@ struct ToolResult {
     output: std::result::Result<String, String>,
 }
 
+/// Application mode: autonomous execution vs interactive planning
+#[derive(Debug, Clone, PartialEq)]
+enum AppMode {
+    Build,
+    Plan,
+}
+
 /// Minimal TUI application
 pub struct App {
     config: Config,
@@ -81,14 +89,19 @@ pub struct App {
     tool_iteration_count: usize,
     /// Receives result from async tool execution
     tool_result_rx: Option<oneshot::Receiver<ToolResult>>,
+    /// Build (autonomous) vs Plan (interactive) mode
+    mode: AppMode,
+    /// Contents of AGENTS.md if found on startup
+    agents_task: Option<String>,
 }
 
 impl App {
-    /// Create new app with optional Ollama client
+    /// Create new app with optional Ollama client and AGENTS.md content
     pub fn new(
         config: Config,
         session: Session,
         ollama_client: Option<OllamaClient>,
+        agents_md: Option<String>,
     ) -> Self {
         let message_buffer = MessageBuffer::from_db(&session.messages_db)
             .unwrap_or_else(|e| {
@@ -117,6 +130,8 @@ impl App {
             turn_phase: TurnPhase::Idle,
             tool_iteration_count: 0,
             tool_result_rx: None,
+            mode: AppMode::Build,
+            agents_task: agents_md,
         }
     }
 
@@ -127,6 +142,13 @@ impl App {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
+
+        // Kick off AGENTS.md task immediately in Build mode if present
+        if let Some(task) = self.agents_task.clone() {
+            if !task.trim().is_empty() {
+                self.handle_message(&task).await;
+            }
+        }
 
         loop {
             // Drain any pending stream tokens before drawing
@@ -328,18 +350,9 @@ impl App {
     /// Build the steering system prompt (shared between handle_message and check_tool_result)
     fn steering_text(&self) -> String {
         let steering_directive = SteeringDirective::custom(
-            "You are Yggdra, a local agentic assistant. You have access to tools for \
-             interacting with the local filesystem and running code. Available tools:\n\
-             - rg PATTERN PATH — search files with ripgrep\n\
-             - editfile PATH — read a file's contents\n\
-             - spawn BINARY ARGS — execute a local binary\n\
-             - commit \"MESSAGE\" — git commit\n\
-             - python SCRIPT ARGS — run a Python script\n\
-             - ruste FILE — compile and run Rust code\n\
-             To use a tool, output: [TOOL: name args]\n\
-             After receiving tool output, analyze the results and continue.\n\
-             When done, just respond normally without tool calls.\n\
-             Be concise and helpful. You work entirely offline."
+            "You are Yggdra. Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], \
+             [TOOL: spawn BIN ARGS], [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], \
+             [TOOL: ruste FILE]. Output tools inline. Work offline, be concise."
         );
         steering_directive.format_for_system_prompt()
     }
@@ -360,26 +373,28 @@ impl App {
             .split(f.area());
 
         // Header
-        let connection_status = if self.ollama_client.is_some() { "✅ Connected" } else { "⚠️ Offline" };
+        let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
+        let mode_indicator = match self.mode {
+            AppMode::Build => "⚡ Build",
+            AppMode::Plan => "🧠 Plan",
+        };
         let header_text = match &self.turn_phase {
             TurnPhase::Streaming if self.tool_iteration_count > 0 => {
-                format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Tool follow-up ({}/{})",
-                    connection_status, self.config.model,
+                format!("🌷 {} | {} | {} | ⏳ Tool follow-up ({}/{})",
+                    mode_indicator, connection_status, self.config.model,
                     self.tool_iteration_count, MAX_TOOL_ITERATIONS)
             }
             TurnPhase::Streaming => {
-                format!("🌷 Yggdra v0.1 - {} | {} | ⏳ Streaming...",
-                    connection_status, self.config.model)
+                format!("🌷 {} | {} | {} | ⏳ Streaming...",
+                    mode_indicator, connection_status, self.config.model)
             }
             TurnPhase::ExecutingTool(name) => {
-                format!("🌷 Yggdra v0.1 - {} | {} | 🔧 Running {}...",
-                    connection_status, self.config.model, name)
+                format!("🌷 {} | {} | {} | 🔧 Running {}...",
+                    mode_indicator, connection_status, self.config.model, name)
             }
             TurnPhase::Idle => {
-                format!("🌷 Yggdra v0.1 - {} | {} | Model: {}",
-                    connection_status,
-                    self.config.endpoint.replace("http://", "").replace(":11434", ""),
-                    self.config.model)
+                format!("🌷 {} | {} | {}",
+                    mode_indicator, connection_status, self.config.model)
             }
         };
 
@@ -388,25 +403,46 @@ impl App {
         f.render_widget(header, chunks[0]);
 
         // Messages + live streaming text
-        let mut messages_text: Vec<Line> = self
+        let messages_list = self
             .message_buffer
             .messages()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let mut messages_text: Vec<Line> = messages_list
             .iter()
             .map(|m| {
-                let emoji = match m.role.as_str() {
-                    "user" => "👤",
-                    "assistant" => "🤖",
-                    "tool" => "🔧",
-                    _ => "💬",
-                };
-                Line::from(format!("{} [{}] {}", emoji, m.role, m.content))
+                match m.role.as_str() {
+                    "user" => {
+                        Line::from(vec![
+                            Span::styled("👤 ", Style::default().fg(Color::Cyan)),
+                            Span::raw(&m.content),
+                        ])
+                    }
+                    "assistant" => {
+                        Line::from(vec![
+                            Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
+                            Span::raw(&m.content),
+                        ])
+                    }
+                    "tool" => {
+                        Line::from(vec![
+                            Span::styled("🔧 ", Style::default().fg(Color::Green)),
+                            Span::raw(&m.content),
+                        ])
+                    }
+                    _ => Line::from(vec![
+                        Span::styled("💬 ", Style::default().fg(Color::Gray)),
+                        Span::raw(&m.content),
+                    ]),
+                }
             })
             .collect();
 
         // Show partial streaming response
         if !self.streaming_text.is_empty() {
-            messages_text.push(Line::from(format!("🤖 [assistant] {}▌", self.streaming_text)));
+            messages_text.push(Line::from(vec![
+                Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}▌", self.streaming_text)),
+            ]));
         }
 
         let output = Paragraph::new(messages_text)
@@ -432,7 +468,7 @@ impl App {
 
         // Status bar
         let status = format!(
-            "Session: {} | Msgs: {} | {} | [Ctrl+C] Exit [ESC] Clear",
+            "🔢 {} | 💬 {} | {}",
             &self.session.id[..8],
             self.cached_message_count,
             self.status_message.lines().next().unwrap_or("")
@@ -505,20 +541,12 @@ impl App {
     fn show_help(&mut self) {
         self.status_message = 
             "📖 Commands:\n\
-             /help         - Show this help message\n\
-             /models       - List available Ollama models\n\
-             /tool CMD     - Execute a local tool\n\n\
-             Available tools:\n\
-             • rg          - Ripgrep search (usage: /tool rg pattern path)\n\
-             • spawn       - Execute binary (usage: /tool spawn /path/to/bin args)\n\
-             • editfile    - Read file contents (usage: /tool editfile /path/to/file)\n\
-             • commit      - Git commit (usage: /tool commit \"message\")\n\
-             • python      - Run Python script (usage: /tool python script.py args)\n\
-             • ruste       - Compile/run Rust (usage: /tool ruste script.rs)\n\n\
-             Keybindings:\n\
-             Enter - Submit message\n\
-             Escape - Clear input\n\
-             Ctrl+C - Exit".to_string();
+             /help         - Show this help\n\
+             /models       - List models\n\
+             /plan         - Switch to Plan mode\n\
+             /tool CMD     - Execute tool\n\n\
+             Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive)\n\n\
+             Keybindings: Enter-Submit | Esc-Clear | Ctrl+C-Exit".to_string();
     }
 
     /// Handle /tool command for local tool execution

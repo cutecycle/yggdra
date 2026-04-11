@@ -21,6 +21,18 @@ async fn main() -> Result<()> {
     eprintln!("📁 Session: {}", session.id);
     eprintln!("📝 Messages DB: {}", session.messages_db.display());
 
+    // Load AGENTS.md from CWD if present
+    let agents_md = std::env::current_dir()
+        .ok()
+        .map(|p| p.join("AGENTS.md"))
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .filter(|c| !c.trim().is_empty());
+
+    if agents_md.is_some() {
+        eprintln!("🌱 Found AGENTS.md — autonomous build mode");
+    }
+
     // Create Ollama client (reuses the validated endpoint from config)
     let ollama_client = match ollama::OllamaClient::new(&config.endpoint, &config.model).await {
         Ok(client) => {
@@ -36,7 +48,7 @@ async fn main() -> Result<()> {
 
     notifications::session_created(&session.id).await;
 
-    let mut app = App::new(config, session, ollama_client);
+    let mut app = App::new(config, session, ollama_client, agents_md);
     app.run().await?;
 
     eprintln!("👋 Goodbye!");
