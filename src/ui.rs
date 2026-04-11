@@ -5,6 +5,7 @@ use crate::message::{Message, MessageBuffer};
 use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
 use crate::steering::SteeringDirective;
+use crate::task::{TaskManager, Checkpoint};
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use crossterm::{
@@ -130,6 +131,7 @@ pub struct App {
     status_message: String,
     running: bool,
     message_buffer: MessageBuffer,
+    task_manager: TaskManager,
     ollama_client: Option<OllamaClient>,
     tool_registry: ToolRegistry,
     cached_message_count: usize,
@@ -167,6 +169,12 @@ impl App {
                 MessageBuffer::new(&session.messages_db)
                     .expect("Cannot create message database")
             });
+        let task_manager = TaskManager::from_db(&session.tasks_db)
+            .unwrap_or_else(|e| {
+                eprintln!("🌹 Failed to open tasks DB: {}", e);
+                TaskManager::new(&session.tasks_db)
+                    .expect("Cannot create task database")
+            });
         let status_message = if ollama_client.is_some() {
             "✅ Ollama connected".to_string()
         } else {
@@ -180,6 +188,7 @@ impl App {
             status_message,
             running: true,
             message_buffer,
+            task_manager,
             ollama_client,
             tool_registry: ToolRegistry::new(),
             cached_message_count: 0,
@@ -749,6 +758,9 @@ impl App {
             self.handle_models_command().await;
         } else if command == "/help" {
             self.show_help();
+        } else if command.starts_with("/checkpoint") {
+            let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
+            self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
         } else if command.starts_with('/') {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
@@ -987,6 +999,24 @@ impl App {
             result.pop();
         }
         result
+    }
+
+    /// Handle /checkpoint command to save session progress
+    fn handle_checkpoint_command(&mut self, name_opt: Option<&str>) {
+        let checkpoint_name = name_opt
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Checkpoint at {}", chrono::Local::now().format("%H:%M:%S")));
+
+        match self.task_manager.checkpoint(&checkpoint_name) {
+            Ok(_) => {
+                let summary = format!("📍 Checkpoint '{}' saved", checkpoint_name);
+                self.push_system_event(&summary);
+                self.status_message = summary;
+            }
+            Err(e) => {
+                self.status_message = format!("❌ Checkpoint failed: {}", e);
+            }
+        }
     }
 }
 
