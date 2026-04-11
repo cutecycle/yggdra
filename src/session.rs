@@ -1,268 +1,67 @@
-/// Session management module: handles JSONL-based session storage
+/// Session management: track current session via .yggdra_session_id marker file
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
-/// Session mode: Plan or Build
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum SessionMode {
-    Plan,
-    Build,
-}
-
-impl std::fmt::Display for SessionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SessionMode::Plan => write!(f, "Plan"),
-            SessionMode::Build => write!(f, "Build"),
-        }
-    }
-}
-
-/// Session metadata: stored in metadata.jsonl
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMetadata {
+/// Session info
+#[derive(Debug, Clone)]
+pub struct Session {
     pub id: String,
-    pub created_at: DateTime<Utc>,
-    pub mode: SessionMode,
-    pub context_tokens: u32,
-    pub battery_aware_rates: bool,
+    pub messages_file: PathBuf,
 }
 
-/// Session manager: handles creation, loading, and listing of sessions
-pub struct SessionManager;
-
-impl SessionManager {
-    /// Get the base sessions directory
-    fn sessions_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
-        Ok(home.join(".yggdra/sessions"))
-    }
-
-    /// Get the yggdra config directory
-    pub fn config_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
-        Ok(home.join(".yggdra"))
-    }
-
-    /// Get current session ID file path (global)
-    fn current_session_file() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("current_session_id"))
-    }
-
-    /// Get per-directory session ID file path
-    fn directory_session_file() -> Result<PathBuf> {
+impl Session {
+    /// Get session ID marker file path in CWD
+    fn marker_file() -> Result<PathBuf> {
         let cwd = std::env::current_dir()?;
         Ok(cwd.join(".yggdra_session_id"))
     }
 
-    /// Create a new session
-    pub fn create_session(mode: SessionMode) -> Result<SessionMetadata> {
-        let config_dir = Self::config_dir()?;
-        fs::create_dir_all(&config_dir)?;
+    /// Get session directory
+    fn session_dir(id: &str) -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot find home"))?;
+        Ok(home.join(".yggdra/sessions").join(id))
+    }
 
-        let sessions_dir = Self::sessions_dir()?;
-        fs::create_dir_all(&sessions_dir)?;
+    /// Load or create session
+    pub fn load_or_create() -> Result<Self> {
+        let marker = Self::marker_file()?;
 
+        // Try to load existing session
+        if marker.exists() {
+            let session_id = fs::read_to_string(&marker)?
+                .trim()
+                .to_string();
+            if !session_id.is_empty() {
+                let session_dir = Self::session_dir(&session_id)?;
+                if session_dir.exists() {
+                    eprintln!("📂 Attached to session: {}", session_id);
+                    return Ok(Session {
+                        id: session_id,
+                        messages_file: session_dir.join("messages.jsonl"),
+                    });
+                }
+            }
+        }
+
+        // Create new session
         let session_id = Uuid::new_v4().to_string();
-        let session_dir = sessions_dir.join(&session_id);
+        let session_dir = Self::session_dir(&session_id)?;
         fs::create_dir_all(&session_dir)?;
 
-        let metadata = SessionMetadata {
-            id: session_id.clone(),
-            created_at: Utc::now(),
-            mode,
-            context_tokens: 0,
-            battery_aware_rates: false,
-        };
+        // Create empty messages file
+        let messages_file = session_dir.join("messages.jsonl");
+        fs::write(&messages_file, "")?;
 
-        // Write metadata.jsonl
-        let metadata_path = session_dir.join("metadata.jsonl");
-        let metadata_json = serde_json::to_string(&metadata)?;
-        fs::write(&metadata_path, format!("{}\n", metadata_json))?;
+        // Write marker
+        fs::write(&marker, &session_id)?;
 
-        // Create empty messages.jsonl
-        let messages_path = session_dir.join("messages.jsonl");
-        fs::write(&messages_path, "")?;
+        eprintln!("🎫 Created new session: {}", session_id);
 
-        // Save as current session
-        fs::write(Self::current_session_file()?, &session_id)?;
-
-        Ok(metadata)
-    }
-
-    /// Load a session by ID
-    pub fn load_session(session_id: &str) -> Result<SessionMetadata> {
-        let sessions_dir = Self::sessions_dir()?;
-        let session_dir = sessions_dir.join(session_id);
-
-        if !session_dir.exists() {
-            return Err(anyhow!("Session {} not found", session_id));
-        }
-
-        let metadata_path = session_dir.join("metadata.jsonl");
-        let content = fs::read_to_string(&metadata_path)?;
-
-        let metadata: SessionMetadata = serde_json::from_str(content.lines().next().unwrap_or(""))?;
-        Ok(metadata)
-    }
-
-    /// Load the per-directory session, or create one if none exists
-    /// This checks for .yggdra_session_id in the current working directory first
-    pub fn load_or_create_per_directory() -> Result<SessionMetadata> {
-        // First, try to load from directory-local session ID file
-        match Self::directory_session_file() {
-            Ok(dir_session_file) => {
-                if dir_session_file.exists() {
-                    if let Ok(session_id) = std::fs::read_to_string(&dir_session_file) {
-                        let session_id = session_id.trim();
-                        if !session_id.is_empty() {
-                            if let Ok(metadata) = Self::load_session(session_id) {
-                                eprintln!("📂 Loaded session from .yggdra_session_id: {}", session_id);
-                                return Ok(metadata);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-
-        // Create new session if none exists in this directory
-        let metadata = Self::create_session(SessionMode::Plan)?;
-
-        // Write session ID to directory-local file
-        if let Ok(dir_session_file) = Self::directory_session_file() {
-            let _ = std::fs::write(&dir_session_file, &metadata.id);
-            eprintln!("📂 Created new session for this directory: {}", metadata.id);
-        }
-
-        Ok(metadata)
-    }
-
-    /// Load the last active session (global), or create one if none exists
-    /// This is used when no per-directory session exists
-    pub fn load_or_create_last() -> Result<SessionMetadata> {
-        match Self::current_session_file() {
-            Ok(current_file) => {
-                if current_file.exists() {
-                    if let Ok(session_id) = fs::read_to_string(&current_file) {
-                        let session_id = session_id.trim();
-                        if !session_id.is_empty() {
-                            if let Ok(metadata) = Self::load_session(session_id) {
-                                return Ok(metadata);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-
-        // Create new session if none exists
-        Self::create_session(SessionMode::Plan)
-    }
-
-    /// List all sessions
-    pub fn list_sessions() -> Result<Vec<SessionMetadata>> {
-        let sessions_dir = Self::sessions_dir()?;
-
-        if !sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = Vec::new();
-
-        for entry in fs::read_dir(&sessions_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let metadata_path = path.join("metadata.jsonl");
-                if metadata_path.exists() {
-                    if let Ok(content) = fs::read_to_string(&metadata_path) {
-                        if let Ok(metadata) = serde_json::from_str::<SessionMetadata>(
-                            content.lines().next().unwrap_or(""),
-                        ) {
-                            sessions.push(metadata);
-                        }
-                    }
-                }
-            }
-        }
-
-        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(sessions)
-    }
-
-    /// Update current session ID
-    pub fn set_current_session(session_id: &str) -> Result<()> {
-        fs::write(Self::current_session_file()?, session_id)?;
-        Ok(())
-    }
-
-    /// Get current session ID
-    pub fn get_current_session() -> Result<Option<String>> {
-        match Self::current_session_file() {
-            Ok(current_file) => {
-                if current_file.exists() {
-                    let session_id = fs::read_to_string(&current_file)?;
-                    let session_id = session_id.trim();
-                    if !session_id.is_empty() {
-                        return Ok(Some(session_id.to_string()));
-                    }
-                }
-                Ok(None)
-            }
-            Err(_) => Ok(None),
-        }
-    }
-
-    /// Append a message to session's messages.jsonl
-    pub fn append_message(session_id: &str, message: &serde_json::Value) -> Result<()> {
-        let sessions_dir = Self::sessions_dir()?;
-        let messages_path = sessions_dir.join(session_id).join("messages.jsonl");
-
-        let json_str = serde_json::to_string(message)?;
-        let mut file_content = if messages_path.exists() {
-            fs::read_to_string(&messages_path)?
-        } else {
-            String::new()
-        };
-
-        if !file_content.is_empty() && !file_content.ends_with('\n') {
-            file_content.push('\n');
-        }
-
-        file_content.push_str(&json_str);
-        file_content.push('\n');
-
-        fs::write(&messages_path, file_content)?;
-        Ok(())
-    }
-
-    /// Read all messages from a session
-    pub fn read_messages(session_id: &str) -> Result<Vec<serde_json::Value>> {
-        let sessions_dir = Self::sessions_dir()?;
-        let messages_path = sessions_dir.join(session_id).join("messages.jsonl");
-
-        if !messages_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&messages_path)?;
-        let mut messages = Vec::new();
-
-        for line in content.lines() {
-            if !line.trim().is_empty() {
-                let msg: serde_json::Value = serde_json::from_str(line)?;
-                messages.push(msg);
-            }
-        }
-
-        Ok(messages)
+        Ok(Session {
+            id: session_id,
+            messages_file,
+        })
     }
 }

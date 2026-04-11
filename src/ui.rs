@@ -1,241 +1,208 @@
-/// TUI module: handles the terminal user interface using ratatui
-use crate::message::MessageBuffer;
-use crate::session::{SessionManager, SessionMetadata, SessionMode};
+/// TUI module: minimal terminal UI with multi-window sync via polling
+use crate::config::Config;
+use crate::message::{Message, MessageBuffer};
+use crate::session::Session;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    layout::{Constraint, Direction, Layout},
+    text::Line,
+    widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use serde_json::json;
+use std::io;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
-/// Type alias for the terminal type used in this app
-type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
+type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// TUI application state
-pub struct TuiApp {
-    session: SessionMetadata,
-    message_buffer: MessageBuffer,
+/// Minimal TUI application
+pub struct App {
+    config: Config,
+    session: Session,
     input_buffer: String,
     output_buffer: String,
-    mode: SessionMode,
     running: bool,
-    needs_save: bool,
+    message_buffer: MessageBuffer,
+    last_file_size: u64,
 }
 
-impl TuiApp {
-    /// Create a new TUI application
-    pub fn new(session: SessionMetadata, message_buffer: MessageBuffer) -> Self {
-        let mode = session.mode;
+impl App {
+    /// Create new app
+    pub fn new(config: Config, session: Session) -> Self {
+        let message_buffer = MessageBuffer::from_file(&session.messages_file);
         Self {
+            config,
             session,
-            message_buffer,
             input_buffer: String::new(),
             output_buffer: String::new(),
-            mode,
             running: true,
-            needs_save: false,
+            message_buffer,
+            last_file_size: 0,
         }
     }
 
-    /// Handle keyboard events
-    fn handle_input(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                self.running = false;
+    /// Run the TUI
+    pub async fn run(&mut self) -> Result<()> {
+        // Setup terminal
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
+
+        // Track last file size for polling
+        self.last_file_size = self
+            .session
+            .messages_file
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // Main loop
+        let running = Arc::new(AtomicBool::new(true));
+        let _running_clone = running.clone();
+
+        loop {
+            // Draw UI
+            terminal.draw(|f| self.draw(f))?;
+
+            // Handle events with timeout
+            if crossterm::event::poll(Duration::from_millis(500))? {
+                if let Event::Key(key) = event::read()? {
+                    self.handle_key(key);
+                    if !self.running {
+                        break;
+                    }
+                }
+            } else {
+                // Timeout: poll for changes
+                self.poll_for_updates()?;
             }
-            (KeyModifiers::NONE, KeyCode::Tab) => {
-                self.mode = match self.mode {
-                    SessionMode::Plan => SessionMode::Build,
-                    SessionMode::Build => SessionMode::Plan,
-                };
-                self.output_buffer
-                    .push_str(&format!("🌷 Switched to {} mode\n", self.mode));
+        }
+
+        // Cleanup terminal
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        Ok(())
+    }
+
+    /// Draw UI frame
+    fn draw(&self, f: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                [
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ]
+                .as_ref(),
+            )
+            .split(f.area());
+
+        // Header
+        let header = Paragraph::new("🌷 Yggdra - Airgapped Agent")
+            .block(Block::default().borders(Borders::BOTTOM));
+        f.render_widget(header, chunks[0]);
+
+        // Message output
+        let messages_text: Vec<Line> = self
+            .message_buffer
+            .messages()
+            .iter()
+            .map(|m| {
+                let emoji = if m.role == "user" { "🌷" } else { "🌻" };
+                Line::from(format!("{} [{}] {}", emoji, m.role, m.content))
+            })
+            .collect();
+
+        let output = Paragraph::new(messages_text)
+            .block(Block::default().title("Messages").borders(Borders::ALL))
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(output, chunks[1]);
+
+        // Input area
+        let input = Paragraph::new(format!("> {}", self.input_buffer))
+            .block(Block::default().title("Input").borders(Borders::ALL));
+        f.render_widget(input, chunks[2]);
+
+        // Status bar
+        let status = format!(
+            "Session: {} | Model: {} | {}/? | Ctrl+C to exit",
+            &self.session.id[..8],
+            self.config.model,
+            self.message_buffer.messages().len()
+        );
+        let status_bar = Paragraph::new(status);
+        f.render_widget(status_bar, chunks[3]);
+    }
+
+    /// Handle keyboard input
+    fn handle_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+
+        match key.code {
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if c == 'c' {
+                    self.running = false;
+                }
             }
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.send_message()?;
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
             }
-            (KeyModifiers::NONE, KeyCode::Backspace) => {
+            KeyCode::Backspace => {
                 self.input_buffer.pop();
             }
-            (KeyModifiers::NONE, KeyCode::Char(c)) => {
-                self.input_buffer.push(c);
+            KeyCode::Enter => {
+                self.handle_command();
+            }
+            KeyCode::Esc => {
+                self.input_buffer.clear();
             }
             _ => {}
         }
-        Ok(())
     }
 
-    /// Send a message and get a placeholder response
-    fn send_message(&mut self) -> Result<()> {
-        if self.input_buffer.trim().is_empty() {
-            return Ok(());
-        }
+    /// Handle command submission
+    fn handle_command(&mut self) {
+        let command = self.input_buffer.trim();
 
-        let user_message = self.input_buffer.clone();
-
-        // Add user message to buffer
-        self.message_buffer
-            .add_message("user", user_message.clone());
-
-        // Add to output
-        self.output_buffer
-            .push_str(&format!("🌷 You: {}\n", user_message));
-
-        // Create message entry for JSONL
-        let message_json = json!({
-            "role": "user",
-            "content": user_message,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "token_count": (user_message.len() as f32 / 4.0).ceil() as u32
-        });
-
-        // Save to session
-        SessionManager::append_message(&self.session.id, &message_json)?;
-
-        // Placeholder agent response
-        let agent_response = "🌷 Placeholder agent output: processing your message...";
-        self.message_buffer.add_message("assistant", agent_response);
-
-        self.output_buffer
-            .push_str(&format!("🌻 Agent: {}\n", agent_response));
-
-        let response_json = json!({
-            "role": "assistant",
-            "content": agent_response,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "token_count": (agent_response.len() as f32 / 4.0).ceil() as u32
-        });
-
-        SessionManager::append_message(&self.session.id, &response_json)?;
-
-        // Check compression warning
-        if self.message_buffer.needs_compression() {
-            self.output_buffer.push_str(&format!(
-                "🌹 Warning: Context usage at {:.1}%\n",
-                self.message_buffer.context_usage_percent()
-            ));
+        if command == "/models" {
+            self.output_buffer = "📋 Available models (stub):\n  - qwen:3.5".to_string();
+        } else if !command.is_empty() {
+            // Save user message
+            let msg = Message::new("user", command.to_string());
+            let _ = msg.to_jsonl();
+            eprintln!("User: {}", command);
+            self.message_buffer
+                .add_and_persist(msg, &self.session.messages_file)
+                .ok();
         }
 
         self.input_buffer.clear();
-        self.needs_save = true;
-
-        Ok(())
     }
 
-    /// Render the TUI
-    fn render(&self, f: &mut Frame) {
-        let size = f.area();
-
-        // Create main layout: header | main | status
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(3),
-            ])
-            .split(size);
-
-        // Header
-        self.render_header(f, chunks[0]);
-
-        // Main content area: split into output and input
-        let main_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(4)])
-            .split(chunks[1]);
-
-        self.render_output(f, main_chunks[0]);
-        self.render_input(f, main_chunks[1]);
-
-        // Status bar
-        self.render_status(f, chunks[2]);
-    }
-
-    /// Render header with mode indicator
-    fn render_header(&self, f: &mut Frame, area: Rect) {
-        let title = format!("🌷 Yggdra - {} Mode", self.mode);
-        let header = Paragraph::new(title)
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::BOTTOM));
-        f.render_widget(header, area);
-    }
-
-    /// Render output area
-    fn render_output(&self, f: &mut Frame, area: Rect) {
-        let output = Paragraph::new(self.output_buffer.as_str())
-            .block(Block::default().title("🌻 Output").borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        f.render_widget(output, area);
-    }
-
-    /// Render input area
-    fn render_input(&self, f: &mut Frame, area: Rect) {
-        let lines = vec![Line::from(vec![
-            Span::raw("🌷 > "),
-            Span::raw(self.input_buffer.as_str()),
-        ])];
-        let input = Paragraph::new(lines)
-            .block(Block::default().title("Input").borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        f.render_widget(input, area);
-    }
-
-    /// Render status bar
-    fn render_status(&self, f: &mut Frame, area: Rect) {
-        let context_percent = self.message_buffer.context_usage_percent();
-        let status = format!(
-            " Mode: {} | Session: {} | Context: {:.1}% | Battery: --% ",
-            self.mode,
-            &self.session.id[..8],
-            context_percent
-        );
-        let status_bar = Paragraph::new(status)
-            .block(Block::default().borders(Borders::TOP))
-            .alignment(Alignment::Left);
-        f.render_widget(status_bar, area);
-    }
-}
-
-/// Run the TUI event loop
-pub async fn run_tui(session: SessionMetadata, message_buffer: MessageBuffer) -> Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut app = TuiApp::new(session, message_buffer);
-
-    loop {
-        terminal.draw(|f| app.render(f))?;
-
-        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_input(key)?;
+    /// Poll for file changes
+    fn poll_for_updates(&mut self) -> Result<()> {
+        if let Ok(metadata) = self.session.messages_file.metadata() {
+            let new_size = metadata.len();
+            if new_size > self.last_file_size {
+                // File grew - reload messages
+                self.message_buffer = MessageBuffer::from_file(&self.session.messages_file);
+                self.last_file_size = new_size;
             }
         }
-
-        if !app.running {
-            break;
-        }
+        Ok(())
     }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-    )?;
-
-    Ok(())
 }
