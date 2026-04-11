@@ -157,8 +157,8 @@ pub struct App {
     log_dir: std::path::PathBuf,
     /// Build (autonomous) vs Plan (interactive) mode
     mode: AppMode,
-    /// Contents of AGENTS.md if found on startup
-    agents_task: Option<String>,
+    /// Contents of AGENTS.md — injected into steering context
+    agents_context: Option<String>,
     /// Whether the command palette is open
     palette_open: bool,
     /// Which palette item is highlighted
@@ -218,7 +218,7 @@ impl App {
             log_sender,
             log_dir,
             mode: AppMode::Build,
-            agents_task: agents_md,
+            agents_context: agents_md,
             palette_open: false,
             palette_selection: 0,
         }
@@ -232,11 +232,18 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        // Kick off AGENTS.md task immediately in Build mode if present
-        if let Some(task) = self.agents_task.clone() {
-            if !task.trim().is_empty() {
-                self.handle_message(&task).await;
-            }
+        // In Build mode, fire kick prompt to start autonomous loop
+        if self.mode == AppMode::Build && self.agents_context.is_some() {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            let kick = format!(
+                "New session started in `{cwd}`. \
+                 Orient yourself: list the directory, review any existing tasks, \
+                 and begin working autonomously. \
+                 Use tools to explore. Say [DONE] only when fully complete."
+            );
+            self.handle_message(&kick).await;
         }
 
         loop {
@@ -486,14 +493,18 @@ impl App {
     fn steering_text(&self) -> String {
         let os = std::env::consts::OS;
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
-        let steering_directive = SteeringDirective::custom(&format!(
+        let mut base = format!(
             "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
              Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], [TOOL: spawn BINARY ARGS], \
              [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], [TOOL: ruste FILE].\n\
              Examples: [TOOL: spawn ls -la .] or [TOOL: rg TODO src/] or [TOOL: editfile Cargo.toml].\n\
              Use tools proactively. Do not say you cannot access files—use [TOOL: spawn ls] instead. Be concise."
-        ));
-        steering_directive.format_for_system_prompt()
+        );
+        if let Some(ctx) = &self.agents_context {
+            base.push_str("\n\n--- AGENTS.md ---\n");
+            base.push_str(ctx);
+        }
+        SteeringDirective::custom(&base).format_for_system_prompt()
     }
 
     /// Push a system-level notice into the conversation (compaction, warnings, etc.)
