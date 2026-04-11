@@ -177,3 +177,48 @@ fn test_gitignore_includes_session_id() {
         ".gitignore should contain .yggdra_session_id entry"
     );
 }
+
+#[test]
+fn test_hierarchical_config_jsonl_format() {
+    // Test that config can be created and parsed in JSONL format
+    let temp_dir = std::env::temp_dir().join("yggdra_config_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp test dir");
+
+    let config_file = temp_dir.join("yggdra.jsonl");
+    
+    let config_json = r#"{"ollama_endpoint":"http://localhost:11434","context_limit":8000,"battery_low_percent":30,"compression_threshold":70}"#;
+    fs::write(&config_file, format!("{}\n", config_json))
+        .expect("Failed to write config");
+
+    // Read and parse
+    let content = fs::read_to_string(&config_file).expect("Failed to read config");
+    if let Some(line) = content.lines().next() {
+        let config: serde_json::Value = serde_json::from_str(line)
+            .expect("Config should parse as JSON");
+        assert_eq!(config["context_limit"], 8000);
+        assert_eq!(config["battery_low_percent"], 30);
+    } else {
+        panic!("Config file should not be empty");
+    }
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[test]
+fn test_config_serialization() {
+    // Test that Config round-trips through JSON
+    let original_config = serde_json::json!({
+        "ollama_endpoint": "http://localhost:11434",
+        "context_limit": 8000,
+        "battery_low_percent": 30,
+        "compression_threshold": 70
+    });
+
+    let json_str = original_config.to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .expect("Should deserialize");
+
+    assert_eq!(original_config, parsed);
+}

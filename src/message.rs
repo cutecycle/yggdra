@@ -12,6 +12,7 @@ pub struct Message {
 }
 
 /// Message buffer: manages messages and token tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageBuffer {
     messages: Vec<Message>,
     total_tokens: u32,
@@ -102,6 +103,24 @@ impl MessageBuffer {
             0
         };
         &self.messages[start..]
+    }
+
+    /// Create from raw components (for deserialization)
+    pub fn from_components(
+        messages: Vec<Message>,
+        total_tokens: u32,
+        context_limit: u32,
+    ) -> Self {
+        Self {
+            messages,
+            total_tokens,
+            context_limit,
+        }
+    }
+
+    /// Get raw components (for serialization)
+    pub fn to_components(self) -> (Vec<Message>, u32, u32) {
+        (self.messages, self.total_tokens, self.context_limit)
     }
 }
 
