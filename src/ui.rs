@@ -481,24 +481,24 @@ impl App {
             .iter()
             .map(|m| {
                 let tint = if exchange_idx % 2 == 0 {
-                    Color::Rgb(30, 30, 40)   // subtle dark blue
+                    Color::Rgb(30, 30, 45)   // subtle dark blue band
                 } else {
-                    Color::Rgb(20, 30, 20)   // subtle dark green
+                    Color::Rgb(20, 35, 20)   // subtle dark green band
                 };
                 let line = match m.role.as_str() {
                     "user" => {
-                        if m.role != "tool" { exchange_idx += 1; }
+                        exchange_idx += 1;
                         Line::from(vec![
-                            Span::styled("👤 ", Style::default().fg(Color::Cyan).bg(tint)),
-                            Span::styled(&m.content, Style::default().fg(Color::White).bg(tint)),
-                        ])
+                            Span::styled("👤 ", Style::default().fg(Color::Cyan)),
+                            Span::styled(&m.content, Style::default().fg(Color::White)),
+                        ]).style(Style::default().bg(tint))
                     }
                     "assistant" => {
-                        if m.role != "tool" { exchange_idx += 1; }
+                        exchange_idx += 1;
                         Line::from(vec![
-                            Span::styled("🤖 ", Style::default().fg(Color::Yellow).bg(tint)),
-                            Span::styled(&m.content, Style::default().fg(Color::White).bg(tint)),
-                        ])
+                            Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
+                            Span::styled(&m.content, Style::default().fg(Color::White)),
+                        ]).style(Style::default().bg(tint))
                     }
                     "tool" => Line::from(vec![
                         Span::styled("🔧 ", Style::default().fg(Color::Green)),
@@ -519,10 +519,11 @@ impl App {
 
         // Show partial streaming response
         if !self.streaming_text.is_empty() {
-            let tint = if exchange_idx % 2 == 0 { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 30, 20) };
-            messages_text.push(Line::from(vec![
-                Span::styled("🤖 ", Style::default().fg(Color::Yellow).bg(tint)),
-                Span::styled(format!("{}▌", self.streaming_text), Style::default().fg(Color::White).bg(tint)),
+            let tint = if exchange_idx % 2 == 0 { Color::Rgb(30, 30, 45) } else { Color::Rgb(20, 35, 20) };
+            messages_text.push(
+                Line::from(vec![
+                    Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{}▌", self.streaming_text), Style::default().fg(Color::White)),
             ]));
         }
 

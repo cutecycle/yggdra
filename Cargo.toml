@@ -2,11 +2,16 @@
 name = "yggdra"
 version = "0.1.0"
 edition = "2021"
-description = "Airgapped agentic TUI with local tool execution"
+description = "Airgapped agentic TUI for local LLM inference with tool execution"
 authors = ["Copilot <223556219+Copilot@users.noreply.github.com>"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/cutecycle/yggdra"
+homepage = "https://github.com/cutecycle/yggdra"
+documentation = "https://github.com/cutecycle/yggdra"
 readme = "README.md"
+keywords = ["tui", "llm", "ollama", "agent", "cli"]
+categories = ["command-line-utilities", "command-line-interface"]
+exclude = [".github", "target"]
 
 [lib]
 name = "yggdra"
