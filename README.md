@@ -1,397 +1,212 @@
-# Yggdra: Airgapped Agentic TUI
+# 🌳 yggdra
 
-**Yggdra** is a minimal, airgapped TUI (terminal user interface) for local language model inference with integrated tool execution. Designed for secure, offline environments with zero internet connectivity—while supporting local or tailnet Ollama endpoints.
+**Your local LLM just learned how to use tools.**
 
-## ✨ Features
+Yggdra is an airgapped agentic TUI — a tiny Rust app that connects to
+[Ollama](https://ollama.ai), gives your model a toolbox (ripgrep, git, python,
+file editing, even nested sub-agents), and lets it *do things* on your
+filesystem. No cloud. No API keys. No phoning home. Just you, a terminal, and
+a surprisingly capable local model.
 
-- **Airgapped by Design**: No internet connectivity required. All computation stays local.
-- **Build & Plan Modes**: Autonomous (Build) or interactive (Plan) workflows
-- **Local Model Inference**: Chat with Ollama-hosted LLMs (Qwen, Llama, Mistral, etc.)
-- **Tool Execution**: Run local tools directly from the TUI (ripgrep, git, python, rust)
-- **Session Management**: Per-directory sessions that persist across restarts
-- **SQLite Backend**: Fast, transactional storage with multi-window sync via polling
-- **Steering Directives**: Inject system-level constraints ("be concise", "output JSON", etc.)
-- **Clean TUI**: Minimal, distraction-free interface built with Ratatui
+```
+┌──────────────────────────────── yggdra ─────────────────────────────────┐
+│ 🌷 session a1b2c3  ·  qwen3:8b  ·  build mode  ·  3 tasks remaining  │
+│─────────────────────────────────────────────────────────────────────────│
+│ user: find all the TODO comments and summarize them                     │
+│ assistant: on it — searching with rg first…                             │
+│ [TOOL_OUTPUT: rg = src/ui.rs:42: // TODO: dark mode toggle]            │
+│ assistant: found 7 TODOs across 4 files. here's the summary…           │
+│─────────────────────────────────────────────────────────────────────────│
+│ >                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-## 🚀 Quick Start
+~6k lines of Rust · 4.8 MB binary · <50 MB RAM · zero network dependencies
 
-### Prerequisites
+---
 
-- **Ollama** (v0.1.0+): Download from https://ollama.ai
-- **ripgrep** (optional): For file searching with `/tool rg`
-- **Git** (optional): For version control operations
-- **Rust 1.70+** (for building from source)
+## Why?
 
-### Installation
+Most agentic coding tools need the cloud. Yggdra doesn't. It's built for the
+scenario where you *can't* — or *won't* — send your code to someone else's
+servers. Plug in an Ollama instance (local or on your tailnet), point it at a
+project, and let it work.
 
-#### Option 1: Build from Source
+It's also just… nice? The TUI is clean, sessions persist, and the model can
+spawn sub-agents to parallelize work. It feels like pair programming with
+someone who never gets tired and never judges your variable names.
+
+---
+
+## Quick start
+
+**You need:** [Ollama](https://ollama.ai) running somewhere reachable, and
+Rust 1.70+ to build.
+
 ```bash
 git clone https://github.com/cutecycle/yggdra.git
 cd yggdra
 cargo build --release
-./target/release/yggdra
+./target/release/yggdra          # or: make install → ~/.local/bin/yggdra
 ```
 
-#### Option 2: Install from Binary
-```bash
-# Download pre-built binary for your platform
-# (Links in GitHub releases)
-chmod +x yggdra
-./yggdra
-```
-
-### First Steps
-
-1. **Start Ollama** (if not already running):
-   ```bash
-   ollama serve
-   ```
-
-2. **Pull a model** (one-time setup):
-   ```bash
-   ollama pull qwen:3.5-chat
-   # or: ollama pull llama2, mistral, etc.
-   ```
-
-3. **Launch Yggdra**:
-   ```bash
-   yggdra
-   ```
-
-4. **Type a message**:
-   ```
-   > What is recursion?
-   ```
-
-5. **See available commands**:
-   ```
-   /help
-   ```
-
-## 📖 Usage
-
-### Commands
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/help` | Show all commands and keybindings | `/help` |
-| `/models` | List available Ollama models | `/models` |
-| `/tool CMD` | Execute a local tool | `/tool rg "pattern" .` |
-| Any text | Send message to LLM | `What is machine learning?` |
-
-### Keybindings
-
-| Key | Action |
-|-----|--------|
-| **Enter** | Send message or command |
-| **Escape** | Clear input buffer |
-| **Ctrl+C** | Exit Yggdra |
-
-### Examples
-
-**List available models:**
-```
-/models
-```
-
-**Search for files:**
-```
-/tool rg "TODO" .
-```
-
-**Run a Git command:**
-```
-/tool git log --oneline | head -5
-```
-
-**Get file information:**
-```
-/tool stat src/main.rs
-```
-
-## ⚡ Build & Plan Modes
-
-Yggdra supports two operating modes:
-
-### Build Mode (Autonomous) 🏗️
-
-By default, Yggdra launches in **Build mode**. If an `AGENTS.md` file exists in the current directory, Yggdra reads it and immediately begins executing the task described there. Perfect for:
-
-- Running automated workflows
-- Executing pre-defined agent tasks
-- Batch processing with no user interaction
-
-**Example `AGENTS.md`:**
-```
-Search for all TODO comments in src/ and create a summary.
-```
-
-On startup, Yggdra will:
-1. Load the task from `AGENTS.md`
-2. Send it to the model
-3. Let the model use tools autonomously (ripgrep, editfile, etc.)
-4. Display results as they arrive
-
-### Plan Mode (Interactive) 🧠
-
-Switch to **Plan mode** for hands-on control:
+First run? Pull a model and go:
 
 ```bash
-/plan
+ollama pull qwen3:8b             # or whatever you like
+yggdra                           # that's it
 ```
-
-In Plan mode, you stay in the driver's seat:
-- Send messages and receive responses
-- Approve or reject tool executions before they run
-- Iterate on solutions interactively
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable | Description | Default | Example |
-|----------|-------------|---------|---------|
-| `OLLAMA_ENDPOINT` | Ollama API URL | `http://localhost:11434` | `http://192.168.1.10:11434` |
-| `OLLAMA_MODEL` | Default model to use | Auto-detect from Ollama | `mistral` |
-
-### Example Configuration
-
-```bash
-# Use a remote Ollama instance
-export OLLAMA_ENDPOINT=http://192.168.1.100:11434
-export OLLAMA_MODEL=llama2
-
-yggdra
-```
-
-## 📁 Session Management
-
-### Per-Directory Sessions
-
-Each directory gets its own isolated session (conversation history):
-
-```bash
-cd ~/project-a
-yggdra  # Creates/loads session for ~/project-a
-
-cd ~/project-b
-yggdra  # Creates/loads session for ~/project-b (separate history)
-```
-
-**Session Storage:**
-- **Session ID file**: `.yggdra_session_id` (in each directory, add to .gitignore)
-- **Session data**: `~/.yggdra/sessions/{uuid}/` (local user directory)
-
-### Session Files
-
-```
-~/.yggdra/
-├── sessions/
-│   └── {session-uuid}/
-│       ├── metadata.json       # Session info (created, model, etc.)
-│       └── messages.jsonl      # Conversation history (one message per line)
-└── .yggdra_session_id          # Session ID marker (per directory)
-```
-
-## 🏗️ Architecture
-
-### High-Level Design
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      Yggdra TUI                         │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Input Handling     Output Rendering            │   │
-│  │  (Crossterm)        (Ratatui)                   │   │
-│  └──────────────┬───────────────────────────────────┘   │
-│                │                                         │
-│  ┌──────────────┴───────────────────────────────────┐   │
-│  │  Message Buffer (in-memory with DB persistence)  │   │
-│  │  • Compressed when >20 messages                  │   │
-│  │  • Auto-saves on each message                    │   │
-│  └──────────────┬───────────────────────────────────┘   │
-│                │                                         │
-│  ┌──────────────┴───────────────────────────────────┐   │
-│  │  SQLite Backend                                  │   │
-│  │  • One DB file per session (~/.yggdra/...)      │   │
-│  │  • JSONL export for portability                 │   │
-│  │  • <16ms query times even with 100+ messages    │   │
-│  └──────────────┬───────────────────────────────────┘   │
-│                │                                         │
-├────────────────┼────────────────────────────────────────┤
-│   Tool Execution                                        │
-│  ┌────────────────┬────────────────────────────────┐   │
-│  │ /tool ripgrep  │ /tool git   | /tool bash cmd  │   │
-│  └────────────────┴────────────────────────────────┘   │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│   Ollama Integration                                    │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  OllamaClient                                    │   │
-│  │  • Chat API (/api/chat)                         │   │
-│  │  • Model discovery (/api/tags)                  │   │
-│  │  • Steering injection (system prompt)           │   │
-│  └──────────────────────────────────────────────────┘   │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Key Components
-
-1. **UI Module** (`src/ui.rs`)
-   - Terminal rendering with Ratatui
-   - Event handling (keyboard, input validation)
-   - Status bar with real-time feedback
-
-2. **Message Buffer** (`src/message.rs`)
-   - In-memory message storage with compression
-   - SQLite persistence (transactions, durability)
-   - Context window management
-
-3. **Ollama Client** (`src/ollama.rs`)
-   - HTTP interface to Ollama API
-   - Model discovery and validation
-   - Error handling and timeouts
-
-4. **Session Manager** (`src/session.rs`)
-   - Per-directory session identification
-   - Message history persistence
-   - Multi-window sync via polling
-
-5. **Steering Directives** (`src/steering.rs`)
-   - System-level constraint injection
-   - JSON output enforcement, tool responses, etc.
-
-### Multi-Window Sync
-
-Sessions automatically sync across multiple Yggdra instances via SQLite:
-
-```bash
-# Terminal 1
-cd ~/project
-yggdra  # Start first session
-
-# Terminal 2
-cd ~/project
-yggdra  # New Yggdra instance loads same session
-```
-
-Both instances poll the SQLite DB every 500ms, showing real-time updates.
-
-## 🔐 Security & Constraints
-
-### Airgapped Design
-
-- ✅ **No public internet**: All inference stays on local machine or tailnet
-- ✅ **No telemetry or tracking**: Your data never leaves your device
-- ✅ **No API keys required**: Works entirely with local models
-- ✅ **All data stays local**: Conversation history in `~/.yggdra/` on your machine
-- ⚡ **Tailnet support**: Optional `OLLAMA_ENDPOINT` for private Ollama instances on your tailnet
-
-### Input Validation
-
-- Tool commands are validated before execution
-- Suspicious patterns are rejected
-- File I/O is bounded (no traversal outside session dir)
-
-### Error Handling
-
-- User-friendly error messages (not technical stack traces)
-- Graceful degradation (app continues if Ollama offline)
-- Detailed logs on stderr for debugging
-
-## 📊 Performance
-
-- **Message Query Time**: <16ms (SQLite, indexed)
-- **UI Render**: ~10ms (Ratatui optimized)
-- **Tool Execution**: <2s typical (depends on tool)
-- **Memory**: ~50 MB base + message buffer
-
-**Tested with:**
-- 100+ messages in conversation
-- Repeated tool executions
-- Extended sessions (8+ hours)
-
-## 🐛 Troubleshooting
-
-### "Ollama is offline"
-
-**Problem:** `❌ Ollama is not running at http://localhost:11434`
-
-**Solution:**
-```bash
-# Start Ollama
-ollama serve
-
-# Or check if it's running on a different port
-export OLLAMA_ENDPOINT=http://localhost:11435  # or wherever
-yggdra
-```
-
-### "Model not found"
-
-**Problem:** `❌ Model 'qwen:3.5' not found`
-
-**Solution:**
-```bash
-ollama pull qwen:3.5
-# Or: /models (in Yggdra) to see available models
-```
-
-### "Connection timeout"
-
-**Problem:** Messages or `/models` command hangs
-
-**Solution:**
-1. Check Ollama is responsive: `curl http://localhost:11434/api/tags`
-2. Try a different model: `export OLLAMA_MODEL=mistral`
-3. Increase timeout: Add `OLLAMA_TIMEOUT=30` (seconds)
-
-### "Permission denied"
-
-**Problem:** `❌ File error: Permission denied`
-
-**Solution:**
-```bash
-# Check file/directory permissions
-ls -la ~/.yggdra/
-chmod 700 ~/.yggdra
-chmod 700 ~/.yggdra/sessions/*
-```
-
-## 🔄 Supported Models
-
-Yggdra works with any Ollama model. Popular choices:
-
-| Model | Size | Best For | Command |
-|-------|------|----------|---------|
-| Qwen 3.5 Chat | 3.8 GB | Balanced, fast | `ollama pull qwen:3.5-chat` |
-| Llama 2 | 3.5 GB | General, creative | `ollama pull llama2` |
-| Mistral | 3.8 GB | Instruction-following | `ollama pull mistral` |
-| Phi 2 | 2 GB | Lightweight, laptop | `ollama pull phi` |
-| Neural Chat | 3.2 GB | Conversational | `ollama pull neural-chat` |
-
-## 📝 License
-
-MIT or Apache-2.0 (choose one)
-
-## 🤝 Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on:
-- Adding new tools
-- Code style and testing
-- Building and debugging
-
-## 📚 Additional Resources
-
-- **Architecture Deep Dive**: See [ARCHITECTURE.md](ARCHITECTURE.md)
-- **Build & Development**: See [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Ollama Documentation**: https://ollama.ai/docs
-- **Ratatui TUI Library**: https://github.com/ratatui-org/ratatui
 
 ---
 
-**Yggdra v0.1.0** - MVP Release
-- Built for airgapped environments
-- Production-ready with comprehensive error handling
-- Zero external dependencies for execution
+## Three modes
+
+| Flag | Mode | What it does |
+|------|------|-------------|
+| `--plan` | **Plan** (default) | Interactive back-and-forth. You drive, the model assists. |
+| `--build` | **Build** | Autonomous. Reads `AGENTS.md` and gets to work — no hand-holding. |
+| `--ask` | **Ask** | Read-only. The model can look but can't touch your files. |
+
+Mode persists across sessions (saved to `.yggdra/config.json`), so you only
+set it once.
+
+---
+
+## The toolbox
+
+The model doesn't just talk — it acts. Six built-in tools, all local:
+
+| Tool | What it does |
+|------|-------------|
+| **rg** | Ripgrep search across files |
+| **spawn** | Run local commands (ls, cat, etc. — no network binaries allowed) |
+| **editfile** | Read and write files |
+| **commit** | Stage and commit with git |
+| **python** | Execute Python snippets |
+| **ruste** | Compile and run Rust snippets |
+
+Tools use a Qwen/Gemma-style format that the model emits naturally:
+
+```
+<|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool>
+```
+
+Results come back as `[TOOL_OUTPUT: rg = ...]` and the model keeps going.
+
+### Sub-agents
+
+The model can spawn child agents to handle subtasks in parallel — up to 10
+levels deep. Each sub-agent gets the same tools (minus the ability to spawn
+further agents, to prevent recursion nightmares).
+
+---
+
+## Sessions & storage
+
+Every directory gets its own session. Walk into a project, launch yggdra, and
+your conversation is right where you left it.
+
+```
+.yggdra_session_id               ← marker file (add to .gitignore)
+
+~/.yggdra/
+└── sessions/<uuid>/
+    ├── messages.db               ← SQLite — fast, transactional
+    └── metadata.json             ← model, timestamps, etc.
+```
+
+Open two terminals in the same project? Both instances share the same SQLite
+DB and sync via polling — you'll see messages appear in both windows.
+
+---
+
+## The knowledge base
+
+Symlink `.yggdra/knowledge` to a local docs folder and the model can search
+it. The default setup points at `~/source/repos/offlinebase` — 135,000+ files
+across 73 categories (Rust docs, Godot tutorials, spacecraft systems, whatever
+you've curated).
+
+The model searches it with `rg` like any other directory. No indexing server,
+no vector DB, just grep and vibes.
+
+---
+
+## Knowledge gaps
+
+After every response, yggdra quietly asks the model: *"what did you wish you
+knew?"* The answers get logged to `.yggdra/gaps`. Over time, you build a map
+of what your local model struggles with — handy for knowing what to add to
+your knowledge base.
+
+---
+
+## Configuration
+
+| Variable | Default | What it does |
+|----------|---------|-------------|
+| `OLLAMA_ENDPOINT` | `http://localhost:11434` | Where your Ollama lives |
+| `OLLAMA_MODEL` | auto-detect | Which model to use |
+
+```bash
+export OLLAMA_ENDPOINT=http://10.0.0.5:11434   # tailnet box
+export OLLAMA_MODEL=qwen3:8b
+yggdra --build
+```
+
+---
+
+## Nice touches
+
+- **Battery-aware indexing** — knowledge base indexing slows down when you're
+  on battery power. Your laptop won't hate you.
+- **Native notifications** — 🌷 on new session, 🌻 on model response. Cute
+  *and* functional.
+- **Adaptive theming** — detects light/dark terminal and picks colors
+  accordingly. Solarized-inspired palette.
+- **Structured logging** — every message written to
+  `.yggdra/log/YYYY/MM/DD/HHMM/SS-role.md` for full auditability.
+- **Task tracking** — built-in SQLite-backed task graph with checkpoints and
+  dependency tracking. The model manages its own todo list.
+- **Steering directives** — inject system-level constraints (be concise, output
+  JSON, etc.) that get prepended to every prompt.
+
+---
+
+## Building & testing
+
+```bash
+cargo build --release            # optimized binary (LTO, stripped)
+cargo test --lib                 # run the test suite — keep it green
+make install                     # copy to ~/.local/bin/
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev guide and
+[ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
+
+---
+
+## Troubleshooting
+
+**"Ollama is offline"** — Start it (`ollama serve`) or point
+`OLLAMA_ENDPOINT` at the right address.
+
+**"Model not found"** — `ollama pull <model>` or type `/models` inside yggdra
+to see what's available.
+
+**Slow responses** — That's your GPU talking, not yggdra. Try a smaller model
+or check `ollama ps`.
+
+**Session weirdness** — Delete `.yggdra_session_id` in the project dir to
+start fresh.
+
+---
+
+## License
+
+MIT — do whatever you want.
+
+---
+
+*Built for the space between "I want an AI coding assistant" and "I refuse to
+upload my code." That space is bigger than people think.*
