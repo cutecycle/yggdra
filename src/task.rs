@@ -134,6 +134,18 @@ impl TaskManager {
             [],
         )?;
 
+        // Create task dependencies table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_deps (
+                task_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                PRIMARY KEY (task_id, depends_on),
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                FOREIGN KEY (depends_on) REFERENCES tasks(id)
+            )",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -288,6 +300,42 @@ impl TaskManager {
         })?;
 
         checkpoints.collect()
+    }
+
+    /// Add a dependency: task_id depends on depends_on
+    pub fn add_dependency(&mut self, task_id: &str, depends_on: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?1, ?2)",
+            params![task_id, depends_on],
+        )?;
+        Ok(())
+    }
+
+    /// Get all dependencies for a task
+    pub fn get_task_dependencies(&self, task_id: &str) -> SqliteResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on FROM task_deps WHERE task_id = ?1 ORDER BY depends_on"
+        )?;
+
+        let deps = stmt.query_map(params![task_id], |row| row.get(0))?;
+        deps.collect()
+    }
+
+    /// Get all dependencies across all tasks
+    pub fn get_all_dependencies(&self) -> SqliteResult<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, depends_on FROM task_deps ORDER BY task_id, depends_on"
+        )?;
+
+        let deps = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        deps.collect()
+    }
+
+    /// List all tasks (public interface for UI)
+    pub fn list_all_tasks(&self) -> SqliteResult<Vec<Task>> {
+        self.all_tasks()
     }
 }
 

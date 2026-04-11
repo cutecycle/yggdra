@@ -47,6 +47,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
+    PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
     PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
     PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
@@ -762,6 +763,8 @@ impl App {
             self.show_help();
         } else if command == "/clear" {
             self.handle_clear_command();
+        } else if command == "/tasks" {
+            self.handle_tasks_command();
         } else if command.starts_with("/checkpoint") {
             let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
             self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
@@ -1076,6 +1079,63 @@ impl App {
             }
             Err(e) => {
                 self.status_message = format!("❌ mem search failed: {}", e);
+            }
+        }
+    }
+
+    /// Handle /tasks command to show task dependency graph
+    fn handle_tasks_command(&mut self) {
+        match self.task_manager.list_all_tasks() {
+            Ok(tasks) => {
+                if tasks.is_empty() {
+                    self.push_system_event("📋 No tasks defined");
+                    return;
+                }
+
+                // Build adjacency list from dependencies
+                let mut adjacency: std::collections::HashMap<String, Vec<String>> = 
+                    std::collections::HashMap::new();
+                
+                // Initialize all tasks with empty dependency lists
+                for task in &tasks {
+                    adjacency.entry(task.id.clone()).or_insert_with(Vec::new);
+                }
+
+                // Add dependencies
+                if let Ok(deps) = self.task_manager.get_all_dependencies() {
+                    for (task_id, depends_on) in deps {
+                        adjacency
+                            .entry(task_id)
+                            .or_insert_with(Vec::new)
+                            .push(depends_on);
+                    }
+                }
+
+                // Format as directed adjacency list: task -> dep1, dep2, ...
+                let mut output = String::from("📊 Task Dependency Graph (DAG):\n\n");
+                let mut sorted_tasks: Vec<&String> = adjacency.keys().collect();
+                sorted_tasks.sort();
+
+                for task_id in sorted_tasks {
+                    if let Some(deps) = adjacency.get(task_id) {
+                        if deps.is_empty() {
+                            output.push_str(&format!("  {} →\n", task_id));
+                        } else {
+                            let deps_str = deps.join(", ");
+                            output.push_str(&format!("  {} → {}\n", task_id, deps_str));
+                        }
+                    }
+                }
+
+                let tasks_msg = Message::new("tool", output);
+                if let Err(e) = self.message_buffer.add_and_persist(tasks_msg) {
+                    self.status_message = format!("❌ Failed to save tasks: {}", e);
+                } else {
+                    self.push_system_event(&format!("📋 Showing {} tasks", tasks.len()));
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("❌ Failed to list tasks: {}", e);
             }
         }
     }
