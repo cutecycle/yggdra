@@ -1,0 +1,14 @@
+{
+    "deepseek-r1": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-r1-0528:free"
+    },
+    "gemma-4-26b": {
+        "provider": "openrouter",
+        "model": "google/gemma-4-26b-a4b-it"
+    },
+    "kimi-k2": {
+        "provider": "openrouter",
+        "model": "moonshotai/kimi-k2:free"
+    }
+}
