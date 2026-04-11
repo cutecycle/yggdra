@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-const MAX_TOOL_ITERATIONS: usize = 10;
+const MAX_TOOL_ITERATIONS: usize = 30;
 
 /// A command that can be invoked from the palette
 struct PaletteCommand {
@@ -51,7 +51,12 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
     PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
-    PaletteCommand { name: "plan",   description: "Switch to interactive Plan mode",    keywords: "interactive manual control",        fill: "/plan" },
+    PaletteCommand { name: "plan",   description: "Switch to Plan mode (reflective)",   keywords: "interactive manual control plan",   fill: "/plan" },
+    PaletteCommand { name: "build",  description: "Switch to Build mode (autonomous)",  keywords: "build auto run execute work",       fill: "/build" },
+    PaletteCommand { name: "copycode",  description: "Copy code block from last reply",   keywords: "copy code block clipboard snippet", fill: "/copycode" },
+    PaletteCommand { name: "copytext",  description: "Copy full last reply as plain text", keywords: "copy text clipboard message",      fill: "/copytext" },
+    PaletteCommand { name: "copylink",  description: "Copy URL from last reply",           keywords: "copy link url clipboard",          fill: "/copylink" },
+    PaletteCommand { name: "openlink",  description: "Open URL from last reply in browser", keywords: "open link url browser",           fill: "/openlink" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
     PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
     PaletteCommand { name: "tool spawn",    description: "Execute a local binary",      keywords: "run exec spawn binary program",     fill: "/tool spawn " },
@@ -171,6 +176,10 @@ pub struct App {
     last_token_counts: (u32, u32),
     /// Running total of tokens used this session
     total_tokens_used: u32,
+    /// Last context % at which we warned in chat (prevents spam)
+    last_warned_ctx_pct: u32,
+    /// Monotonic frame counter — increments every event loop tick, used for animations
+    tick_count: u64,
     /// Scroll offset from bottom (0 = pinned to latest, >0 = scrolled up)
     scroll_offset: u16,
     /// Whether the user has manually scrolled up (suppresses auto-pin)
@@ -185,8 +194,10 @@ pub struct App {
     model_picker_open: bool,
     /// Available models for the picker
     model_picker_items: Vec<String>,
-    /// Currently highlighted model in picker
+    /// Currently highlighted model in picker (index into filtered list)
     model_picker_selection: usize,
+    /// Fuzzy search query for the model picker
+    model_picker_query: String,
     /// Detected terminal theme (light/dark + colour palette)
     theme: Theme,
 }
@@ -250,6 +261,8 @@ impl App {
             active_subagents: 0,
             last_token_counts: (0, 0),
             total_tokens_used: 0,
+            last_warned_ctx_pct: 0,
+            tick_count: 0,
             scroll_offset: 0,
             user_scrolled: false,
             last_clock: std::time::Instant::now(),
@@ -258,6 +271,7 @@ impl App {
             model_picker_open: false,
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
+            model_picker_query: String::new(),
             theme: Theme::detect(),
         }
     }
@@ -302,6 +316,7 @@ impl App {
         }
 
         loop {
+            self.tick_count = self.tick_count.wrapping_add(1);
             // Drain any pending stream tokens before drawing
             self.drain_stream_tokens();
             // Check for completed tool execution
@@ -359,7 +374,7 @@ impl App {
                     return;
                 }
                 Ok(StreamEvent::Error(e)) => {
-                    self.status_message = format!("❌ Stream error: {}", e);
+                    self.notify(format!("❌ Stream error: {}", e));
                     self.streaming_text.clear();
                     self.stream_rx = None;
                     self.turn_phase = TurnPhase::Idle;
@@ -397,7 +412,7 @@ impl App {
         let model_msg = Message::new("assistant", &response_text);
         if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
             eprintln!("Failed to save streamed response: {}", e);
-            self.status_message = format!("⚠️ Response received but not saved: {}", e);
+            self.notify(format!("⚠️ Response received but not saved: {}", e));
             self.streaming_text.clear();
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
@@ -452,7 +467,7 @@ impl App {
             tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
             self.status_message = "🌸 Milestone reached — finding next task".to_string();
             // Re-kick with a continue prompt so the loop doesn't idle
-            let continue_msg = Message::new("user",
+            let continue_msg = Message::new("system",
                 "Good work. Now find what's next — more tasks, improvements, \
                  refactoring, or documentation. Keep going.");
             if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
@@ -474,7 +489,26 @@ impl App {
             }
         } else {
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
-                self.status_message = "⚠️ Max tool iterations reached".to_string();
+                self.notify("⚠️ Max tool iterations reached — pausing");
+            } else if self.mode == AppMode::Build {
+                // Build mode: agent gave plain text without [DONE] — nudge it to keep going
+                let kick = Message::new("system", "Keep going. Find the next task or improvement.");
+                if let Err(e) = self.message_buffer.add_and_persist(kick) {
+                    eprintln!("Build kick persist error: {}", e);
+                }
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+                let steering = self.steering_text();
+                let messages = self.message_buffer.messages().unwrap_or_default();
+                if let Some(client) = &self.ollama_client {
+                    self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+                    self.streaming_text.clear();
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.tool_iteration_count = 0;
+                    self.streaming_text.clear();
+                    self.stream_rx = self.stream_rx.take(); // already set above
+                    return; // skip clearing stream_rx below
+                }
             } else {
                 self.status_message = "✅ Response complete".to_string();
             }
@@ -613,7 +647,7 @@ impl App {
                 // Persist tool result
                 let tool_msg = Message::new("tool", &output_text);
                 if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {
-                    self.status_message = format!("⚠️ Failed to save tool result: {}", e);
+                    self.notify(format!("⚠️ Failed to save tool result: {}", e));
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                     return;
@@ -636,7 +670,7 @@ impl App {
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
                 } else {
-                    self.status_message = "⚠️ Ollama offline".to_string();
+                    self.notify("⚠️ Ollama offline — retrying after next message");
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                 }
@@ -645,7 +679,7 @@ impl App {
                 // Still waiting for tool execution
             }
             Err(oneshot::error::TryRecvError::Closed) => {
-                self.status_message = "❌ Tool execution failed unexpectedly".to_string();
+                self.notify("❌ Tool execution failed unexpectedly");
                 self.tool_result_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
@@ -747,6 +781,7 @@ impl App {
         }
 
         self.last_token_counts = (0, 0);
+        self.last_warned_ctx_pct = 0; // reset so threshold warnings fire again after compaction
         self.cached_message_count = self.message_buffer.count().unwrap_or(0);
         self.push_system_event(format!(
             "🌿 Autocompacted: archived {} old messages to scrollback",
@@ -760,6 +795,14 @@ impl App {
         self.persist_message(msg);
         self.cached_message_count = self.message_buffer.messages()
             .map(|v| v.len()).unwrap_or(0);
+    }
+
+    /// Show a message in both the status bar and the chat timeline.
+    /// Use for errors, warnings, and significant state changes.
+    fn notify(&mut self, text: impl Into<String>) {
+        let s: String = text.into();
+        self.status_message = s.clone();
+        self.push_system_event(s);
     }
 
     /// Persist a message to SQLite and asynchronously write it to .yggdra/log.
@@ -803,9 +846,9 @@ impl App {
 
         // Header with context window indicator
         let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
-        let mode_indicator = match self.mode {
-            AppMode::Build => "⚡ Build",
-            AppMode::Plan => "🧠 Plan",
+        let (mode_label, mode_color) = match self.mode {
+            AppMode::Build => ("⚡ BUILD", self.theme.violet),
+            AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
         };
 
         // Token usage indicator — real counts when available, estimate otherwise
@@ -825,10 +868,13 @@ impl App {
             }
         };
 
-        let header_text = format!("🌷 {} | {} | {} | {}",
-            mode_indicator, connection_status, self.config.model, context_indicator);
+        let header_line = Line::from(vec![
+            Span::raw("🌷 "),
+            Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" | {} | {} | {}", connection_status, self.config.model, context_indicator)),
+        ]);
 
-        let header = Paragraph::new(header_text)
+        let header = Paragraph::new(header_line)
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
         f.render_widget(header, chunks[0]);
 
@@ -990,11 +1036,13 @@ impl App {
             f.render_widget(ind_widget, ind_area);
         }
 
-        // Input area
+        // Input area — animated hint while streaming
+        const YAPPING: &[&str] = &["💬", "🗣️ ", "💬 💬", "🗣️  💬"];
+        let yap = YAPPING[(self.tick_count / 8) as usize % YAPPING.len()];
         let input_hint = match &self.turn_phase {
             TurnPhase::Idle => "(type message or /help for commands)",
-            TurnPhase::Streaming => "(streaming response...)",
-            TurnPhase::ExecutingTool(_) => "(executing tool...)",
+            TurnPhase::Streaming => yap,
+            TurnPhase::ExecutingTool(_) => "🔧 …",
         };
         let input_text = if self.input_buffer.is_empty() {
             input_hint.to_string()
@@ -1054,30 +1102,40 @@ impl App {
         // Model picker overlay — centered popup over entire screen
         if self.model_picker_open && !self.model_picker_items.is_empty() {
             let area = f.area();
-            // Wide: use 90% of terminal width, tall: up to 80% height
-            let picker_width = ((area.width * 9 / 10)).max(50).min(area.width.saturating_sub(4));
-            let visible_rows = (area.height * 4 / 5).saturating_sub(4).max(4);
-            let picker_height = (self.model_picker_items.len() as u16 + 4).min(area.height - 4).min(visible_rows + 4);
+            let picker_width = (area.width * 9 / 10).max(50).min(area.width.saturating_sub(4));
+            // +1 row for the search bar inside the border
+            let filtered = self.model_picker_filtered();
+            let visible_rows = (area.height * 4 / 5).saturating_sub(5).max(3);
+            let picker_height = (filtered.len() as u16 + 5).min(area.height - 4).min(visible_rows + 5);
             let picker_x = (area.width.saturating_sub(picker_width)) / 2;
             let picker_y = (area.height.saturating_sub(picker_height)) / 2;
             let picker_rect = Rect { x: picker_x, y: picker_y, width: picker_width, height: picker_height };
 
-            // Compute scroll offset so selected item stays in view
-            let inner_rows = picker_height.saturating_sub(2) as usize; // subtract borders
-            let scroll_top = if self.model_picker_selection >= inner_rows {
-                self.model_picker_selection - inner_rows + 1
+            // Split picker: top row = search bar, rest = list
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(Rect { x: picker_rect.x + 1, y: picker_rect.y + 1,
+                               width: picker_rect.width.saturating_sub(2),
+                               height: picker_rect.height.saturating_sub(2) });
+
+            let list_rows = inner[1].height as usize;
+            let scroll_top = if self.model_picker_selection >= list_rows {
+                self.model_picker_selection - list_rows + 1
             } else {
                 0
             };
 
-            let items: Vec<ListItem> = self.model_picker_items.iter().enumerate()
+            let items: Vec<ListItem> = filtered.iter()
+                .enumerate()
                 .skip(scroll_top)
-                .take(inner_rows)
-                .map(|(i, name)| {
+                .take(list_rows)
+                .map(|(vis_i, &orig_i)| {
+                    let name = &self.model_picker_items[orig_i];
                     let is_current = name.starts_with(&self.config.model);
                     let marker = if is_current { "✦ " } else { "  " };
                     let label = format!("{}{}", marker, name);
-                    let style = if i == self.model_picker_selection {
+                    let style = if vis_i == self.model_picker_selection {
                         Style::default().fg(self.theme.selected_fg).bg(self.theme.violet).add_modifier(Modifier::BOLD)
                     } else if is_current {
                         Style::default().fg(self.theme.violet)
@@ -1087,25 +1145,33 @@ impl App {
                     ListItem::new(Span::styled(label, style))
                 }).collect();
 
-            let total = self.model_picker_items.len();
-            let scroll_indicator = if total > inner_rows {
-                format!(" 🌸 Select Model ({}/{})  ↑↓ scroll · Enter select · Esc cancel ", self.model_picker_selection + 1, total)
+            let count_label = if filtered.len() != self.model_picker_items.len() {
+                format!(" 🌸 Models  {}/{} match  Esc cancel ", filtered.len(), self.model_picker_items.len())
             } else {
-                " 🌸 Select Model  ↑↓ navigate · Enter select · Esc cancel ".to_string()
+                format!(" 🌸 Models  {}  ↑↓ navigate · Enter select · Esc cancel ", self.model_picker_items.len())
             };
 
-            let picker = List::new(items)
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .title(scroll_indicator)
-                    .border_style(Style::default().fg(self.theme.violet)));
+            // Render border + title
+            let border = Block::default()
+                .borders(Borders::ALL)
+                .title(count_label)
+                .border_style(Style::default().fg(self.theme.violet));
             f.render_widget(Clear, picker_rect);
-            f.render_widget(picker, picker_rect);
+            f.render_widget(border, picker_rect);
+
+            // Search bar row
+            let search_text = format!("🔍 {}_", self.model_picker_query);
+            let search = Paragraph::new(Span::styled(search_text, Style::default().fg(self.theme.violet)));
+            f.render_widget(search, inner[0]);
+
+            // Model list
+            let list = List::new(items);
+            f.render_widget(list, inner[1]);
         }
 
         // Status bar
         let token_info = if self.total_tokens_used > 0 {
-            format!("🪙 {}tok", self.total_tokens_used)
+            format!("🪙 {}", self.total_tokens_used)
         } else {
             "🪙 0".to_string()
         };
@@ -1129,38 +1195,48 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.model_picker_open = false;
+                    self.model_picker_query.clear();
                     self.status_message = "Model picker cancelled".to_string();
                 }
+                KeyCode::Char(c) => {
+                    self.model_picker_query.push(c);
+                    self.model_picker_selection = 0; // reset to top on new query
+                }
+                KeyCode::Backspace => {
+                    self.model_picker_query.pop();
+                    self.model_picker_selection = 0;
+                }
                 KeyCode::Down => {
-                    let count = self.model_picker_items.len();
+                    let count = self.model_picker_filtered().len();
                     if count > 0 {
                         self.model_picker_selection = (self.model_picker_selection + 1) % count;
                     }
                 }
                 KeyCode::Up => {
-                    let count = self.model_picker_items.len();
+                    let count = self.model_picker_filtered().len();
                     if count > 0 {
                         self.model_picker_selection = self.model_picker_selection
                             .checked_sub(1).unwrap_or(count - 1);
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(raw) = self.model_picker_items.get(self.model_picker_selection) {
-                        // Strip size suffix (everything after the first space)
-                        let model_name = raw.split_whitespace().next().unwrap_or(raw).to_string();
+                    let filtered = self.model_picker_filtered();
+                    if let Some(&orig_i) = filtered.get(self.model_picker_selection) {
+                        let raw = self.model_picker_items[orig_i].clone();
+                        let model_name = raw.split_whitespace().next().unwrap_or(&raw).to_string();
                         self.config.model = model_name.clone();
-                        // Reconnect ollama client with new model
                         let endpoint = self.config.endpoint.clone();
                         match OllamaClient::new(&endpoint, &model_name).await {
                             Ok(client) => {
                                 self.ollama_client = Some(client);
-                                self.status_message = format!("🌸 Switched to {}", model_name);
+                                self.notify(format!("🌸 Switched to {}", model_name));
                             }
                             Err(e) => {
-                                self.status_message = format!("❌ Failed to connect with {}: {}", model_name, e);
+                                self.notify(format!("❌ Failed to connect with {}: {}", model_name, e));
                             }
                         }
                         self.model_picker_open = false;
+                        self.model_picker_query.clear();
                     }
                 }
                 _ => {}
@@ -1172,6 +1248,8 @@ impl App {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if c == 'c' {
                     self.running = false;
+                } else if c == 's' {
+                    self.handle_command().await;
                 }
             }
             // Open palette on '/'
@@ -1283,6 +1361,24 @@ impl App {
         scored.into_iter().map(|(_, c)| c).collect()
     }
 
+    /// Return indices into model_picker_items that match the current fuzzy query.
+    /// Empty query → all items. Results sorted by match score descending.
+    fn model_picker_filtered(&self) -> Vec<usize> {
+        if self.model_picker_query.is_empty() {
+            return (0..self.model_picker_items.len()).collect();
+        }
+        let query = self.model_picker_query.to_lowercase();
+        let mut scored: Vec<(i32, usize)> = self.model_picker_items.iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let s = fuzzy_score(&query, &name.to_lowercase());
+                if s > 0 { Some((s, i)) } else { None }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
+
     /// Handle command submission
     async fn handle_command(&mut self) {
         let command = self.input_buffer.trim().to_string();
@@ -1323,6 +1419,27 @@ impl App {
             } else {
                 self.handle_shell_command(shell_cmd).await;
             }
+        } else if command == "/build" {
+            self.mode = AppMode::Build;
+            self.notify("⚡ Switched to Build mode — autonomous execution");
+        } else if command == "/plan" {
+            self.mode = AppMode::Plan;
+            self.notify("🧠 Switched to Plan mode — reflective & interactive");
+        } else if command == "/mode" {
+            self.mode = match self.mode { AppMode::Build => AppMode::Plan, AppMode::Plan => AppMode::Build };
+            let label = match self.mode { AppMode::Build => "⚡ Build", AppMode::Plan => "🧠 Plan" };
+            self.notify(format!("Switched to {} mode", label));
+        } else if command.starts_with("/copycode") {
+            let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
+            self.handle_copycode(n).await;
+        } else if command == "/copytext" {
+            self.handle_copytext().await;
+        } else if command.starts_with("/copylink") {
+            let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
+            self.handle_link_command(false, n).await;
+        } else if command.starts_with("/openlink") {
+            let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
+            self.handle_link_command(true, n).await;
         } else if command.starts_with('/') {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
@@ -1387,13 +1504,13 @@ impl App {
                 
                 let tool_msg = Message::new("tool", response);
                 if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {
-                    self.status_message = format!("❌ Failed to save tool output: {}", e);
+                    self.notify(format!("❌ Failed to save tool output: {}", e));
                 } else {
                     self.status_message = format!("✅ Tool {} executed successfully", tool_name);
                 }
             }
             Err(e) => {
-                self.status_message = format!("❌ Tool {} error: {}", tool_name, e);
+                self.notify(format!("❌ Tool {} error: {}", tool_name, e));
             }
         }
     }
@@ -1450,6 +1567,145 @@ impl App {
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
             self.tool_iteration_count = 0;
+        }
+    }
+
+    /// Copy text to system clipboard using pbcopy / xclip / wl-copy
+    async fn copy_to_clipboard(text: &str) -> Result<(), String> {
+        // Try pbcopy (macOS), then wl-copy (Wayland), then xclip (X11)
+        let candidates = &[
+            ("pbcopy",  vec![]),
+            ("wl-copy", vec![]),
+            ("xclip",   vec!["-selection", "clipboard"]),
+            ("xsel",    vec!["--clipboard", "--input"]),
+        ];
+        for (cmd, args) in candidates {
+            let mut c = tokio::process::Command::new(cmd);
+            c.args(args);
+            c.stdin(std::process::Stdio::piped());
+            c.stdout(std::process::Stdio::null());
+            c.stderr(std::process::Stdio::null());
+            if let Ok(mut child) = c.spawn() {
+                use tokio::io::AsyncWriteExt;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes()).await;
+                }
+                if let Ok(status) = child.wait().await {
+                    if status.success() { return Ok(()); }
+                }
+            }
+        }
+        Err("No clipboard utility found (pbcopy / wl-copy / xclip / xsel)".to_string())
+    }
+
+    /// Extract fenced code blocks from markdown text. Returns (lang, body) pairs.
+    fn extract_code_blocks(text: &str) -> Vec<(String, String)> {
+        let mut blocks = Vec::new();
+        let mut in_block = false;
+        let mut lang = String::new();
+        let mut body = String::new();
+        for line in text.lines() {
+            if !in_block {
+                if line.trim_start().starts_with("```") {
+                    lang = line.trim_start().trim_start_matches('`').trim().to_string();
+                    body.clear();
+                    in_block = true;
+                }
+            } else if line.trim_start().starts_with("```") {
+                blocks.push((lang.clone(), body.trim_end().to_string()));
+                in_block = false;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        blocks
+    }
+
+    /// Extract URLs from text.
+    fn extract_urls(text: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        for word in text.split_whitespace() {
+            let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != ':' && c != '.' && c != '-' && c != '_' && c != '?' && c != '=' && c != '&' && c != '#' && c != '%');
+            if w.starts_with("http://") || w.starts_with("https://") || w.starts_with("file://") {
+                if !urls.contains(&w.to_string()) { urls.push(w.to_string()); }
+            }
+        }
+        urls
+    }
+
+    /// Get the text of the last assistant message
+    fn last_assistant_message(&self) -> Option<String> {
+        self.message_buffer.messages().ok()?.into_iter().rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content)
+    }
+
+    /// /copycode [N] — copy Nth code block (1-based) from last assistant message
+    async fn handle_copycode(&mut self, arg: Option<usize>) {
+        let Some(text) = self.last_assistant_message() else {
+            self.notify("❌ No assistant message to copy from"); return;
+        };
+        let blocks = Self::extract_code_blocks(&text);
+        if blocks.is_empty() {
+            self.notify("❌ No code blocks found in last message"); return;
+        }
+        if blocks.len() == 1 || arg == Some(1) || arg.is_none() {
+            let idx = arg.map(|n| n.saturating_sub(1)).unwrap_or(0).min(blocks.len() - 1);
+            let (lang, code) = &blocks[idx];
+            let label = if lang.is_empty() { String::new() } else { format!(" ({})", lang) };
+            match Self::copy_to_clipboard(code).await {
+                Ok(_) => self.notify(format!("📋 Copied code block{} ({} lines)", label, code.lines().count())),
+                Err(e) => self.notify(format!("❌ Clipboard error: {}", e)),
+            }
+        } else {
+            // Show numbered list
+            let list: String = blocks.iter().enumerate()
+                .map(|(i, (l, b))| format!("  {}. `{}` — {} lines", i + 1, if l.is_empty() { "plain" } else { l }, b.lines().count()))
+                .collect::<Vec<_>>().join("\n");
+            self.notify(format!("📋 {} code blocks found — use /copycode N:\n{}", blocks.len(), list));
+        }
+    }
+
+    /// /copytext — copy full text of last assistant message
+    async fn handle_copytext(&mut self) {
+        let Some(text) = self.last_assistant_message() else {
+            self.notify("❌ No assistant message to copy"); return;
+        };
+        match Self::copy_to_clipboard(&text).await {
+            Ok(_) => self.notify(format!("📋 Copied {} chars to clipboard", text.len())),
+            Err(e) => self.notify(format!("❌ Clipboard error: {}", e)),
+        }
+    }
+
+    /// /copylink [N] / /openlink [N] — act on URL(s) in last assistant message
+    async fn handle_link_command(&mut self, open: bool, arg: Option<usize>) {
+        let Some(text) = self.last_assistant_message() else {
+            self.notify("❌ No assistant message to scan"); return;
+        };
+        let urls = Self::extract_urls(&text);
+        if urls.is_empty() {
+            self.notify("❌ No URLs found in last message"); return;
+        }
+        let idx = arg.map(|n| n.saturating_sub(1)).unwrap_or(0).min(urls.len() - 1);
+        if urls.len() > 1 && arg.is_none() {
+            let list: String = urls.iter().enumerate()
+                .map(|(i, u)| format!("  {}. {}", i + 1, u))
+                .collect::<Vec<_>>().join("\n");
+            let verb = if open { "openlink" } else { "copylink" };
+            self.notify(format!("🔗 {} URLs found — use /{} N:\n{}", urls.len(), verb, list));
+            return;
+        }
+        let url = &urls[idx];
+        if open {
+            let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            let _ = tokio::process::Command::new(opener).arg(url).spawn();
+            self.notify(format!("🔗 Opening {}", url));
+        } else {
+            match Self::copy_to_clipboard(url).await {
+                Ok(_) => self.notify(format!("📋 Copied {}", url)),
+                Err(e) => self.notify(format!("❌ Clipboard error: {}", e)),
+            }
         }
     }
 
@@ -1538,7 +1794,7 @@ impl App {
         let user_msg = Message::new("user", message.to_string());
         if let Err(e) = self.message_buffer.add_and_persist(user_msg) {
             eprintln!("Failed to save user message: {}", e);
-            self.status_message = format!("❌ Storage error: {}", self.friendly_error(&e.to_string()));
+            self.notify(format!("❌ Storage error: {}", self.friendly_error(&e.to_string())));
             return;
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
@@ -1557,7 +1813,7 @@ impl App {
 
         if self.ollama_client.is_none() {
             self.push_system_event("🦙 Ollama offline: message saved but not sent");
-            self.status_message = "⚠️ Ollama offline: Message saved but not sent.".to_string();
+            self.notify("⚠️ Ollama offline — message queued locally");
             return;
         }
 
@@ -1623,10 +1879,23 @@ impl App {
                 if !in_code_block {
                     // Start of code block: extract language and add visual marker
                     let lang_part = line.trim_start().strip_prefix("```").unwrap_or("").trim();
+                    // Only display the language tag if it's a real known language;
+                    // Qwen often emits ```lua for generic blocks — map those to "code"
+                    const KNOWN_LANGS: &[&str] = &[
+                        "rust","python","py","javascript","js","typescript","ts","go","java",
+                        "c","cpp","c++","cs","csharp","bash","sh","zsh","fish","toml","yaml",
+                        "yml","json","html","css","sql","dockerfile","makefile","zig","kotlin",
+                        "swift","ruby","php","scala","haskell","elixir","erlang","ocaml","r",
+                        "markdown","md","xml","csv","diff","patch","text","txt","plaintext",
+                        "proto","graphql","nix","vim","assembly","asm","wgsl","glsl","hlsl",
+                    ];
+                    let canonical = lang_part.to_lowercase();
                     code_language = if lang_part.is_empty() {
                         "code".to_string()
-                    } else {
+                    } else if KNOWN_LANGS.contains(&canonical.as_str()) {
                         lang_part.to_string()
+                    } else {
+                        "code".to_string() // unknown/hallucinated tag → generic
                     };
                     result.push_str(&format!("┌─ {}\n", code_language));
                     in_code_block = true;
@@ -1685,7 +1954,7 @@ impl App {
                 self.status_message = summary;
             }
             Err(e) => {
-                self.status_message = format!("❌ Checkpoint failed: {}", e);
+                self.notify(format!("❌ Checkpoint failed: {}", e));
             }
         }
     }
@@ -1700,7 +1969,7 @@ impl App {
                 self.cached_message_count = 0;
             }
             Err(e) => {
-                self.status_message = format!("❌ Clear failed: {}", e);
+                self.notify(format!("❌ Clear failed: {}", e));
             }
         }
     }
@@ -1729,7 +1998,7 @@ impl App {
 
         let mem_msg = Message::new("tool", output);
         if let Err(e) = self.message_buffer.add_and_persist(mem_msg) {
-            self.status_message = format!("❌ Failed to save search results: {}", e);
+            self.notify(format!("❌ Failed to save search results: {}", e));
         } else {
             self.status_message = format!("🔍 {} results for '{}'", results.len(), query);
         }
