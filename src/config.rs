@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub endpoint: String,
     pub model: String,
+    /// Context window size in tokens (None = use 4096 default)
+    pub context_window: Option<u32>,
 }
 
 impl Default for Config {
@@ -13,6 +15,7 @@ impl Default for Config {
         Self {
             endpoint: "http://localhost:11434".to_string(),
             model: "qwen:3.5".to_string(),
+            context_window: None,
         }
     }
 }
@@ -24,10 +27,13 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let model =
             std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen:3.5".to_string());
+        let context_window = std::env::var("OLLAMA_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
 
         eprintln!("🔧 Config: endpoint={}, model={}", endpoint, model);
 
-        Config { endpoint, model }
+        Config { endpoint, model, context_window }
     }
 
     /// Load config with smart model detection from Ollama
@@ -57,6 +63,10 @@ impl Config {
 
         eprintln!("🔧 Config: endpoint={}, model={}", endpoint, model);
 
-        Config { endpoint, model }
+        let context_window = std::env::var("OLLAMA_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+
+        Config { endpoint, model, context_window }
     }
 }

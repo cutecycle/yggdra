@@ -159,6 +159,16 @@ pub struct App {
     mode: AppMode,
     /// Contents of AGENTS.md — injected into steering context
     agents_context: Option<String>,
+    /// Receives result from async subagent execution
+    subagent_result_rx: Option<oneshot::Receiver<crate::spawner::AgentResult>>,
+    /// Number of subagents spawned this session (display counter)
+    subagent_count: u32,
+    /// Number of subagents currently running
+    active_subagents: u32,
+    /// Actual token counts from last completed response: (prompt, generated)
+    last_token_counts: (u32, u32),
+    /// Running total of tokens used this session
+    total_tokens_used: u32,
     /// Whether the command palette is open
     palette_open: bool,
     /// Which palette item is highlighted
@@ -219,6 +229,11 @@ impl App {
             log_dir,
             mode: AppMode::Build,
             agents_context: agents_md,
+            subagent_result_rx: None,
+            subagent_count: 0,
+            active_subagents: 0,
+            last_token_counts: (0, 0),
+            total_tokens_used: 0,
             palette_open: false,
             palette_selection: 0,
         }
@@ -253,6 +268,8 @@ impl App {
             self.check_tool_result();
             // Check for completed gap reflection
             self.check_gap_result();
+            // Check for completed subagent execution
+            self.check_subagent_result();
 
             terminal.draw(|f| self.draw(f))?;
 
@@ -289,7 +306,9 @@ impl App {
                 Ok(StreamEvent::Token(token)) => {
                     self.streaming_text.push_str(&token);
                 }
-                Ok(StreamEvent::Done) => {
+                Ok(StreamEvent::Done(prompt_tokens, gen_tokens)) => {
+                    self.last_token_counts = (prompt_tokens, gen_tokens);
+                    self.total_tokens_used += prompt_tokens + gen_tokens;
                     self.complete_streaming_turn();
                     return;
                 }
@@ -356,8 +375,19 @@ impl App {
 
         // Check for tool calls in the response
         let tool_calls = agent::parse_tool_calls(&response_text);
+        let spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
 
-        if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
+        // Handle spawn_agent: show 🤖 N indicator in chat, execute first one
+        if !spawn_calls.is_empty() && self.subagent_result_rx.is_none() {
+            let (task_id, task_desc) = &spawn_calls[0];
+            self.subagent_count += 1;
+            self.active_subagents += 1;
+            let n = self.subagent_count;
+            let indicator = format!("🤖 {}  {} — {}", n, task_id, task_desc);
+            self.push_system_event(indicator);
+            self.execute_subagent_async(task_id.clone(), task_desc.clone());
+            self.turn_phase = TurnPhase::ExecutingTool(format!("spawn_agent:{}", task_id));
+        } else if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
             // Execute FIRST tool call only (one per turn to avoid dependency issues)
             let call = &tool_calls[0];
             self.status_message = format!("🔧 Executing tool: {} ...", call.name);
@@ -394,7 +424,77 @@ impl App {
         self.tool_result_rx = Some(rx);
     }
 
-    /// Check if async tool execution has completed; if so, persist result and continue
+    /// Spawn a subagent off the UI thread; result arrives via subagent_result_rx
+    fn execute_subagent_async(&mut self, task_id: String, task_desc: String) {
+        let (tx, rx) = oneshot::channel();
+        let endpoint = self.config.endpoint.clone();
+        let model = self.config.model.clone();
+
+        tokio::spawn(async move {
+            let config = crate::agent::AgentConfig {
+                model,
+                endpoint: endpoint.clone(),
+                max_iterations: 10,
+                max_recursion_depth: 10,
+                current_depth: 1,
+            };
+            let result = crate::spawner::spawn_subagent(
+                "ui", &task_id, &task_desc, &endpoint, config,
+            ).await;
+            let agent_result = result.unwrap_or_else(|e| crate::spawner::AgentResult {
+                agent_id: format!("ui/{}", task_id),
+                task_description: task_desc,
+                output: format!("Error: {}", e),
+                success: false,
+            });
+            let _ = tx.send(agent_result);
+        });
+
+        self.subagent_result_rx = Some(rx);
+    }
+
+    /// Check if a subagent has finished; inject result and continue conversation
+    fn check_subagent_result(&mut self) {
+        let done = match self.subagent_result_rx.as_mut() {
+            Some(rx) => rx.try_recv().is_ok(),
+            None => return,
+        };
+        if !done { return; }
+
+        // Re-take and receive (already peeked Ok above, so this won't block)
+        let mut rx = self.subagent_result_rx.take().unwrap();
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            _ => return,
+        };
+
+        self.active_subagents = self.active_subagents.saturating_sub(1);
+        let status = if result.success { "✅" } else { "❌" };
+        let done_msg = format!("🤖 {} {}  {}", self.subagent_count, status, result.agent_id);
+        self.push_system_event(done_msg);
+
+        // Inject result back into conversation and continue streaming
+        let injection = result.to_injection();
+        let injection_msg = Message::new("tool", &injection);
+        self.persist_message(injection_msg);
+        self.cached_message_count = self.message_buffer.count()
+            .unwrap_or(self.cached_message_count + 1);
+
+        self.turn_phase = TurnPhase::Idle;
+        self.tool_iteration_count = 0;
+
+        // Kick next stream turn with the injected result
+        if let Some(client) = self.ollama_client.clone() {
+            let messages: Vec<Message> = self.message_buffer.messages().unwrap_or_default();
+            let steering = self.steering_text();
+            let rx = client.generate_streaming(messages, Some(&steering));
+            self.stream_rx = Some(rx);
+            self.streaming_text.clear();
+            self.turn_phase = TurnPhase::Streaming;
+        }
+    }
+
+
     fn check_tool_result(&mut self) {
         let rx = match self.tool_result_rx.as_mut() {
             Some(rx) => rx,
@@ -544,21 +644,25 @@ impl App {
             AppMode::Build => "⚡ Build",
             AppMode::Plan => "🧠 Plan",
         };
-        
-        // Estimate context window usage (rough: message count affects token count)
-        let message_count = self.cached_message_count as f64;
-        let estimated_tokens = message_count * 150.0; // rough avg tokens per message
-        let context_window = 4096.0; // for qwen:3.5-chat typical
-        let usage_percent = (estimated_tokens / context_window * 100.0).min(100.0) as u32;
-        let context_indicator = if usage_percent > 70 {
-            format!("🔴 {}%", usage_percent)
-        } else if usage_percent > 50 {
-            format!("🟡 {}%", usage_percent)
+
+        // Token usage indicator — real counts when available, estimate otherwise
+        let (prompt_tok, gen_tok) = self.last_token_counts;
+        let context_indicator = if prompt_tok > 0 {
+            // Real data from Ollama
+            let context_window = self.config.context_window.unwrap_or(4096) as f64;
+            let usage_pct = ((prompt_tok as f64) / context_window * 100.0).min(100.0) as u32;
+            let dot = if usage_pct > 70 { "🔴" } else if usage_pct > 50 { "🟡" } else { "🟢" };
+            format!("{dot} {prompt_tok}+{gen_tok}tok ({usage_pct}%)")
         } else {
-            format!("🟢 {}%", usage_percent)
+            // No response yet — show session total or idle
+            if self.total_tokens_used > 0 {
+                format!("🟢 {}tok total", self.total_tokens_used)
+            } else {
+                "🟢 idle".to_string()
+            }
         };
-        
-        let header_text = format!("🌷 {} | {} | {} | {}", 
+
+        let header_text = format!("🌷 {} | {} | {} | {}",
             mode_indicator, connection_status, self.config.model, context_indicator);
 
         let header = Paragraph::new(header_text)
@@ -637,7 +741,12 @@ impl App {
             } else {
                 Color::Rgb(20, 35, 20)
             };
-            let stream_text = format!("🤖 {}▌", self.streaming_text);
+            let agent_badge = if self.active_subagents > 0 {
+                format!(" [🤖{}]", self.active_subagents)
+            } else {
+                String::new()
+            };
+            let stream_text = format!("🤖{} {}▌", agent_badge, self.streaming_text);
             let stream_para = Paragraph::new(stream_text)
                 .style(Style::default().fg(Color::White).bg(tint))
                 .wrap(ratatui::widgets::Wrap { trim: true });
@@ -991,9 +1100,15 @@ impl App {
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
 
         // Warn when context window is getting full (>70% threshold)
-        let estimated_usage = (self.cached_message_count as f64 * 150.0 / 4096.0 * 100.0) as u32;
-        if estimated_usage >= 70 {
-            self.push_system_event(format!("⚠️ Context ~{}% full — autocompact may trigger soon", estimated_usage));
+        let context_window = self.config.context_window.unwrap_or(4096) as f64;
+        let (prompt_tok, _) = self.last_token_counts;
+        let usage_pct = if prompt_tok > 0 {
+            (prompt_tok as f64 / context_window * 100.0) as u32
+        } else {
+            (self.cached_message_count as f64 * 150.0 / context_window * 100.0) as u32
+        };
+        if usage_pct >= 70 {
+            self.push_system_event(format!("⚠️ Context ~{}% full — autocompact may trigger soon", usage_pct));
         }
 
         if self.ollama_client.is_none() {

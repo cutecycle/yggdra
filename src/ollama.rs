@@ -49,6 +49,10 @@ pub struct OllamaMessage {
 struct StreamChunk {
     message: Option<OllamaMessage>,
     done: bool,
+    /// Tokens in prompt (only present on final done=true chunk)
+    prompt_eval_count: Option<u32>,
+    /// Tokens generated (only present on final done=true chunk)
+    eval_count: Option<u32>,
 }
 
 /// Response from Ollama generate endpoint (non-streaming)
@@ -60,7 +64,8 @@ pub struct GenerateResponse {
 /// Token event sent from streaming to UI
 pub enum StreamEvent {
     Token(String),
-    Done,
+    /// Stream finished; carries (prompt_tokens, generated_tokens)
+    Done(u32, u32),
     Error(String),
 }
 
@@ -226,7 +231,9 @@ impl OllamaClient {
                                         }
                                     }
                                     if chunk.done {
-                                        let _ = tx.send(StreamEvent::Done);
+                                        let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
+                                        let gen_tokens = chunk.eval_count.unwrap_or(0);
+                                        let _ = tx.send(StreamEvent::Done(prompt_tokens, gen_tokens));
                                         return;
                                     }
                                 }
@@ -244,7 +251,7 @@ impl OllamaClient {
             }
 
             // Stream ended without done signal
-            let _ = tx.send(StreamEvent::Done);
+            let _ = tx.send(StreamEvent::Done(0, 0));
         });
 
         rx
