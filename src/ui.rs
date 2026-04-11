@@ -1037,8 +1037,10 @@ impl App {
         }
 
         // Input area — animated hint while streaming
-        const YAPPING: &[&str] = &["💬", "🗣️ ", "💬 💬", "🗣️  💬"];
-        let yap = YAPPING[(self.tick_count / 8) as usize % YAPPING.len()];
+        // Smooth robot-yapping animation: static 🤖💬 + cycling dot ligature
+        const DOTS: &[&str] = &["·", "··", "···", "····", "···", "··"];
+        let dot = DOTS[(self.tick_count / 12) as usize % DOTS.len()];
+        let yap = &format!("🤖💬 {}", dot);
         let input_hint = match &self.turn_phase {
             TurnPhase::Idle => "(type message or /help for commands)",
             TurnPhase::Streaming => yap,
