@@ -39,7 +39,8 @@ Always run `cargo test --lib` after any change. Do not leave tests failing.
 - Tool results injected as: `[TOOL_OUTPUT: name = result]`
 - Completion signal: `[DONE]`
 - Session data lives in `~/.yggdra/sessions/<uuid>/`
-- Per-project data lives in `.yggdra/` (log/, gaps, session marker)
+- Per-project data lives in `.yggdra/` (log/, gaps, session marker, **todo/**)
+- **Todos:** discoverable markdown files in `.yggdra/todo/` — see `.yggdra/todo/README.md`
 
 ## UI commands
 
