@@ -408,12 +408,23 @@ impl App {
 
     /// Build the steering system prompt (shared between handle_message and check_tool_result)
     fn steering_text(&self) -> String {
-        let steering_directive = SteeringDirective::custom(
-            "You are Yggdra. Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], \
+        let os = std::env::consts::OS;
+        let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+        let steering_directive = SteeringDirective::custom(&format!(
+            "You are Yggdra. OS: {os}. Terminal width: {term_width} cols. \
+             Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], \
              [TOOL: spawn BIN ARGS], [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], \
              [TOOL: ruste FILE]. Output tools inline. Work offline, be concise."
-        );
+        ));
         steering_directive.format_for_system_prompt()
+    }
+
+    /// Push a system-level notice into the conversation (compaction, warnings, etc.)
+    fn push_system_event(&mut self, text: impl Into<String>) {
+        let msg = Message::new("system", text);
+        let _ = self.message_buffer.add_and_persist(msg);
+        self.cached_message_count = self.message_buffer.messages()
+            .map(|v| v.len()).unwrap_or(0);
     }
 
     /// Draw UI frame
@@ -463,41 +474,55 @@ impl App {
             .message_buffer
             .messages()
             .unwrap_or_default();
+
+        // Track exchange index for alternating row tints (skip tool messages in count)
+        let mut exchange_idx: usize = 0;
         let mut messages_text: Vec<Line> = messages_list
             .iter()
             .map(|m| {
-                match m.role.as_str() {
+                let tint = if exchange_idx % 2 == 0 {
+                    Color::Rgb(30, 30, 40)   // subtle dark blue
+                } else {
+                    Color::Rgb(20, 30, 20)   // subtle dark green
+                };
+                let line = match m.role.as_str() {
                     "user" => {
+                        if m.role != "tool" { exchange_idx += 1; }
                         Line::from(vec![
-                            Span::styled("👤 ", Style::default().fg(Color::Cyan)),
-                            Span::raw(&m.content),
+                            Span::styled("👤 ", Style::default().fg(Color::Cyan).bg(tint)),
+                            Span::styled(&m.content, Style::default().fg(Color::White).bg(tint)),
                         ])
                     }
                     "assistant" => {
+                        if m.role != "tool" { exchange_idx += 1; }
                         Line::from(vec![
-                            Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
-                            Span::raw(&m.content),
+                            Span::styled("🤖 ", Style::default().fg(Color::Yellow).bg(tint)),
+                            Span::styled(&m.content, Style::default().fg(Color::White).bg(tint)),
                         ])
                     }
-                    "tool" => {
-                        Line::from(vec![
-                            Span::styled("🔧 ", Style::default().fg(Color::Green)),
-                            Span::raw(&m.content),
-                        ])
-                    }
+                    "tool" => Line::from(vec![
+                        Span::styled("🔧 ", Style::default().fg(Color::Green)),
+                        Span::styled(&m.content, Style::default().fg(Color::DarkGray)),
+                    ]),
+                    "system" => Line::from(vec![
+                        Span::styled("⚙️  ", Style::default().fg(Color::Rgb(180, 120, 0))),
+                        Span::styled(&m.content, Style::default().fg(Color::Rgb(180, 120, 0)).add_modifier(Modifier::DIM)),
+                    ]),
                     _ => Line::from(vec![
                         Span::styled("💬 ", Style::default().fg(Color::Gray)),
                         Span::raw(&m.content),
                     ]),
-                }
+                };
+                line
             })
             .collect();
 
         // Show partial streaming response
         if !self.streaming_text.is_empty() {
+            let tint = if exchange_idx % 2 == 0 { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 30, 20) };
             messages_text.push(Line::from(vec![
-                Span::styled("🤖 ", Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{}▌", self.streaming_text)),
+                Span::styled("🤖 ", Style::default().fg(Color::Yellow).bg(tint)),
+                Span::styled(format!("{}▌", self.streaming_text), Style::default().fg(Color::White).bg(tint)),
             ]));
         }
 
@@ -832,7 +857,14 @@ impl App {
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(self.cached_message_count + 1);
 
+        // Warn when context window is getting full (>70% threshold)
+        let estimated_usage = (self.cached_message_count as f64 * 150.0 / 4096.0 * 100.0) as u32;
+        if estimated_usage >= 70 {
+            self.push_system_event(format!("⚠️ Context ~{}% full — autocompact may trigger soon", estimated_usage));
+        }
+
         if self.ollama_client.is_none() {
+            self.push_system_event("🦙 Ollama offline: message saved but not sent");
             self.status_message = "⚠️ Ollama offline: Message saved but not sent.".to_string();
             return;
         }
