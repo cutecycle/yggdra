@@ -46,6 +46,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "shell",  description: "Run a shell command inline",          keywords: "run exec shell bash command terminal", fill: "/shell " },
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
+    PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
@@ -1440,6 +1441,22 @@ impl App {
             self.mode = match self.mode { AppMode::Build => AppMode::Plan, AppMode::Plan => AppMode::Build };
             let label = match self.mode { AppMode::Build => "⚡ Build", AppMode::Plan => "🧠 Plan" };
             self.notify(format!("Switched to {} mode", label));
+        } else if command.starts_with("/ctx ") {
+            let ctx_str = command.strip_prefix("/ctx ").unwrap_or("").trim();
+            if let Ok(new_ctx) = ctx_str.parse::<u32>() {
+                if new_ctx < 128 {
+                    self.notify("❌ Context window must be at least 128 tokens");
+                } else if new_ctx > 200000 {
+                    self.notify("❌ Context window cannot exceed 200000 tokens");
+                } else {
+                    self.config.context_window = Some(new_ctx);
+                    let _ = self.config.save();
+                    self.notify(format!("🎯 Context window set to {} tokens", new_ctx));
+                }
+            } else {
+                let current = self.config.context_window.unwrap_or(4096);
+                self.notify(format!("❌ Usage: /ctx <number> (current: {})", current));
+            }
         } else if command.starts_with("/copycode") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_copycode(n).await;
