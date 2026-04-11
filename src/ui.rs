@@ -411,7 +411,7 @@ impl App {
         let os = std::env::consts::OS;
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         let steering_directive = SteeringDirective::custom(&format!(
-            "You have access to local tools. OS: {os}. Terminal: {term_width} cols.\n\
+            "ASSISTANT is yggdra, an airgapped local tool executor. OS: {os}. Terminal: {term_width} cols.\n\
              Tools: [TOOL: rg PATTERN PATH], [TOOL: editfile PATH], [TOOL: spawn BINARY ARGS], \
              [TOOL: commit MSG], [TOOL: python SCRIPT ARGS], [TOOL: ruste FILE].\n\
              Examples: [TOOL: spawn ls -la .] or [TOOL: rg TODO src/] or [TOOL: editfile Cargo.toml].\n\
