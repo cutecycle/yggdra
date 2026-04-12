@@ -48,6 +48,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "estimate", description: "Show project completion estimate",  keywords: "progress percentage done metrics", fill: "/estimate" },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
+    PaletteCommand { name: "params", description: "Set model params (temperature, top_k…)", keywords: "temperature top_k top_p repeat penalty params sampling", fill: "/set_params " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
@@ -193,10 +194,18 @@ pub struct App {
     model_picker_selection: usize,
     /// Fuzzy search query for the model picker
     model_picker_query: String,
-    /// Detected terminal theme (light/dark + colour palette)
+    /// Detected terminal theme (light/dark + colour palette); set after terminal init
     theme: Theme,
     /// Tracks project completion metrics
     metrics: MetricsTracker,
+    /// Receives filesystem watcher events (config.json or AGENTS.md changes)
+    pub config_watcher_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::watcher::ConfigChange>>,
+    /// Runtime parameter overrides (set by user or agent; not persisted)
+    runtime_params: crate::config::ModelParams,
+    /// Parsed AGENTS.md config (models + parameter defaults)
+    agents_config: crate::config::AgentsConfig,
+    /// Last time a build-mode kick was fired — for watchdog recovery
+    last_build_kick: std::time::Instant,
 }
 
 impl App {
@@ -206,6 +215,7 @@ impl App {
         session: Session,
         ollama_client: Option<OllamaClient>,
         agents_md: Option<String>,
+        config_watcher_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::watcher::ConfigChange>>,
     ) -> Self {
         let message_buffer = MessageBuffer::from_db(&session.messages_db)
             .unwrap_or_else(|e| {
@@ -233,6 +243,10 @@ impl App {
         let log_sender = Some(crate::msglog::start(log_dir.clone()));
 
         let initial_mode = config.mode;
+
+        // Parse AGENTS.md into structured config for model + param defaults
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let agents_config = crate::config::AgentsConfig::parse_from_file(&cwd.join("AGENTS.md"));
 
         Self {
             config,
@@ -273,6 +287,10 @@ impl App {
             model_picker_query: String::new(),
             theme: Theme::detect(),
             metrics: MetricsTracker::new(),
+            config_watcher_rx,
+            runtime_params: crate::config::ModelParams::default(),
+            agents_config,
+            last_build_kick: std::time::Instant::now(),
         }
     }
 
@@ -323,10 +341,30 @@ impl App {
                 )
             };
             self.handle_message(&kick).await;
+            self.last_build_kick = std::time::Instant::now();
         }
 
         loop {
             self.tick_count = self.tick_count.wrapping_add(1);
+            
+            // Check for config changes (watcher events) — drain all pending
+            if let Some(ref mut rx) = self.config_watcher_rx {
+                let mut last_change: Option<crate::watcher::ConfigChange> = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(change) => { last_change = Some(change); }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            self.config_watcher_rx = None;
+                            break;
+                        }
+                    }
+                }
+                if let Some(change) = last_change {
+                    self.handle_config_change(change).await;
+                }
+            }
+            
             // Drain any pending stream tokens before drawing
             self.drain_stream_tokens();
             // Check for completed tool execution
@@ -389,6 +427,10 @@ impl App {
                     self.stream_rx = None;
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
+                    // Build mode: retry after surfacing the error
+                    if self.mode == AppMode::Build {
+                        self.inject_continue_kick();
+                    }
                     return;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return,
@@ -400,6 +442,9 @@ impl App {
                         self.stream_rx = None;
                         self.turn_phase = TurnPhase::Idle;
                         self.tool_iteration_count = 0;
+                        if self.mode == AppMode::Build {
+                            self.inject_continue_kick();
+                        }
                     }
                     return;
                 }
@@ -413,6 +458,9 @@ impl App {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
+            if self.mode == AppMode::Build {
+                self.inject_continue_kick();
+            }
             return;
         }
 
@@ -421,12 +469,14 @@ impl App {
         // Persist assistant message
         let model_msg = Message::new("assistant", &response_text);
         if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
-            eprintln!("Failed to save streamed response: {}", e);
             self.notify(format!("⚠️ Response received but not saved: {}", e));
             self.streaming_text.clear();
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
+            if self.mode == AppMode::Build {
+                self.inject_continue_kick();
+            }
             return;
         }
         self.cached_message_count = self.message_buffer.count()
@@ -484,7 +534,7 @@ impl App {
                 "Good work. Now find what's next — more tasks, improvements, \
                  refactoring, or documentation. Keep going.");
             if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
-                eprintln!("Failed to save continue kick: {}", e);
+                self.notify(format!("⚠️ Failed to save continue kick: {}", e));
             }
             self.cached_message_count = self.message_buffer.count()
                 .unwrap_or(self.cached_message_count + 1);
@@ -492,7 +542,7 @@ impl App {
             let steering = self.steering_text();
             let messages = self.message_buffer.messages().unwrap_or_default();
             if let Some(client) = &self.ollama_client {
-                self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+                self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
                 self.streaming_text.clear();
                 self.turn_phase = TurnPhase::Streaming;
                 self.tool_iteration_count = 0;
@@ -502,11 +552,16 @@ impl App {
             }
         } else {
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
-                self.notify("⚠️ Max tool iterations reached — pausing");
+                self.notify("⚠️ Max tool iterations reached — resetting");
+                self.tool_iteration_count = 0;
+                if self.mode == AppMode::Build {
+                    self.inject_continue_kick();
+                    return;
+                }
             } else if self.mode == AppMode::Build {
-                // Build mode: agent gave plain text without [DONE] — nudge it to keep going
+                // Build mode: plain text with no [DONE] — nudge to keep going
                 self.inject_continue_kick();
-                return; // skip clearing stream_rx below
+                return;
             } else {
                 self.status_message = "✅ Response complete".to_string();
             }
@@ -522,17 +577,18 @@ impl App {
     fn inject_continue_kick(&mut self) {
         let kick = Message::new("system", "Keep going. Find the next task or improvement.");
         if let Err(e) = self.message_buffer.add_and_persist(kick) {
-            eprintln!("Continue kick persist error: {}", e);
+            self.notify(format!("⚠️ Continue kick persist error: {}", e));
         }
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
         if let Some(client) = &self.ollama_client {
-            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
             self.tool_iteration_count = 0;
+            self.last_build_kick = std::time::Instant::now();
         }
     }
 
@@ -642,7 +698,7 @@ impl App {
         if let Some(client) = self.ollama_client.clone() {
             let messages: Vec<Message> = self.message_buffer.messages().unwrap_or_default();
             let steering = self.steering_text();
-            let rx = client.generate_streaming(messages, Some(&steering));
+            let rx = client.generate_streaming(messages, Some(&steering), self.effective_params());
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
@@ -720,7 +776,7 @@ impl App {
                 if let Some(client) = &self.ollama_client {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
-                    let rx = client.generate_streaming(messages, Some(&steering_text));
+                    let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params());
                     self.stream_rx = Some(rx);
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
@@ -738,6 +794,9 @@ impl App {
                 self.tool_result_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
+                if self.mode == AppMode::Build {
+                    self.inject_continue_kick();
+                }
             }
         }
     }
@@ -878,6 +937,10 @@ impl App {
         ));
     }
 
+    /// Compute the effective model params: runtime_params > config.json > AGENTS.md defaults.
+    fn effective_params(&self) -> crate::config::ModelParams {
+        self.runtime_params.merge_over(&self.config.params.merge_over(&self.agents_config.params))
+    }
 
     fn push_system_event(&mut self, text: impl Into<String>) {
         let msg = Message::new("system", text);
@@ -920,18 +983,29 @@ impl App {
 
     /// Draw UI frame
     fn draw(&self, f: &mut Frame) {
+        let area = f.area();
+        // Compute dynamic input box height from content + terminal width
+        let inner_width = area.width.saturating_sub(2).max(1) as usize;
+        let input_content_len = if self.input_buffer.is_empty() {
+            0
+        } else {
+            2 + self.input_buffer.chars().count() // "> " prefix
+        };
+        let content_rows = ((input_content_len + inner_width - 1) / inner_width).max(1) as u16;
+        let input_height = (content_rows + 2).min(12); // +2 for borders, cap at 12
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
                     Constraint::Length(2),
                     Constraint::Min(5),
-                    Constraint::Length(3),
+                    Constraint::Length(input_height),
                     Constraint::Length(2),
                 ]
                 .as_ref(),
             )
-            .split(f.area());
+            .split(area);
 
         // Header with context window indicator
         let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
@@ -1154,7 +1228,8 @@ impl App {
             .block(Block::default()
                 .title(format!(" 🌱 Input {}", mode_badge))
                 .border_style(Style::default().fg(mode_border_color))
-                .borders(Borders::ALL));
+                .borders(Borders::ALL))
+            .wrap(ratatui::widgets::Wrap { trim: false });
         f.render_widget(input, chunks[2]);
 
         // Command palette overlay (above input box)
@@ -1423,6 +1498,9 @@ impl App {
             KeyCode::Enter => {
                 self.handle_command().await;
             }
+            KeyCode::BackTab => {
+                self.cycle_mode().await;
+            }
             KeyCode::Esc => {
                 if self.palette_open {
                     self.palette_open = false;
@@ -1496,6 +1574,26 @@ impl App {
     }
 
     /// Handle command submission
+    /// Cycle mode Ask→Plan→Build→Ask; if entering Build, kick the agent loop.
+    async fn cycle_mode(&mut self) {
+        self.mode = match self.mode {
+            AppMode::Ask   => AppMode::Plan,
+            AppMode::Plan  => AppMode::Build,
+            AppMode::Build => AppMode::Ask,
+        };
+        self.config.mode = self.mode;
+        let _ = self.config.save();
+        let label = match self.mode {
+            AppMode::Ask   => "🔍 Ask",
+            AppMode::Plan  => "🧠 Plan",
+            AppMode::Build => "⚡ Build",
+        };
+        self.notify(format!("Switched to {} mode", label));
+        if self.mode == AppMode::Build && self.turn_phase == TurnPhase::Idle {
+            self.inject_continue_kick();
+        }
+    }
+
     async fn handle_command(&mut self) {
         let command = self.input_buffer.trim().to_string();
 
@@ -1517,6 +1615,9 @@ impl App {
             self.handle_tool_command(&command).await;
         } else if command == "/models" {
             self.handle_models_command().await;
+        } else if command.starts_with("/set_params") {
+            let args = command.strip_prefix("/set_params").unwrap_or("").trim().to_string();
+            self.handle_set_params_command(&args);
         } else if command == "/help" {
             self.show_help();
         } else if command == "/estimate" {
@@ -1753,7 +1854,7 @@ impl App {
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
         if let Some(client) = &self.ollama_client {
-            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering)));
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
             self.tool_iteration_count = 0;
@@ -2018,6 +2119,92 @@ impl App {
     }
 
 
+    /// Handle /set_params command — validate and apply key=value pairs to runtime_params.
+    fn handle_set_params_command(&mut self, args: &str) {
+        if args.is_empty() {
+            let summary = self.runtime_params.summary();
+            let agents_summary = if self.agents_config.params.is_empty() { "none".to_string() }
+                                  else { self.agents_config.params.summary() };
+            let config_summary = if self.config.params.is_empty() { "none".to_string() }
+                                  else { self.config.params.summary() };
+            self.push_system_event(format!(
+                "🎛  Current params:\n  runtime: {}\n  config.json: {}\n  AGENTS.md: {}\n  effective: {}\n\nUsage: /set_params temperature=0.8 top_k=40\nKeys: temperature (0-2), top_k, top_p (0-1), repeat_penalty, num_predict, reset",
+                summary, config_summary, agents_summary,
+                self.effective_params().summary()
+            ));
+            return;
+        }
+        match self.runtime_params.apply_args(args) {
+            Ok(msg) => self.notify(format!("🎛  {}", msg)),
+            Err(e) => self.notify(format!("❌ set_params: {}", e)),
+        }
+    }
+
+
+    /// Handle configuration changes from filesystem watcher
+    async fn handle_config_change(&mut self, change: crate::watcher::ConfigChange) {
+        use crate::watcher::ConfigChange;
+        
+        match change {
+            ConfigChange::ConfigFileChanged => {
+                let fresh_config = crate::config::Config::reload_from_file();
+                let model_changed = fresh_config.model != self.config.model;
+                let endpoint_changed = fresh_config.endpoint != self.config.endpoint;
+                
+                if model_changed {
+                    let endpoint = fresh_config.endpoint.clone();
+                    match OllamaClient::new(&endpoint, &fresh_config.model).await {
+                        Ok(client) => {
+                            self.config = fresh_config;
+                            self.ollama_client = Some(client);
+                            self.notify(format!("🌸 Switched to model: {}", self.config.model));
+                        }
+                        Err(e) => {
+                            self.notify(format!("❌ Failed to switch model: {}", e));
+                        }
+                    }
+                } else if endpoint_changed {
+                    self.config = fresh_config;
+                    self.notify(format!("🔄 Endpoint changed to {}", self.config.endpoint));
+                } else {
+                    // Silent reload — config didn't meaningfully change
+                    self.config = fresh_config;
+                }
+            }
+            ConfigChange::AgentsMdChanged => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                self.agents_context = std::fs::read_to_string(cwd.join("AGENTS.md"))
+                    .ok()
+                    .filter(|c| !c.trim().is_empty());
+                
+                let agents_config = crate::config::AgentsConfig::parse_from_file(&cwd.join("AGENTS.md"));
+                if let Some(preferred) = &agents_config.preferred_model {
+                    if preferred != &self.config.model && self.ollama_client.is_some() {
+                        let client = self.ollama_client.as_ref().unwrap();
+                        let new_model = crate::config::get_model_with_fallback(
+                            &agents_config,
+                            &self.config.model,
+                            client,
+                        ).await;
+                        if new_model != self.config.model {
+                            let endpoint = self.config.endpoint.clone();
+                            match OllamaClient::new(&endpoint, &new_model).await {
+                                Ok(new_client) => {
+                                    self.config.model = new_model.clone();
+                                    self.ollama_client = Some(new_client);
+                                    self.notify(format!("🌸 Switched to model from AGENTS.md: {}", new_model));
+                                }
+                                Err(e) => {
+                                    self.notify(format!("❌ Failed to switch model: {}", e));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle user message — kick off streaming generation
     async fn handle_message(&mut self, message: &str) {
         if message.is_empty() {
@@ -2069,9 +2256,10 @@ impl App {
 
         // Start streaming — returns immediately, tokens arrive via channel
         if let Some(client) = &self.ollama_client {
-            let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text));
+            let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text), self.effective_params());
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
+            self.last_build_kick = std::time::Instant::now();
         }
     }
 
@@ -2104,6 +2292,15 @@ impl App {
             if count != self.cached_message_count {
                 self.cached_message_count = count;
             }
+        }
+
+        // Watchdog: if Build mode has been idle for 5+ seconds, re-kick
+        if self.mode == AppMode::Build
+            && self.turn_phase == TurnPhase::Idle
+            && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
+            && self.ollama_client.is_some()
+        {
+            self.inject_continue_kick();
         }
     }
 

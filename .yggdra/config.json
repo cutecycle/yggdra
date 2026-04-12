@@ -1,0 +1,12 @@
+{
+  "endpoint": "http://localhost:11434",
+  "model": "qwen3.5:4b",
+  "context_window": 16000,
+  "mode": "build",
+  "knowledge_index": {
+    "enabled": true,
+    "size_limit_gb": 0.02,
+    "battery_delay_ms": 100
+  },
+  "params": {}
+}

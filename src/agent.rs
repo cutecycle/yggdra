@@ -6,6 +6,33 @@ use crate::steering::SteeringDirective;
 use crate::ollama::{OllamaClient, OllamaMessage};
 use anyhow::{anyhow, Result};
 use regex::Regex;
+use std::sync::OnceLock;
+
+/// Tool call format preference based on model
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// Standard: <|tool>name<|tool_sep>arg<|end_tool>
+    Standard,
+    /// Qwen 4b quirk: <|tool_call>call:name args<|tool_sep|>none
+    ToolCall,
+    /// Legacy: [TOOL: name args]
+    Legacy,
+}
+
+/// Detect expected tool call format from model name
+pub fn detect_tool_format(model: &str) -> ToolFormat {
+    let lower = model.to_lowercase();
+    // Qwen 4b models emit the <|tool_call> format
+    // Match "qwen:4b" or "qwen-4b" but not "qwen:14b", "qwen:24b", etc
+    if lower.contains("qwen") && (lower == "qwen:4b" || lower == "qwen-4b" || 
+                                    lower.contains(":4b-") || lower.contains("-4b-") ||
+                                    lower.ends_with(":4b") || lower.ends_with("-4b")) {
+        ToolFormat::ToolCall
+    } else {
+        // Default to standard Qwen/Gemma format for other models
+        ToolFormat::Standard
+    }
+}
 
 /// Tool call representation parsed from LLM output
 #[derive(Debug, Clone)]
@@ -17,29 +44,71 @@ pub struct ToolCall {
 /// Parse tool calls from LLM output
 /// Supports two formats:
 /// 1. Qwen/Gemma: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
-/// 2. Legacy: [TOOL: name args]
+/// 2. Qwen 4b:   <|tool_call>call:name arg1\narg2<|tool_sep|>none<|tool_sep|>none<|end_tool>
+/// 3. Legacy:    [TOOL: name args]
 pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
+    // Lazy-compile regex patterns (once per binary, not per call)
+    static RE_QWEN_GEMMA: OnceLock<Regex> = OnceLock::new();
+    static RE_TOOL_CALL: OnceLock<Regex> = OnceLock::new();
+    static RE_LEGACY: OnceLock<Regex> = OnceLock::new();
+    
+    let re_qwen_gemma = RE_QWEN_GEMMA.get_or_init(|| {
+        Regex::new(r"<\|tool>(\w+)(<\|tool_sep>[^<]*)*<\|end_tool>").unwrap()
+    });
+    
+    let re_tool_call = RE_TOOL_CALL.get_or_init(|| {
+        Regex::new(r"(?s)<\|?tool_call\|?>[ \t]*call:(\w+)(.*?)(?:<\|end_tool>|</tool_call>|<\|tool_call\|?>)").unwrap()
+    });
+    
+    let re_legacy = RE_LEGACY.get_or_init(|| {
+        Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]").unwrap()
+    });
+    
     let mut calls = Vec::new();
     
     // Parse Qwen/Gemma format: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
-    if let Ok(re) = Regex::new(r"<\|tool>(\w+)(<\|tool_sep>[^<]*)*<\|end_tool>") {
-        for cap in re.captures_iter(output) {
-            if let Some(name_match) = cap.get(1) {
+    for cap in re_qwen_gemma.captures_iter(output) {
+        if let Some(name_match) = cap.get(1) {
+            let name = name_match.as_str().to_string();
+            let full_match = cap.get(0).unwrap().as_str();
+            let args_section = full_match
+                .trim_start_matches(&format!("<|tool>{}", name))
+                .trim_end_matches("<|end_tool>");
+            
+            let args = args_section
+                .split("<|tool_sep>")
+                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.trim().eq_ignore_ascii_case("none"))
+                .map(|s| s.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            
+            if !name.is_empty() {
+                calls.push(ToolCall { name, args });
+            }
+        }
+    }
+
+    // Parse <|tool_call>call:name or <tool_call>call:name variants
+    // Separators: <|tool_sep|> or <|tool_sep>
+    // Closers:    <|end_tool> or </tool_call>
+    if calls.is_empty() {
+        for cap in re_tool_call.captures_iter(output) {
+            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
                 let name = name_match.as_str().to_string();
-                // Extract all arguments after the tool name
-                let full_match = cap.get(0).unwrap().as_str();
-                let args_section = full_match
-                    .trim_start_matches(&format!("<|tool>{}", name))
-                    .trim_end_matches("<|end_tool>");
-                
-                let args = args_section
-                    .split("<|tool_sep>")
-                    .filter(|s| !s.is_empty())
+                let raw_args = args_match.as_str();
+                // Split on either separator variant, then on whitespace; filter "none" placeholders
+                let args = raw_args
+                    .replace("<|tool_sep|>", "\x00")
+                    .replace("<|tool_sep>", "\x00")
+                    .split('\x00')
+                    .flat_map(|chunk| chunk.split_whitespace())
+                    .filter(|s| !s.eq_ignore_ascii_case("none"))
+                    .filter(|s| !s.starts_with('<') && !s.ends_with('>'))
                     .collect::<Vec<_>>()
                     .join(" ");
-                
                 if !name.is_empty() {
-                    calls.push(ToolCall { name, args: args.trim().to_string() });
+                    calls.push(ToolCall { name, args });
                 }
             }
         }
@@ -47,13 +116,103 @@ pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
     
     // If no Qwen format found, try legacy format: [TOOL: name args]
     if calls.is_empty() {
-        if let Ok(re) = Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]") {
-            for cap in re.captures_iter(output) {
+        for cap in re_legacy.captures_iter(output) {
+            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
+                calls.push(ToolCall {
+                    name: name_match.as_str().to_string(),
+                    args: args_match.as_str().trim().to_string(),
+                });
+            }
+        }
+    }
+    
+    calls
+}
+
+/// Parse tool calls with a format hint — tries expected format first, then falls back
+pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<ToolCall> {
+    static RE_QWEN_GEMMA: OnceLock<Regex> = OnceLock::new();
+    static RE_TOOL_CALL: OnceLock<Regex> = OnceLock::new();
+    static RE_LEGACY: OnceLock<Regex> = OnceLock::new();
+    
+    let re_qwen_gemma = RE_QWEN_GEMMA.get_or_init(|| {
+        Regex::new(r"<\|tool>(\w+)(<\|tool_sep>[^<]*)*<\|end_tool>").unwrap()
+    });
+    
+    let re_tool_call = RE_TOOL_CALL.get_or_init(|| {
+        Regex::new(r"(?s)<\|?tool_call\|?>[ \t]*call:(\w+)(.*?)(?:<\|end_tool>|</tool_call>|<\|tool_call\|?>)").unwrap()
+    });
+    
+    let re_legacy = RE_LEGACY.get_or_init(|| {
+        Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]").unwrap()
+    });
+    
+    let mut calls = Vec::new();
+    
+    // Try primary format first
+    match format {
+        ToolFormat::Standard => {
+            for cap in re_qwen_gemma.captures_iter(output) {
+                if let Some(name_match) = cap.get(1) {
+                    let name = name_match.as_str().to_string();
+                    let full_match = cap.get(0).unwrap().as_str();
+                    let args_section = full_match
+                        .trim_start_matches(&format!("<|tool>{}", name))
+                        .trim_end_matches("<|end_tool>");
+                    
+                    let args = args_section
+                        .split("<|tool_sep>")
+                        .filter(|s| !s.trim().is_empty())
+                        .filter(|s| !s.trim().eq_ignore_ascii_case("none"))
+                        .map(|s| s.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    
+                    if !name.is_empty() {
+                        calls.push(ToolCall { name, args });
+                    }
+                }
+            }
+        }
+        ToolFormat::ToolCall => {
+            for cap in re_tool_call.captures_iter(output) {
+                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
+                    let name = name_match.as_str().to_string();
+                    let raw_args = args_match.as_str();
+                    let args = raw_args
+                        .replace("<|tool_sep|>", "\x00")
+                        .replace("<|tool_sep>", "\x00")
+                        .split('\x00')
+                        .flat_map(|chunk| chunk.split_whitespace())
+                        .filter(|s| !s.eq_ignore_ascii_case("none"))
+                        .filter(|s| !s.starts_with('<') && !s.ends_with('>'))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !name.is_empty() {
+                        calls.push(ToolCall { name, args });
+                    }
+                }
+            }
+        }
+        ToolFormat::Legacy => {
+            for cap in re_legacy.captures_iter(output) {
                 if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
                     calls.push(ToolCall {
                         name: name_match.as_str().to_string(),
                         args: args_match.as_str().trim().to_string(),
                     });
+                }
+            }
+        }
+    }
+    
+    // Fallback to other formats if primary returned nothing
+    if calls.is_empty() {
+        for format_variant in &[ToolFormat::Standard, ToolFormat::ToolCall, ToolFormat::Legacy] {
+            if format_variant != &format {
+                calls = parse_tool_calls_with_format(output, *format_variant);
+                if !calls.is_empty() {
+                    break;
                 }
             }
         }
@@ -99,6 +258,8 @@ pub struct Agent {
     config: AgentConfig,
     client: OllamaClient,
     registry: ToolRegistry,
+    /// Runtime parameter overrides — updated by `set_params` tool calls
+    current_params: crate::config::ModelParams,
 }
 
 impl Agent {
@@ -108,7 +269,14 @@ impl Agent {
             config,
             client,
             registry: ToolRegistry::new(),
+            current_params: crate::config::ModelParams::default(),
         })
+    }
+
+    /// Seed runtime params from a base (e.g. App's effective params at agent start)
+    pub fn with_params(mut self, params: crate::config::ModelParams) -> Self {
+        self.current_params = params;
+        self
     }
 
     /// Parse tool calls from LLM output (delegates to module-level function)
@@ -121,16 +289,27 @@ impl Agent {
         self.registry.execute(&call.name, &call.args)
     }
 
+    /// Handle `set_params` tool call — updates runtime params, returns confirmation or error.
+    fn handle_set_params(&mut self, args: &str) -> String {
+        match self.current_params.apply_args(args) {
+            Ok(msg) => format!("✅ {}", msg),
+            Err(e) => format!("❌ {}", e),
+        }
+    }
+
     /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering() -> String {
         let steering = SteeringDirective::custom(
             "You are an agentic assistant with access to tools and subagent spawning. \
-             When you need to execute tasks, use [TOOL: name args] format to call tools. \
-             Available tools: rg, spawn, editfile, commit, python, ruste.\n\
-             For divisible tasks, consider parallelization via [TOOL: spawn_agent task_id \"description\"].\
-             Examples: [TOOL: spawn_agent search \"find all .rs files\"] [TOOL: spawn_agent analyze \"compute metrics\"]\n\
-             Subagents run in parallel and report results. Combine results for final output.\
-             Always respond with [TOOL: ...] calls when needed, followed by [DONE] when complete."
+             When you need to execute tasks, use the <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool> format for tool calls.\n\
+             Available tools: rg, spawn, editfile, commit, python, ruste, set_params.\n\
+             Examples:\n\
+             <|tool>rg<|tool_sep>TODO<|tool_sep>.yggdra/todo/<|end_tool>\n\
+             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool>\n\
+             <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_k=40<|end_tool>\n\
+             For divisible tasks, spawn subagents: <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"description\"<|end_tool>\n\
+             Subagents run in parallel; combine results for final output.\n\
+             Always use the <|tool>...</|end_tool> format, followed by [DONE] when complete."
         );
         steering.format_for_system_prompt()
     }
@@ -172,9 +351,13 @@ impl Agent {
                 return Err(anyhow!("agent: max iterations ({}) reached", self.config.max_iterations));
             }
 
+            // Refresh model and base params; runtime current_params take precedence
+            let fresh = crate::config::Config::reload_from_file();
+            let effective_params = self.current_params.merge_over(&fresh.params);
             let response = self.client.generate_with_messages(
-                &self.config.model,
+                &fresh.model,
                 messages.clone(),
+                &effective_params,
             ).await?;
 
             let llm_output = response.message.content.clone();
@@ -184,7 +367,8 @@ impl Agent {
             });
 
             // Check for tool calls (no subagent spawning here)
-            let tool_calls = Self::parse_tool_calls(&llm_output);
+            let format = detect_tool_format(&self.config.model);
+            let tool_calls = parse_tool_calls_with_format(&llm_output, format);
 
             if tool_calls.is_empty() {
                 if Self::is_done(&llm_output) {
@@ -197,12 +381,16 @@ impl Agent {
                 continue;
             }
 
-            // Execute tools
+            // Execute tools — set_params is handled locally, others via registry
             let mut tool_results = String::new();
             for call in tool_calls {
-                let result = match self.execute_tool(&call) {
-                    Ok(output) => output,
-                    Err(e) => format!("[ERROR]: {}", e),
+                let result = if call.name == "set_params" {
+                    self.handle_set_params(&call.args)
+                } else {
+                    match self.execute_tool(&call) {
+                        Ok(output) => output,
+                        Err(e) => format!("[ERROR]: {}", e),
+                    }
                 };
                 tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
             }
@@ -259,10 +447,13 @@ impl Agent {
                 return Err(anyhow!("agent: max iterations ({}) reached", self.config.max_iterations));
             }
 
-            // Call Ollama
+            // Refresh model and base params; runtime current_params take precedence
+            let fresh = crate::config::Config::reload_from_file();
+            let effective_params = self.current_params.merge_over(&fresh.params);
             let response = self.client.generate_with_messages(
-                &self.config.model,
+                &fresh.model,
                 messages.clone(),
+                &effective_params,
             ).await?;
 
             let llm_output = response.message.content.clone();
@@ -274,7 +465,8 @@ impl Agent {
             });
 
             // Check for tool calls
-            let tool_calls = Self::parse_tool_calls(&llm_output);
+            let format = detect_tool_format(&self.config.model);
+            let tool_calls = parse_tool_calls_with_format(&llm_output, format);
             let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
             
             // Disable subagent spawning if recursion depth limit reached
@@ -295,12 +487,16 @@ impl Agent {
                 continue;
             }
 
-            // Execute tools and collect results
+            // Execute tools — set_params handled locally, others via registry
             let mut tool_results = String::new();
             for call in tool_calls {
-                let result = match self.execute_tool(&call) {
-                    Ok(output) => output,
-                    Err(e) => format!("[ERROR]: {}", e),
+                let result = if call.name == "set_params" {
+                    self.handle_set_params(&call.args)
+                } else {
+                    match self.execute_tool(&call) {
+                        Ok(output) => output,
+                        Err(e) => format!("[ERROR]: {}", e),
+                    }
                 };
                 tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
             }
@@ -406,6 +602,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tool_calls_tool_call_format() {
+        // <tool_call>call:name format (some Qwen 4b variants)
+        let output = "<tool_call>call:rg \"TODO\"\n.yggdra/todo/<|tool_sep>none<|tool_sep>none<|end_tool>";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "rg");
+        assert!(calls[0].args.contains("TODO"));
+        assert!(calls[0].args.contains(".yggdra/todo/"));
+        assert!(!calls[0].args.contains("none"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_pipe_tool_call_format() {
+        // <|tool_call>call:name format — ACTUAL Qwen 4b output with piped delimiters
+        let output = "<|tool_call>call:spawn ls -la .yggdra/todo/<|tool_sep|>none<|tool_sep|>none<|end_tool>";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1, "should parse <|tool_call> format");
+        assert_eq!(calls[0].name, "spawn");
+        assert!(calls[0].args.contains("ls"), "args should contain ls");
+        assert!(calls[0].args.contains(".yggdra/todo/"), "args should contain path");
+        assert!(!calls[0].args.contains("none"), "none placeholders should be filtered");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_pipe_sep_pipe_format() {
+        // <|tool_sep|> variant (closing pipe) must also be handled
+        let output = "<|tool_call>call:rg \"TODO\"\n.yggdra/todo/<|tool_sep|>none<|tool_sep|>none<|end_tool>";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "rg");
+        assert!(calls[0].args.contains("TODO"));
+        assert!(calls[0].args.contains(".yggdra/todo/"));
+    }
+
+    #[test]
+    fn test_parse_qwen_none_filtered() {
+        // <|tool> format with "none" placeholder args should be filtered
+        let output = "<|tool>spawn<|tool_sep>ls<|tool_sep>-la<|tool_sep>none<|end_tool>";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "spawn");
+        assert_eq!(calls[0].args, "ls -la");
+    }
+
+    #[test]
     fn test_is_done() {
         assert!(Agent::is_done("Task completed [DONE]"));
         assert!(Agent::is_done("[DONE]"));
@@ -419,6 +660,44 @@ mod tests {
         let prompt = Agent::system_prompt_with_steering();
         // Should contain tool instructions without wrapper tags
         assert!(prompt.contains("tools") || prompt.contains("Tools") || prompt.contains("TOOL"));
+    }
+
+    #[test]
+    fn test_detect_tool_format_qwen_4b() {
+        let format = detect_tool_format("qwen:4b");
+        assert_eq!(format, ToolFormat::ToolCall);
+    }
+
+    #[test]
+    fn test_detect_tool_format_qwen_other_versions() {
+        // Only 4b has the quirky format; others default to Standard
+        let format = detect_tool_format("qwen:7b");
+        assert_eq!(format, ToolFormat::Standard);
+        
+        let format = detect_tool_format("qwen:14b");
+        assert_eq!(format, ToolFormat::Standard);
+    }
+
+    #[test]
+    fn test_detect_tool_format_non_qwen() {
+        let format = detect_tool_format("llama2");
+        assert_eq!(format, ToolFormat::Standard);
+        
+        let format = detect_tool_format("mistral");
+        assert_eq!(format, ToolFormat::Standard);
+        
+        let format = detect_tool_format("neural-chat");
+        assert_eq!(format, ToolFormat::Standard);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_with_format_fallback() {
+        // Standard format input with ToolCall hint should fallback and succeed
+        let output = "<|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool>";
+        let calls = parse_tool_calls_with_format(output, ToolFormat::ToolCall);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "spawn");
+        assert_eq!(calls[0].args, "ls -la");
     }
 
     #[test]

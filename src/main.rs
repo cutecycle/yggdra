@@ -15,6 +15,7 @@ mod spawner;
 mod task;
 mod ui;
 mod metrics;
+mod watcher;
 
 use anyhow::Result;
 use session::Session;
@@ -70,16 +71,12 @@ async fn main() -> Result<()> {
     if !has_commits {
         eprintln!("🌱 No commits yet — creating initial snapshot");
         let _ = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&cwd)
-            .output();
-        let _ = std::process::Command::new("git")
             .args(["commit", "--allow-empty", "-m", "chore: initial snapshot (pre-agent baseline)"])
             .current_dir(&cwd)
             .output();
     }
 
-    let config = config::Config::load_with_smart_model().await;
+    let (config, probe_client) = config::Config::load_with_smart_model().await;
     let config = if let Some(mode) = mode_override {
         let mut c = config;
         c.mode = mode;
@@ -87,6 +84,21 @@ async fn main() -> Result<()> {
         c
     } else {
         config
+    };
+
+    // Spawn filesystem watcher for config.json and AGENTS.md changes
+    let config_watcher_rx = match crate::watcher::spawn_watcher(cwd.clone()) {
+        Ok((rx, _handle)) => {
+            eprintln!("🔍 Filesystem watcher started");
+            Some(rx)
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to start filesystem watcher: {}", e);
+            // Return a channel that never emits - watcher is optional
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(tx);
+            Some(rx)
+        }
     };
     
     // Start background knowledge indexing task
@@ -104,16 +116,26 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|c| !c.trim().is_empty());
 
-    // Create Ollama client (reuses the validated endpoint from config)
-    let ollama_client = match ollama::OllamaClient::new(&config.endpoint, &config.model).await {
-        Ok(client) => Some(client),
-        Err(_) => {
-            notifications::error_occurred("Ollama connection failed").await;
-            None
+    // Reuse the client already validated during config load if the model matches,
+    // otherwise create a fresh one.  Either way we avoid a second /api/tags round-trip.
+    let ollama_client = if let Some(probe) = probe_client {
+        if probe.model() == config.model {
+            Some(probe)
+        } else {
+            // model was overridden (CLI flag or env var) — swap model, no new HTTP call
+            Some(ollama::OllamaClient::new_with_existing(probe, &config.model))
+        }
+    } else {
+        match ollama::OllamaClient::new(&config.endpoint, &config.model).await {
+            Ok(client) => Some(client),
+            Err(_) => {
+                notifications::error_occurred("Ollama connection failed").await;
+                None
+            }
         }
     };
 
-    let mut app = App::new(config, session, ollama_client, agents_md);
+    let mut app = App::new(config, session, ollama_client, agents_md, config_watcher_rx);
     let result = app.run().await;
 
     // Kill entire process group on exit (catches spawned subagents)

@@ -43,7 +43,7 @@ pub async fn query_gap(
         },
     ];
 
-    let response = client.generate_with_messages(model, messages).await?;
+    let response = client.generate_with_messages(model, messages, &crate::config::ModelParams::default()).await?;
     let text = response.message.content.trim().to_string();
 
     // Reject explicit "none" or very short/empty responses

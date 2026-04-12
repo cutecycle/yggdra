@@ -35,6 +35,38 @@ struct GenerateRequest {
     model: String,
     messages: Vec<OllamaMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+}
+
+/// Sampling options forwarded to Ollama (all fields optional — unset = Ollama defaults)
+#[derive(Debug, Serialize, Default)]
+struct OllamaOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<i32>,
+}
+
+impl OllamaOptions {
+    fn from_params(p: &crate::config::ModelParams) -> Option<Self> {
+        if p.is_empty() {
+            return None;
+        }
+        Some(OllamaOptions {
+            temperature: p.temperature,
+            top_k: p.top_k,
+            top_p: p.top_p,
+            repeat_penalty: p.repeat_penalty,
+            num_predict: p.num_predict,
+        })
+    }
 }
 
 /// Message format for Ollama API
@@ -104,6 +136,12 @@ impl OllamaClient {
 
     pub fn endpoint(&self) -> &str { &self.endpoint }
     pub fn model(&self) -> &str { &self.model }
+
+    /// Reuse an existing validated client but switch to a different model name.
+    /// No network round-trip — the underlying reqwest::Client is Arc-backed and cheap to clone.
+    pub fn new_with_existing(existing: Self, model: &str) -> Self {
+        Self { model: model.to_string(), ..existing }
+    }
 
     /// Fetch list of available models from Ollama
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -176,6 +214,7 @@ impl OllamaClient {
         &self,
         messages: Vec<Message>,
         steering: Option<&str>,
+        params: crate::config::ModelParams,
     ) -> mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -184,6 +223,7 @@ impl OllamaClient {
             model: self.model.clone(),
             messages: ollama_messages,
             stream: true,
+            options: OllamaOptions::from_params(&params),
         };
         let url = format!("{}/api/chat", self.endpoint);
         let client = self.client.clone();
@@ -262,6 +302,7 @@ impl OllamaClient {
         &self,
         messages: Vec<Message>,
         steering: Option<&str>,
+        params: &crate::config::ModelParams,
     ) -> Result<String> {
         let ollama_messages = Self::build_messages(&messages, steering);
 
@@ -269,6 +310,7 @@ impl OllamaClient {
             model: self.model.clone(),
             messages: ollama_messages,
             stream: false,
+            options: OllamaOptions::from_params(params),
         };
 
         let url = format!("{}/api/chat", self.endpoint);
@@ -302,11 +344,13 @@ impl OllamaClient {
         &self,
         model: &str,
         messages: Vec<OllamaMessage>,
+        params: &crate::config::ModelParams,
     ) -> Result<GenerateResponse> {
         let request = GenerateRequest {
             model: model.to_string(),
             messages,
             stream: false,
+            options: OllamaOptions::from_params(params),
         };
 
         let url = format!("{}/api/chat", self.endpoint);
@@ -369,10 +413,24 @@ mod tests {
             model: "qwen:3.5".to_string(),
             messages,
             stream: true,
+            options: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("qwen:3.5"));
         assert!(json.contains("stream\":true"));
+        // options absent when None
+        assert!(!json.contains("options"));
+    }
+
+    #[test]
+    fn test_generate_request_with_params() {
+        use crate::config::ModelParams;
+        let params = ModelParams { temperature: Some(0.7), top_k: Some(40), ..Default::default() };
+        let opts = OllamaOptions::from_params(&params).unwrap();
+        let json = serde_json::to_string(&opts).unwrap();
+        assert!(json.contains("\"temperature\":0.7"));
+        assert!(json.contains("\"top_k\":40"));
+        assert!(!json.contains("top_p")); // unset field omitted
     }
 
     #[test]
