@@ -1,8 +1,8 @@
 {
   "endpoint": "http://localhost:11434",
-  "model": "qwen3.5:4b",
-  "context_window": 8192,
-  "mode": "build",
+  "model": "gemma4-e2b-heretic-ara:bf16",
+  "context_window": 160000,
+  "mode": "ask",
   "knowledge_index": {
     "enabled": true,
     "size_limit_gb": 0.02,

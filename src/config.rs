@@ -48,6 +48,14 @@ impl std::str::FromStr for AppMode {
     }
 }
 
+/// UI settings for visual preferences
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UISettings {
+    /// Enable subtle vertical gradient background in message area
+    #[serde(default)]
+    pub gradient_enabled: bool,
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -64,6 +72,9 @@ pub struct Config {
     /// Model sampling parameters
     #[serde(default)]
     pub params: ModelParams,
+    /// UI visual settings
+    #[serde(default)]
+    pub ui_settings: UISettings,
 }
 
 /// Knowledge index settings
@@ -225,6 +236,8 @@ struct FileConfig {
     knowledge_index: Option<KnowledgeIndexSettings>,
     #[serde(default)]
     params: ModelParams,
+    #[serde(default)]
+    ui_settings: Option<UISettings>,
 }
 
 impl FileConfig {
@@ -260,6 +273,7 @@ impl Default for Config {
             mode: AppMode::Plan,
             knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
+            ui_settings: UISettings::default(),
         }
     }
 }
@@ -287,8 +301,9 @@ impl Config {
 
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let params = file.params;
+        let ui_settings = file.ui_settings.unwrap_or_default();
 
-        Config { endpoint, model, context_window, mode, knowledge_index, params }
+        Config { endpoint, model, context_window, mode, knowledge_index, params, ui_settings }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -329,8 +344,9 @@ impl Config {
             .unwrap_or(AppMode::Plan);
 
         let knowledge_index = file.knowledge_index.unwrap_or_default();
+        let ui_settings = file.ui_settings.unwrap_or_default();
 
-        let cfg = Config { endpoint, model, context_window, mode, knowledge_index, params: file.params };
+        let cfg = Config { endpoint, model, context_window, mode, knowledge_index, params: file.params, ui_settings };
         (cfg, validated_client)
     }
 

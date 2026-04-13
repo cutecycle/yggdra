@@ -21,6 +21,9 @@ pub struct Theme {
     pub violet: Color,   // solarized violet-ish, used in model picker
     // Selected-row fg (always black so it reads on both accent bgs)
     pub selected_fg: Color,
+    // Gradient background colors (start/end for vertical fade)
+    pub gradient_start: Color,
+    pub gradient_end: Color,
 }
 
 impl Theme {
@@ -33,6 +36,8 @@ impl Theme {
             accent:     Color::Rgb(42, 161, 152),  // solarized cyan
             violet:     Color::Rgb(108, 113, 196), // solarized violet
             selected_fg: Color::Black,
+            gradient_start: Color::Rgb(218, 230, 242), // soft lavender-blue
+            gradient_end:   Color::Rgb(245, 240, 232), // soft warm cream
         }
     }
 
@@ -45,6 +50,8 @@ impl Theme {
             accent:     Color::Rgb(42, 161, 152),  // solarized cyan (same — works on dark)
             violet:     Color::Rgb(108, 113, 196), // solarized violet (same)
             selected_fg: Color::Black,
+            gradient_start: Color::Rgb(32, 48, 80),   // deep blue
+            gradient_end:   Color::Rgb(45, 31, 61),   // deep purple
         }
     }
 
