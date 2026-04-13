@@ -3,11 +3,12 @@
 
 use crate::tools::ToolRegistry;
 use crate::steering::SteeringDirective;
-use crate::ollama::{OllamaClient, OllamaMessage};
+use crate::ollama::{OllamaClient, OllamaMessage, StreamEvent};
 use crate::config::AppMode;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
 /// Tool call format preference based on model
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +242,8 @@ pub struct AgentConfig {
     pub max_recursion_depth: usize,
     pub current_depth: usize,
     pub app_mode: AppMode,
+    /// Optional channel to forward tokens live as the agent streams
+    pub token_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl AgentConfig {
@@ -252,6 +255,7 @@ impl AgentConfig {
             max_recursion_depth: 10,
             current_depth: 0,
             app_mode: AppMode::Plan,
+            token_tx: None,
         }
     }
 
@@ -267,6 +271,11 @@ impl AgentConfig {
 
     pub fn with_app_mode(mut self, mode: AppMode) -> Self {
         self.app_mode = mode;
+        self
+    }
+
+    pub fn with_token_tx(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
+        self.token_tx = Some(tx);
         self
     }
 }
@@ -384,13 +393,27 @@ impl Agent {
             // Refresh model and base params; runtime current_params take precedence
             let fresh = crate::config::Config::reload_from_file();
             let effective_params = self.current_params.merge_over(&fresh.params);
-            let response = self.client.generate_with_messages(
+
+            // Stream the response so tokens flow live to the UI via token_tx
+            let mut stream_rx = self.client.stream_messages(
                 &fresh.model,
                 messages.clone(),
                 &effective_params,
-            ).await?;
+            );
+            let mut llm_output = String::new();
+            while let Some(event) = stream_rx.recv().await {
+                match event {
+                    StreamEvent::Token(tok) => {
+                        if let Some(tx) = &self.config.token_tx {
+                            let _ = tx.send(tok.clone());
+                        }
+                        llm_output.push_str(&tok);
+                    }
+                    StreamEvent::Done(_, _) => break,
+                    StreamEvent::Error(e) => return Err(anyhow!("stream error: {}", e)),
+                }
+            }
 
-            let llm_output = response.message.content.clone();
             messages.push(OllamaMessage {
                 role: "assistant".to_string(),
                 content: llm_output.clone(),

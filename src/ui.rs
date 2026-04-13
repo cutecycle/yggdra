@@ -51,6 +51,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "model",  description: "Switch AI model",                    keywords: "model switch change llm ollama",   fill: "/model " },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "params", description: "Set model params (temperature, top_k…)", keywords: "temperature top_k top_p repeat penalty params sampling", fill: "/set_params " },
+    PaletteCommand { name: "temperature", description: "Set sampling temperature (0.0–2.0)", keywords: "temperature heat creativity sampling randomness", fill: "/temperature " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
@@ -167,6 +168,10 @@ pub struct App {
     agents_context: Option<String>,
     /// Receives result from async subagent execution
     subagent_result_rx: Option<oneshot::Receiver<crate::spawner::AgentResult>>,
+    /// Live token stream from running subagent
+    subagent_token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// Accumulated live text from running subagent (cleared on completion)
+    subagent_live_text: String,
     /// Number of subagents spawned this session (display counter)
     subagent_count: u32,
     /// Number of subagents currently running
@@ -276,6 +281,8 @@ impl App {
             mode: initial_mode,
             agents_context: agents_md,
             subagent_result_rx: None,
+            subagent_token_rx: None,
+            subagent_live_text: String::new(),
             subagent_count: 0,
             active_subagents: 0,
             last_token_counts: (0, 0),
@@ -374,6 +381,8 @@ impl App {
             
             // Drain any pending stream tokens before drawing
             self.drain_stream_tokens();
+            // Drain any pending subagent tokens
+            self.drain_subagent_tokens();
             // Check for completed tool execution
             self.check_tool_result();
             // Check for completed gap reflection
@@ -453,6 +462,30 @@ impl App {
                             self.inject_continue_kick();
                         }
                     }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Drain pending tokens from a running subagent's stream into subagent_live_text.
+    fn drain_subagent_tokens(&mut self) {
+        let rx = match self.subagent_token_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(tok) => {
+                    self.subagent_live_text.push_str(&tok);
+                    if !self.user_scrolled {
+                        self.scroll_offset = 0;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // Sender dropped (subagent finished) — stop polling
+                    self.subagent_token_rx = None;
                     return;
                 }
             }
@@ -554,6 +587,7 @@ impl App {
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
                     self.tool_iteration_count = 0;
+                    return; // don't clear stream_rx below
                 } else {
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
@@ -642,15 +676,16 @@ impl App {
         let endpoint = self.config.endpoint.clone();
         let model = self.config.model.clone();
 
+        let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        self.subagent_token_rx = Some(token_rx);
+        self.subagent_live_text.clear();
+
         tokio::spawn(async move {
-            let config = crate::agent::AgentConfig {
-                model,
-                endpoint: endpoint.clone(),
-                max_iterations: 10,
-                max_recursion_depth: 10,
-                current_depth: 1,
-                app_mode: crate::config::AppMode::Build,
-            };
+            let config = crate::agent::AgentConfig::new(&model, &endpoint)
+                .with_max_iterations(10)
+                .with_max_recursion_depth(10)
+                .with_app_mode(crate::config::AppMode::Build)
+                .with_token_tx(token_tx);
             let result = crate::spawner::spawn_subagent(
                 "ui", &task_id, &task_desc, &endpoint, config,
             ).await;
@@ -682,6 +717,9 @@ impl App {
         };
 
         self.active_subagents = self.active_subagents.saturating_sub(1);
+        // Clear the live subagent stream display
+        self.subagent_live_text.clear();
+        self.subagent_token_rx = None;
         let status_icon = if result.success { "✅ done" } else { "❌ failed" };
         // Show a truncated preview of the output (first 3 lines, max 200 chars)
         let preview: String = result.output.lines()
@@ -1162,6 +1200,31 @@ impl App {
                 Style::default().bg(tint)
             };
             rendered.push(RenderedMsg { text: stream_text, style: stream_style, height });
+        }
+
+        // Show live subagent output while a subagent is running
+        if !self.subagent_live_text.is_empty() {
+            let tint = if exchange_idx % 2 == 0 { self.theme.band_b } else { self.theme.band_a };
+            // Show last 500 chars to keep it concise
+            let tail = if self.subagent_live_text.len() > 500 {
+                &self.subagent_live_text[self.subagent_live_text.len() - 500..]
+            } else {
+                &self.subagent_live_text
+            };
+            let sub_text = format!("🔀 subagent: {}▌", tail);
+            let line_count = sub_text.lines().count().max(1);
+            let wrap_extra: usize = if area_width > 0 {
+                sub_text.lines()
+                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .sum::<u16>() as usize
+            } else { 0 };
+            let height = (line_count + wrap_extra).max(1) as u16;
+            let sub_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
+                Style::default().fg(Color::Rgb(180, 210, 255)).bg(tint)
+            } else {
+                Style::default().bg(tint)
+            };
+            rendered.push(RenderedMsg { text: sub_text, style: sub_style, height });
         }
 
         // Calculate total content height and clamp scroll_offset
@@ -1664,6 +1727,16 @@ impl App {
         } else if command.starts_with("/set_params") {
             let args = command.strip_prefix("/set_params").unwrap_or("").trim().to_string();
             self.handle_set_params_command(&args);
+        } else if command.starts_with("/temperature") {
+            let val = command.strip_prefix("/temperature").unwrap_or("").trim().to_string();
+            if val.is_empty() {
+                let t = self.effective_params().temperature
+                    .map(|v| format!("{}", v))
+                    .unwrap_or_else(|| "unset (Ollama default)".to_string());
+                self.notify(format!("🌡  temperature: {}\nUsage: /temperature <0.0–2.0>", t));
+            } else {
+                self.handle_set_params_command(&format!("temperature={}", val));
+            }
         } else if command == "/help" {
             self.show_help();
         } else if command == "/estimate" {
@@ -1776,7 +1849,8 @@ impl App {
              /model NAME   - Switch AI model\n\
              /models       - List available models\n\
              /ctx NUM      - Set context window size\n\
-             /set_params K=V - Set model params (temperature, top_k, etc.)\n\
+             /set_params K=V - Set model params (temperature, top_k, etc.) — persists\n\
+             /temperature N  - Set temperature (0.0–2.0) shorthand\n\
              /mode MODE    - Switch mode (ask/plan/build)\n\
              /gradient     - Toggle gradient background\n\
              /checkpoint   - Save session checkpoint\n\
@@ -2259,7 +2333,12 @@ impl App {
             return;
         }
         match self.runtime_params.apply_args(args) {
-            Ok(msg) => self.notify(format!("🎛  {}", msg)),
+            Ok(msg) => {
+                // Also persist to config.json so params survive restart
+                let _ = self.config.params.apply_args(args);
+                let _ = self.config.save();
+                self.notify(format!("🎛  {} (saved)", msg));
+            }
             Err(e) => self.notify(format!("❌ set_params: {}", e)),
         }
     }

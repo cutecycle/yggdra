@@ -47,7 +47,6 @@ pub async fn spawn_subagent(
 ) -> Result<AgentResult> {
     let client = OllamaClient::new(endpoint, &config.model).await?;
     let mut agent = Agent::new(config, client).await?;
-    
     let full_prompt = format!(
         "Subagent {}/{}\n\
          Task: {}\n\

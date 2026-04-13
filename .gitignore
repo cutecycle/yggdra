@@ -25,6 +25,10 @@ Thumbs.db
 /tests/fixtures/temp/
 *.tmp
 
-
+# Per-project yggdra runtime data (logs, session state, symlinks)
 .yggdra/config.toml
+.yggdra/config.json
 .yggdra/knowledge
+.yggdra/log/
+.yggdra/gaps
+.yggdra/todo/

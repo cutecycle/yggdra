@@ -298,6 +298,83 @@ impl OllamaClient {
         rx
     }
 
+    /// Streaming variant that takes pre-built OllamaMessages (used by agent subloops).
+    pub fn stream_messages(
+        &self,
+        model: &str,
+        messages: Vec<OllamaMessage>,
+        params: &crate::config::ModelParams,
+    ) -> mpsc::UnboundedReceiver<StreamEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let request = GenerateRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            options: OllamaOptions::from_params(params),
+        };
+        let url = format!("{}/api/chat", self.endpoint);
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            let response = match client.post(&url).json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let _ = tx.send(StreamEvent::Error(format!("Ollama error {}: {}", status, body)));
+                return;
+            }
+
+            use futures_util::StreamExt;
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(newline_pos) = buffer.find('\n') {
+                            let line = buffer[..newline_pos].trim().to_string();
+                            buffer = buffer[newline_pos + 1..].to_string();
+                            if line.is_empty() { continue; }
+                            match serde_json::from_str::<StreamChunk>(&line) {
+                                Ok(chunk) => {
+                                    if let Some(msg) = &chunk.message {
+                                        if !msg.content.is_empty() {
+                                            if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    if chunk.done {
+                                        let p = chunk.prompt_eval_count.unwrap_or(0);
+                                        let g = chunk.eval_count.unwrap_or(0);
+                                        let _ = tx.send(StreamEvent::Done(p, g));
+                                        return;
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(StreamEvent::Done(0, 0));
+        });
+
+        rx
+    }
+
     /// Non-streaming generate (kept for agent loop use)
     pub async fn generate(
         &self,
