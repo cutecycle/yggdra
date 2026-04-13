@@ -525,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_spawn_validation() {
         let tool = SpawnTool;
 
@@ -545,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_spawn_path_resolution() {
         // resolve_binary("ls") should find something under /bin or /usr/bin
         let resolved = SpawnTool::resolve_binary("ls");

@@ -1,7 +1,7 @@
 {
   "endpoint": "http://localhost:11434",
   "model": "qwen3.5:4b",
-  "context_window": 16000,
+  "context_window": 8192,
   "mode": "build",
   "knowledge_index": {
     "enabled": true,

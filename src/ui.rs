@@ -718,26 +718,31 @@ impl App {
 
                 // In Ask-only mode, detect and revert any file changes
                 if self.mode == AppMode::Ask {
-                    if let Ok(output) = std::process::Command::new("git")
-                        .args(&["diff", "--name-only"])
-                        .current_dir(".")
-                        .output()
-                    {
-                        if !output.stdout.is_empty() {
-                            let changed_files = String::from_utf8_lossy(&output.stdout);
-                            if !changed_files.trim().is_empty() {
-                                // Revert changes
-                                let _ = std::process::Command::new("git")
-                                    .args(&["checkout", "."])
-                                    .current_dir(".")
-                                    .output();
-                                self.push_system_event(format!(
-                                    "🔒 Ask-only mode: {} tried to modify files (reverted):\n{}",
-                                    result.tool_name, changed_files
-                                ));
-                                self.turn_phase = TurnPhase::Idle;
-                                self.tool_iteration_count = 0;
-                                return;
+                    // Skip file-change check for read-only tools
+                    let is_readonly = matches!(result.tool_name.as_str(), "rg" | "spawn");
+                    
+                    if !is_readonly {
+                        if let Ok(output) = std::process::Command::new("git")
+                            .args(&["diff", "--name-only"])
+                            .current_dir(".")
+                            .output()
+                        {
+                            if !output.stdout.is_empty() {
+                                let changed_files = String::from_utf8_lossy(&output.stdout);
+                                if !changed_files.trim().is_empty() {
+                                    // Revert changes
+                                    let _ = std::process::Command::new("git")
+                                        .args(&["checkout", "."])
+                                        .current_dir(".")
+                                        .output();
+                                    self.push_system_event(format!(
+                                        "🔒 Ask-only mode: {} tried to modify files (reverted):\n{}",
+                                        result.tool_name, changed_files
+                                    ));
+                                    self.turn_phase = TurnPhase::Idle;
+                                    self.tool_iteration_count = 0;
+                                    return;
+                                }
                             }
                         }
                     }
