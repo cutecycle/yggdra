@@ -336,8 +336,7 @@ impl App {
                      key files (README, Cargo.toml, package.json, etc.). \
                      Then write an AGENTS.md that describes the project: its purpose, \
                      structure, build commands, conventions, and any gotchas. \
-                     After writing AGENTS.md, continue with normal autonomous work. \
-                     Say [DONE] at each milestone."
+                     After writing AGENTS.md, continue with normal autonomous work."
                 )
             } else if is_new_session {
                 // AGENTS.md exists, new session — normal autonomous kick
@@ -345,16 +344,14 @@ impl App {
                     "New session started in `{cwd}`. \
                      Orient yourself: list the directory, check .yggdra/todo/ for pending tasks, \
                      review .yggdra/log/ history, and begin working autonomously. \
-                     Use tools to explore. When a task is fully complete, say [DONE] \
-                     to notify the user, then immediately continue to the next task."
+                     Use tools to explore. When a task is fully complete, continue to the next."
                 )
             } else {
                 // Session restored with messages — continue work
                 format!(
                     "Session restored in `{cwd}`. \
                      Review recent work in chat history. Check .yggdra/todo/ for pending tasks. \
-                     Continue working autonomously. Use tools to explore and progress. \
-                     Say [DONE] at milestones, then immediately move to the next task."
+                     Continue working autonomously. Use tools to explore and progress."
                 )
             };
             self.handle_message(&kick).await;
@@ -545,8 +542,12 @@ impl App {
         let tool_calls = agent::parse_tool_calls(&response_text);
         let spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
 
-        // Detect [DONE] signal: notify the user but do NOT stop — re-kick to continue
-        let signaled_done = response_text.contains("[DONE]");
+        // Optional milestone notification — fires if model happens to say [DONE], but doesn't
+        // control flow. Any plain-text response (no tool calls) is treated as done.
+        if response_text.contains("[DONE]") {
+            self.push_system_event("🌸 milestone");
+            tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
+        }
 
         // Handle spawn_agent: show 🤖 N indicator in chat, execute first one
         if !spawn_calls.is_empty() && self.subagent_result_rx.is_none() {
@@ -568,42 +569,8 @@ impl App {
             self.status_message = format!("🔧 Executing tool: {} ...", call.name);
             self.execute_tool_async(call.name.clone(), call.args.clone());
             self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
-        } else if signaled_done {
-            // Agent thinks it's done — handle based on mode
-            self.push_system_event("🌸 Agent signaled [DONE]");
-            tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
-
-            if self.mode == AppMode::Build {
-                // Build mode: auto-continue after [DONE]
-                self.status_message = "🌸 Milestone reached — finding next task".to_string();
-                let continue_msg = Message::new("kick",
-                    "Good work. Now find what's next — more tasks, improvements, \
-                     refactoring, or documentation. Keep going.");
-                if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
-                    self.notify(format!("⚠️ Failed to save continue kick: {}", e));
-                }
-                self.cached_message_count = self.message_buffer.count()
-                    .unwrap_or(self.cached_message_count + 1);
-                let steering = self.steering_text();
-                let messages = self.message_buffer.messages().unwrap_or_default();
-                if let Some(client) = &self.ollama_client {
-                    self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
-                    self.streaming_text.clear();
-                    self.turn_phase = TurnPhase::Streaming;
-                    self.stream_start_time = Some(std::time::Instant::now());
-                    self.tool_iteration_count = 0;
-                    return; // don't clear stream_rx below
-                } else {
-                    self.turn_phase = TurnPhase::Idle;
-                    self.tool_iteration_count = 0;
-                }
-            } else {
-                // Ask/Plan modes: stop after [DONE] and wait for user
-                self.status_message = "🌸 Done — awaiting your input".to_string();
-                self.turn_phase = TurnPhase::Idle;
-                self.tool_iteration_count = 0;
-            }
         } else {
+            // No tool calls — plain response, treat as done
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
                 self.notify("⚠️ Max tool iterations reached — resetting");
                 self.tool_iteration_count = 0;
@@ -612,7 +579,7 @@ impl App {
                     return;
                 }
             } else if self.mode == AppMode::Build {
-                // Build mode: plain text with no [DONE] — nudge to keep going
+                // Build mode: auto-continue
                 self.inject_continue_kick();
                 return;
             } else {
@@ -913,7 +880,7 @@ impl App {
             AppMode::Build =>
                 "MODE: BUILD (autonomous). Execute immediately and continuously. \
                  Read todos, write code, run tests, commit. Do not wait for permission. \
-                 Work through tasks end-to-end. Say [DONE] at each milestone then continue.",
+                 Work through tasks end-to-end. Continue to the next task when one is done.",
         };
         let mut base = format!(
             "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
@@ -959,11 +926,7 @@ impl App {
              3. Work on task (use all tools freely)\n\
              4. Update todo status to done\n\
              5. Commit: commit 'message'\n\
-             6. Say [DONE] when milestone reached, then continue to next task\n\
-             \n\
-             Say [DONE] when a task is complete — this notifies the user as a milestone.\n\
-             After [DONE], immediately find and begin the next task: todos, improvements, refactoring, docs.\n\
-             Work is continuous; [DONE] is a checkpoint, not a stop."
+             6. Continue to the next task"
         );
         if let Some(ctx) = &self.agents_context {
             base.push_str("\n\n--- AGENTS.md ---\n");

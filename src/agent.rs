@@ -351,7 +351,7 @@ impl Agent {
              <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_k=40<|end_tool>\n\
              For divisible tasks, spawn subagents: <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"description\"<|end_tool>\n\
              Subagents run in parallel; combine results for final output.\n\
-             Always use the <|tool>...</|end_tool> format, followed by [DONE] when complete."
+             When done with a task, respond with plain text — no special marker needed."
         );
         steering.format_for_system_prompt()
     }
@@ -373,8 +373,9 @@ impl Agent {
 
         let steering = SteeringDirective::custom(
             "Use tools to complete this task. Format tool calls as:\n\
-             [TOOL: name args]\n\
-             After execution, include results in your next response. Respond with [DONE] when complete."
+             <|tool>name<|tool_sep>arg<|end_tool>\n\
+             After execution, include results in your next response. \
+             When the task is fully complete, respond with plain text summarising the result."
         );
         let query_with_steering = format!(
             "{}\n{}",
@@ -426,15 +427,9 @@ impl Agent {
             let format = detect_tool_format(&self.config.model);
             let tool_calls = parse_tool_calls_with_format(&llm_output, format);
 
+            // No tool calls = task complete (model gave a plain response)
             if tool_calls.is_empty() {
-                if Self::is_done(&llm_output) {
-                    return Ok(llm_output);
-                }
-                messages.push(OllamaMessage {
-                    role: "user".to_string(),
-                    content: "Complete the task or respond with [DONE].".to_string(),
-                });
-                continue;
+                return Ok(llm_output);
             }
 
             // Execute tools — set_params is handled locally, others via registry
@@ -462,10 +457,6 @@ impl Agent {
                 role: "user".to_string(),
                 content: injection,
             });
-
-            if Self::is_done(&llm_output) {
-                return Ok(llm_output);
-            }
         }
     }
 
