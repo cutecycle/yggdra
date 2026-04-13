@@ -86,6 +86,16 @@ async fn main() -> Result<()> {
         config
     };
 
+    // Ensure config file is created on every startup, regardless of mode
+    if let Err(e) = config.save() {
+        eprintln!("⚠️  Failed to save config: {}", e);
+    }
+
+    // Terraform: ensure .yggdra subdirectories exist
+    let yggdra_dir = cwd.join(".yggdra");
+    let _ = std::fs::create_dir_all(yggdra_dir.join("log"));
+    let _ = std::fs::create_dir_all(yggdra_dir.join("todo"));
+
     // Spawn filesystem watcher for config.json and AGENTS.md changes
     let config_watcher_rx = match crate::watcher::spawn_watcher(cwd.clone()) {
         Ok((rx, _handle)) => {

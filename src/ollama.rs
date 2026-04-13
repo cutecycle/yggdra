@@ -105,8 +105,8 @@ impl OllamaClient {
     /// Create a new Ollama client and validate connection
     pub async fn new(endpoint: &str, model: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
             .build()?;
 
         let ollama_client = Self {
@@ -199,7 +199,8 @@ impl OllamaClient {
             // offline notices etc.) and must not be forwarded to the model.
             // The actual system prompt comes from the `steering` parameter above.
             if msg.role == "system" || msg.role == "clock" { continue; }
-            let role = if msg.role == "tool" { "user" } else { &msg.role };
+            // "kick" and "tool" are forwarded to the model as "user" turns
+            let role = if msg.role == "tool" || msg.role == "kick" { "user" } else { &msg.role };
             ollama_messages.push(OllamaMessage {
                 role: role.to_string(),
                 content: msg.content.clone(),

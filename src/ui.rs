@@ -47,9 +47,12 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "shell",  description: "Run a shell command inline",          keywords: "run exec shell bash command terminal", fill: "/shell " },
     PaletteCommand { name: "help",   description: "Show commands & keybindings",       keywords: "commands keyboard shortcuts guide", fill: "/help" },
     PaletteCommand { name: "estimate", description: "Show project completion estimate",  keywords: "progress percentage done metrics", fill: "/estimate" },
+    PaletteCommand { name: "endpoint", description: "Change Ollama endpoint URL",      keywords: "ollama server endpoint url connection", fill: "/endpoint " },
+    PaletteCommand { name: "model",  description: "Switch AI model",                    keywords: "model switch change llm ollama",   fill: "/model " },
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "params", description: "Set model params (temperature, top_k…)", keywords: "temperature top_k top_p repeat penalty params sampling", fill: "/set_params " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
+    PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
@@ -206,6 +209,8 @@ pub struct App {
     agents_config: crate::config::AgentsConfig,
     /// Last time a build-mode kick was fired — for watchdog recovery
     last_build_kick: std::time::Instant,
+    /// Whether gradient background is enabled in message area
+    gradient_enabled: bool,
 }
 
 impl App {
@@ -243,6 +248,7 @@ impl App {
         let log_sender = Some(crate::msglog::start(log_dir.clone()));
 
         let initial_mode = config.mode;
+        let gradient_enabled = config.ui_settings.gradient_enabled;
 
         // Parse AGENTS.md into structured config for model + param defaults
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -291,6 +297,7 @@ impl App {
             runtime_params: crate::config::ModelParams::default(),
             agents_config,
             last_build_kick: std::time::Instant::now(),
+            gradient_enabled,
         }
     }
 
@@ -525,28 +532,35 @@ impl App {
             self.execute_tool_async(call.name.clone(), call.args.clone());
             self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
         } else if signaled_done {
-            // Agent thinks it's done — notify user but inject a continue kick
-            self.push_system_event("🌸 Agent signaled [DONE] — notifying & continuing…");
+            // Agent thinks it's done — handle based on mode
+            self.push_system_event("🌸 Agent signaled [DONE]");
             tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
-            self.status_message = "🌸 Milestone reached — finding next task".to_string();
-            // Re-kick with a continue prompt so the loop doesn't idle
-            let continue_msg = Message::new("system",
-                "Good work. Now find what's next — more tasks, improvements, \
-                 refactoring, or documentation. Keep going.");
-            if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
-                self.notify(format!("⚠️ Failed to save continue kick: {}", e));
-            }
-            self.cached_message_count = self.message_buffer.count()
-                .unwrap_or(self.cached_message_count + 1);
-            // Immediately start next streaming turn
-            let steering = self.steering_text();
-            let messages = self.message_buffer.messages().unwrap_or_default();
-            if let Some(client) = &self.ollama_client {
-                self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
-                self.streaming_text.clear();
-                self.turn_phase = TurnPhase::Streaming;
-                self.tool_iteration_count = 0;
+
+            if self.mode == AppMode::Build {
+                // Build mode: auto-continue after [DONE]
+                self.status_message = "🌸 Milestone reached — finding next task".to_string();
+                let continue_msg = Message::new("kick",
+                    "Good work. Now find what's next — more tasks, improvements, \
+                     refactoring, or documentation. Keep going.");
+                if let Err(e) = self.message_buffer.add_and_persist(continue_msg) {
+                    self.notify(format!("⚠️ Failed to save continue kick: {}", e));
+                }
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+                let steering = self.steering_text();
+                let messages = self.message_buffer.messages().unwrap_or_default();
+                if let Some(client) = &self.ollama_client {
+                    self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
+                    self.streaming_text.clear();
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.tool_iteration_count = 0;
+                } else {
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
+                }
             } else {
+                // Ask/Plan modes: stop after [DONE] and wait for user
+                self.status_message = "🌸 Done — awaiting your input".to_string();
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
             }
@@ -573,9 +587,10 @@ impl App {
         self.stream_rx = None;
     }
 
-    /// Inject a system message and immediately start a new streaming turn (for Build mode & /ctx)
+    /// Inject a continue-kick message and immediately start a new streaming turn (for Build mode & /ctx)
     fn inject_continue_kick(&mut self) {
-        let kick = Message::new("system", "Keep going. Find the next task or improvement.");
+        // Use "kick" role: forwarded to Ollama as "user" but hidden from UI rendering
+        let kick = Message::new("kick", "Keep going. Find the next task or improvement.");
         if let Err(e) = self.message_buffer.add_and_persist(kick) {
             self.notify(format!("⚠️ Continue kick persist error: {}", e));
         }
@@ -1067,6 +1082,9 @@ impl App {
         let mut exchange_idx: usize = 0;
 
         for msg in messages_list.iter() {
+            // Skip internal kick messages — they're for the model, not the user
+            if msg.role == "kick" { continue; }
+
             // Solarized-light-friendly pastel bands — no explicit fg so terminal default
             // dark text shows through. Works on both light and dark terminals.
             let (emoji, bg_tint, show_band) = match msg.role.as_str() {
@@ -1151,6 +1169,20 @@ impl App {
         // Bottom-anchored rendering: skip lines from the top based on scroll position
         // lines_to_skip = total_height - viewport_height - scroll_offset
         let lines_to_skip = (total_height - viewport_height - effective_scroll as i32).max(0);
+
+        // Render gradient background if enabled
+        if self.gradient_enabled {
+            let gradient_paras = self.render_gradient_background(messages_area);
+            for (y_offset, para) in gradient_paras.iter().enumerate() {
+                let gradient_area = Rect {
+                    x: messages_area.x,
+                    y: messages_area.y + y_offset as u16,
+                    width: messages_area.width,
+                    height: 1,
+                };
+                f.render_widget(para, gradient_area);
+            }
+        }
 
         let mut skipped: i32 = 0;
         let mut current_y = messages_area.top();
@@ -1618,6 +1650,12 @@ impl App {
                 return;
             }
             self.handle_tool_command(&command).await;
+        } else if command.starts_with("/endpoint ") {
+            let endpoint = command.strip_prefix("/endpoint ").unwrap_or("").trim();
+            self.handle_endpoint_command(endpoint).await;
+        } else if command.starts_with("/model ") {
+            let model = command.strip_prefix("/model ").unwrap_or("").trim();
+            self.handle_model_command(model).await;
         } else if command == "/models" {
             self.handle_models_command().await;
         } else if command.starts_with("/set_params") {
@@ -1701,6 +1739,9 @@ impl App {
                 let current = self.config.context_window.unwrap_or(4096);
                 self.notify(format!("❌ Usage: /ctx <number> (current: {})", current));
             }
+        } else if command == "/gradient" || command.starts_with("/gradient ") {
+            let arg = command.strip_prefix("/gradient").unwrap_or("").trim();
+            self.handle_gradient_command(arg);
         } else if command.starts_with("/copycode") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_copycode(n).await;
@@ -1728,11 +1769,86 @@ impl App {
             "📖 Commands:\n\
              /help         - Show this help\n\
              /estimate     - Show project completion estimate\n\
-             /models       - List models\n\
-             /plan         - Switch to Plan mode\n\
+             /endpoint URL - Change Ollama endpoint\n\
+             /model NAME   - Switch AI model\n\
+             /models       - List available models\n\
+             /ctx NUM      - Set context window size\n\
+             /set_params K=V - Set model params (temperature, top_k, etc.)\n\
+             /mode MODE    - Switch mode (ask/plan/build)\n\
+             /gradient     - Toggle gradient background\n\
+             /checkpoint   - Save session checkpoint\n\
+             /clear        - Archive conversation to scrollback\n\
+             /tasks        - Show task dependency graph\n\
+             /gaps         - Show knowledge gaps\n\
              /tool CMD     - Execute tool\n\n\
-             Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive)\n\n\
+             Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only)\n\n\
              Keybindings: Enter-Submit | Esc-Clear | Ctrl+C-Exit".to_string();
+    }
+
+    /// Render a vertical gradient background across the given area with interpolated colors
+    /// Returns a vector of paragraphs with increasing opacity effect
+    fn render_gradient_background(&self, area: Rect) -> Vec<Paragraph<'static>> {
+        let mut gradients = Vec::new();
+        let height = area.height as usize;
+        
+        // Linear RGB interpolation between start and end colors
+        let start = self.theme.gradient_start;
+        let end = self.theme.gradient_end;
+        
+        for y in 0..height {
+            // Interpolation factor: 0 at top, 1 at bottom
+            let t = if height > 1 {
+                y as f32 / (height - 1) as f32
+            } else {
+                0.5
+            };
+            
+            // Extract RGB values and interpolate
+            let color = match (start, end) {
+                (Color::Rgb(sr, sg, sb), Color::Rgb(er, eg, eb)) => {
+                    let r = (sr as f32 + (er as f32 - sr as f32) * t) as u8;
+                    let g = (sg as f32 + (eg as f32 - sg as f32) * t) as u8;
+                    let b = (sb as f32 + (eb as f32 - sb as f32) * t) as u8;
+                    Color::Rgb(r, g, b)
+                }
+                _ => start,
+            };
+            
+            // Create a paragraph with a single space and the interpolated background color
+            let para = Paragraph::new(" ")
+                .style(Style::default().bg(color));
+            gradients.push(para);
+        }
+        
+        gradients
+    }
+
+    /// Handle /gradient command — toggle pastel gradient background
+    fn handle_gradient_command(&mut self, arg: &str) {
+        match arg {
+            "on" => {
+                self.gradient_enabled = true;
+                self.config.ui_settings.gradient_enabled = true;
+                let _ = self.config.save();
+                self.notify("✨ Gradient background enabled");
+            }
+            "off" => {
+                self.gradient_enabled = false;
+                self.config.ui_settings.gradient_enabled = false;
+                let _ = self.config.save();
+                self.notify("✨ Gradient background disabled");
+            }
+            "toggle" | "" => {
+                self.gradient_enabled = !self.gradient_enabled;
+                self.config.ui_settings.gradient_enabled = self.gradient_enabled;
+                let _ = self.config.save();
+                let status = if self.gradient_enabled { "enabled" } else { "disabled" };
+                self.notify(format!("✨ Gradient background {}", status));
+            }
+            _ => {
+                self.notify("❌ Usage: /gradient on|off|toggle");
+            }
+        }
     }
 
     fn show_estimate(&mut self) {
@@ -2145,6 +2261,55 @@ impl App {
         }
     }
 
+    /// Handle /endpoint command — change Ollama endpoint URL
+    async fn handle_endpoint_command(&mut self, endpoint: &str) {
+        if endpoint.is_empty() {
+            self.notify(format!("🔌 Current endpoint: {}\nUsage: /endpoint <url>", self.config.endpoint));
+            return;
+        }
+
+        self.status_message = format!("🔌 Connecting to {}…", endpoint);
+        match OllamaClient::new(endpoint, &self.config.model).await {
+            Ok(client) => {
+                self.config.endpoint = endpoint.to_string();
+                let _ = self.config.save();
+                self.ollama_client = Some(client);
+                self.notify(format!("✅ Endpoint changed to {}", endpoint));
+            }
+            Err(e) => {
+                self.notify(format!("❌ Failed to connect to {}: {}", endpoint, e));
+            }
+        }
+    }
+
+    /// Handle /model command — change the AI model
+    async fn handle_model_command(&mut self, model: &str) {
+        if model.is_empty() {
+            self.notify(format!("🌸 Current model: {}\nUsage: /model <name>\nTip: Use /models to list available models", self.config.model));
+            return;
+        }
+
+        match &self.ollama_client {
+            Some(client) => {
+                self.status_message = format!("🌸 Switching to {}…", model);
+                match OllamaClient::new(&self.config.endpoint, model).await {
+                    Ok(new_client) => {
+                        self.config.model = model.to_string();
+                        let _ = self.config.save();
+                        self.ollama_client = Some(new_client);
+                        self.notify(format!("✅ Switched to model: {}", model));
+                        self.inject_continue_kick();
+                    }
+                    Err(e) => {
+                        self.notify(format!("❌ Failed to switch to {}: {}", model, e));
+                    }
+                }
+            }
+            None => {
+                self.notify("⚠️ Ollama not connected");
+            }
+        }
+    }
 
     /// Handle configuration changes from filesystem watcher
     async fn handle_config_change(&mut self, change: crate::watcher::ConfigChange) {
