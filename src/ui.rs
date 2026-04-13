@@ -859,27 +859,29 @@ impl App {
              You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
              AVAILABLE TOOLS:\n\
              • rg — ripgrep search: find patterns in files/dirs\n\
-             • editfile — read files (or create if missing)\n\
-             • spawn — execute commands: ls, git, cargo, python, etc.\n\
+             • editfile — read a file\n\
+             • writefile — write/create a file with new content\n\
+             • spawn — run commands: ls, git, cargo, python, etc.\n\
              • commit — git commit changes\n\
              • python — run Python code\n\
-             • ruste — compile & execute Rust code\n\
-             • think — reasoning block (think whenever you want)\n\
+             • ruste — compile & run Rust code\n\
+             • think — reasoning block (use freely)\n\
              TOOL FORMAT (Qwen/Gemma):\n\
              <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
              TOOL EXAMPLES:\n\
              <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
-             <|tool>editfile<|tool_sep>Cargo.toml<|end_tool> — read or update manifest\n\
-             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list current directory\n\
-             <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit changes\n\
+             <|tool>editfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
+             <|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {{}}<|end_tool> — write file\n\
+             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
+             <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n\
              Never say \"I cannot access files.\" Use rg or spawn instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
              \n\
-             PROJECT DIRECTORIES:\n\
-             • .yggdra/todo/ — markdown task files (status, requirements, hints). Discover with rg\n\
-             • .yggdra/log/ — session history by timestamp. Review with spawn\n\
+             PROJECT DIRS:\n\
+             • .yggdra/todo/ — task files (status, requirements, hints). Find with rg\n\
+             • .yggdra/log/ — session history by timestamp. Read with spawn\n\
              • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
-             • .yggdra/knowledge/INDEX.md — auto-generated index of indexed categories (refreshes in background)\n\
+             • .yggdra/knowledge/INDEX.md — indexed category list (auto-refreshed)\n\
              \n\
              KNOWLEDGE BASE:\n\
              Check INDEX.md first to see which categories are indexed.\n\
@@ -896,7 +898,7 @@ impl App {
              6. Say [DONE] when milestone reached, then continue to next task\n\
              \n\
              Say [DONE] when a task is complete — this notifies the user as a milestone.\n\
-             After [DONE], immediately find and begin the next task: todos, improvements, refactoring, documentation.\n\
+             After [DONE], immediately find and begin the next task: todos, improvements, refactoring, docs.\n\
              Work is continuous; [DONE] is a checkpoint, not a stop."
         );
         if let Some(ctx) = &self.agents_context {
