@@ -60,7 +60,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --frozen --target ${{ matrix.target }}
 
       - name: Package archive (Linux / macOS)
         if: matrix.archive == 'tar.gz'

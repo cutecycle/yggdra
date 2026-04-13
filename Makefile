@@ -10,7 +10,7 @@ BINDIR  := $(PREFIX)/bin
 BINARY  := yggdra
 TARGET  := target/release/$(BINARY)
 
-.PHONY: all build install uninstall clean publish release
+.PHONY: all build install uninstall clean publish release vendor
 
 all: build
 
@@ -50,3 +50,11 @@ release:
 	git tag -a "v$(VERSION)" -m "v$(VERSION)"
 	git push && git push --tags
 	cargo publish
+
+# Vendor all dependencies into vendor/ and commit
+# Run after any `cargo update` or adding new dependencies
+vendor:
+	cargo vendor
+	git add vendor/ Cargo.lock .cargo/config.toml
+	git diff --cached --quiet || git commit -m "chore: update vendored dependencies"
+	@echo "✅ vendor/ updated and committed"

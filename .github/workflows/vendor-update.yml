@@ -1,0 +1,45 @@
+name: Update Vendored Dependencies
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  vendor-update:
+    name: Update vendor/
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update dependencies
+        run: cargo update
+
+      - name: Re-vendor
+        run: cargo vendor
+
+      - name: Check for changes
+        id: diff
+        run: |
+          git diff --quiet vendor/ Cargo.lock && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automated/vendor-update
+          commit-message: "chore: update vendored dependencies"
+          title: "chore: update vendored dependencies"
+          body: |
+            Automated weekly vendor update.
+
+            Changes to `vendor/` and `Cargo.lock` from `cargo update && cargo vendor`.
+          labels: dependencies
