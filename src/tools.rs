@@ -1,5 +1,5 @@
 //! Tools system for agentic execution.
-//! Defines the Tool trait and implements 6 core tools for local execution.
+//! Defines the Tool trait and implements 7 core tools for local execution.
 
 use anyhow::{anyhow, Result};
 use std::fs;
@@ -243,6 +243,58 @@ impl Tool for EditfileTool {
     }
 }
 
+// ===== Writefile Tool (writefile) =====
+
+pub struct WritefileTool;
+
+impl WritefileTool {
+    fn contains_escape_attempt(path: &str) -> bool {
+        path.contains("../") || path.contains("..\\")
+    }
+}
+
+impl Tool for WritefileTool {
+    fn name(&self) -> &str {
+        "writefile"
+    }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        let path = args.split('\x00').next().unwrap_or("").trim();
+        if path.is_empty() {
+            return Err(anyhow!("writefile: empty file path"));
+        }
+        if Self::contains_escape_attempt(path) {
+            return Err(anyhow!("writefile: path traversal attempt blocked: {}", path));
+        }
+        if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
+            return Err(anyhow!("writefile: system file edit blocked: {}", path));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        self.validate_input(args)?;
+
+        let mut parts = args.splitn(2, '\x00');
+        let path_str = parts.next().unwrap_or("").trim();
+        let content = parts.next().unwrap_or("");
+
+        let path = Path::new(path_str);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("writefile: failed to create dirs for {}: {}", path_str, e))?;
+            }
+        }
+
+        fs::write(path, content)
+            .map_err(|e| anyhow!("writefile: failed to write {}: {}", path_str, e))?;
+
+        let line_count = content.lines().count();
+        Ok(format!("✅ wrote {} ({} lines)", path_str, line_count))
+    }
+}
+
 // ===== Commit Tool (commit) =====
 
 pub struct CommitTool;
@@ -469,13 +521,14 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create a new registry with all 6 tools
+    /// Create a new registry with all 7 tools
     pub fn new() -> Self {
         let mut tools: std::collections::HashMap<String, Box<dyn Tool>> = std::collections::HashMap::new();
 
         tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
         tools.insert("spawn".to_string(), Box::new(SpawnTool) as Box<dyn Tool>);
         tools.insert("editfile".to_string(), Box::new(EditfileTool) as Box<dyn Tool>);
+        tools.insert("writefile".to_string(), Box::new(WritefileTool) as Box<dyn Tool>);
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
         tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
@@ -613,10 +666,64 @@ mod tests {
         assert!(tools.contains(&"rg"));
         assert!(tools.contains(&"spawn"));
         assert!(tools.contains(&"editfile"));
+        assert!(tools.contains(&"writefile"));
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
+    }
+
+    #[test]
+    fn test_writefile_validation() {
+        let tool = WritefileTool;
+
+        // Path traversal blocked
+        assert!(tool.validate_input("../../../etc/passwd\x00content").is_err());
+
+        // System files blocked
+        assert!(tool.validate_input("/etc/shadow\x00content").is_err());
+
+        // Empty path fails
+        assert!(tool.validate_input("\x00content").is_err());
+
+        // Valid path passes
+        assert!(tool.validate_input("some/file.txt\x00hello").is_ok());
+    }
+
+    #[test]
+    fn test_writefile_roundtrip() {
+        use std::env;
+        let dir = env::temp_dir();
+        let path = dir.join("yggdra_test_writefile.txt");
+        let path_str = path.to_str().unwrap();
+
+        let tool = WritefileTool;
+        let content = "hello\nworld\n";
+        let args = format!("{}\x00{}", path_str, content);
+
+        let result = tool.execute(&args);
+        assert!(result.is_ok(), "writefile should succeed: {:?}", result);
+        assert!(result.unwrap().contains("2 lines"));
+
+        let read_back = fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, content);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_writefile_creates_parent_dirs() {
+        use std::env;
+        let dir = env::temp_dir().join("yggdra_test_nested_dir");
+        let path = dir.join("subdir").join("file.txt");
+        let path_str = path.to_str().unwrap();
+
+        let tool = WritefileTool;
+        let args = format!("{}\x00test content", path_str);
+        let result = tool.execute(&args);
+        assert!(result.is_ok(), "should create parent dirs: {:?}", result);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

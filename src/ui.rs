@@ -612,12 +612,12 @@ impl App {
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name.as_str() {
-                "editfile" | "commit" | "python" | "ruste" => {
+                "writefile" | "commit" | "python" | "ruste" => {
                     self.push_system_event(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     self.turn_phase = TurnPhase::Idle;
                     return;
                 }
-                _ => {} // rg and spawn are allowed
+                _ => {} // rg, spawn, editfile are allowed (read-only)
             }
         }
 
@@ -649,6 +649,7 @@ impl App {
                 max_iterations: 10,
                 max_recursion_depth: 10,
                 current_depth: 1,
+                app_mode: crate::config::AppMode::Build,
             };
             let result = crate::spawner::spawn_subagent(
                 "ui", &task_id, &task_desc, &endpoint, config,
