@@ -51,7 +51,7 @@ pub async fn spawn_subagent(
         "Subagent {}/{}\n\
          Task: {}\n\
          Complete this task and provide a clear, concise result.\n\
-         You have access to tools: rg, spawn, editfile, commit, python, ruste.\n\
+         You have access to tools: rg, spawn, readfile, writefile, commit, python, ruste.\n\
          Respond with [DONE] when complete.",
         parent_id, task_id, task_description
     );

@@ -338,12 +338,15 @@ impl Agent {
         let steering = SteeringDirective::custom(
             "You are an agentic assistant with access to tools and subagent spawning. \
              When you need to execute tasks, use the <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool> format for tool calls.\n\
-             Available tools: rg, spawn, editfile, writefile, commit, python, ruste, set_params.\n\
-             - editfile: read a file. writefile: write/create a file with new content.\n\
+             Available tools: rg, spawn, readfile, writefile, commit, python, ruste, set_params.\n\
+             - readfile: read a file (full, no truncation). readfile path start end for a line range.\n\
+             - writefile: write/create a file with new content.\n\
+             - editfile: alias for readfile (legacy).\n\
              Examples:\n\
              <|tool>rg<|tool_sep>TODO<|tool_sep>.yggdra/todo/<|end_tool>\n\
              <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool>\n\
-             <|tool>editfile<|tool_sep>src/main.rs<|end_tool>\n\
+             <|tool>readfile<|tool_sep>src/main.rs<|end_tool>\n\
+             <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool>\n\
              <|tool>writefile<|tool_sep>src/main.rs<|tool_sep>fn main() {\n    println!(\"hello\");\n}\n<|end_tool>\n\
              <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_k=40<|end_tool>\n\
              For divisible tasks, spawn subagents: <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"description\"<|end_tool>\n\

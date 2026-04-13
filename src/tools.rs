@@ -190,58 +190,78 @@ impl Tool for SpawnTool {
 
 // ===== Editfile Tool (editfile) =====
 
-pub struct EditfileTool;
+pub struct ReadfileTool;
 
-impl EditfileTool {
+impl ReadfileTool {
     fn contains_escape_attempt(path: &str) -> bool {
         path.contains("../") || path.contains("..\\")
     }
 }
 
-impl Tool for EditfileTool {
+impl Tool for ReadfileTool {
     fn name(&self) -> &str {
-        "editfile"
+        "readfile"
     }
 
     fn validate_input(&self, args: &str) -> Result<()> {
         if args.is_empty() {
-            return Err(anyhow!("editfile: empty file path"));
+            return Err(anyhow!("readfile: empty file path"));
         }
-        let path = args.trim_matches('"').trim_matches('\'');
-        
+        let path = args.split_whitespace().next().unwrap_or("")
+            .trim_matches('"').trim_matches('\'');
+
         if Self::contains_escape_attempt(path) {
-            return Err(anyhow!("editfile: path traversal attempt blocked: {}", path));
+            return Err(anyhow!("readfile: path traversal attempt blocked: {}", path));
         }
-
-        // Check if path is within reasonable bounds (not absolute to system dirs)
         if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
-            return Err(anyhow!("editfile: system file edit blocked: {}", path));
+            return Err(anyhow!("readfile: system file blocked: {}", path));
         }
-
         Ok(())
     }
 
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        let file_path = args.trim_matches('"').trim_matches('\'');
-        let path = Path::new(file_path);
+        // Parse: "path [start_line [end_line]]"
+        let mut parts = args.splitn(3, char::is_whitespace);
+        let file_path = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'');
+        let start_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+        let end_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
 
-        if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| anyhow!("editfile: failed to read {}: {}", file_path, e))?;
-            let line_count = content.lines().count();
-            if content.len() > 8000 {
-                let truncated: String = content.chars().take(8000).collect();
-                Ok(format!("📄 {} ({} lines, truncated):\n{}\n...", file_path, line_count, truncated))
-            } else {
-                Ok(format!("📄 {} ({} lines):\n{}", file_path, line_count, content))
-            }
-        } else {
-            Ok(format!("📄 {} does not exist yet", file_path))
+        let path = Path::new(file_path);
+        if !path.exists() {
+            return Ok(format!("📄 {} does not exist yet", file_path));
         }
+
+        let content = fs::read_to_string(path)
+            .map_err(|e| anyhow!("readfile: failed to read {}: {}", file_path, e))?;
+        let total_lines = content.lines().count();
+
+        if let Some(start) = start_line {
+            let start = start.max(1);
+            let end = end_line.unwrap_or(start + 99).min(total_lines);
+            let selected: String = content.lines()
+                .enumerate()
+                .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
+                .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
+                .collect();
+            return Ok(format!(
+                "📄 {} (lines {}-{} of {}):\n{}",
+                file_path, start, end, total_lines, selected
+            ));
+        }
+
+        // Full file — no truncation, line-numbered
+        let numbered: String = content.lines()
+            .enumerate()
+            .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
+            .collect();
+        Ok(format!("📄 {} ({} lines):\n{}", file_path, total_lines, numbered))
     }
 }
+
+// Alias so old tool calls using "editfile" still work
+pub type EditfileTool = ReadfileTool;
 
 // ===== Writefile Tool (writefile) =====
 
@@ -521,13 +541,14 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create a new registry with all 7 tools
+    /// Create a new registry with all tools
     pub fn new() -> Self {
         let mut tools: std::collections::HashMap<String, Box<dyn Tool>> = std::collections::HashMap::new();
 
         tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
         tools.insert("spawn".to_string(), Box::new(SpawnTool) as Box<dyn Tool>);
-        tools.insert("editfile".to_string(), Box::new(EditfileTool) as Box<dyn Tool>);
+        tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
+        tools.insert("editfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>); // alias
         tools.insert("writefile".to_string(), Box::new(WritefileTool) as Box<dyn Tool>);
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
@@ -611,17 +632,20 @@ mod tests {
     }
 
     #[test]
-    fn test_editfile_validation() {
-        let tool = EditfileTool;
-        
+    fn test_readfile_validation() {
+        let tool = ReadfileTool;
+
         // Path traversal blocked
         assert!(tool.validate_input("../../../etc/passwd").is_err());
-        
+
         // System files blocked
         assert!(tool.validate_input("/etc/shadow").is_err());
-        
+
         // Valid paths
         assert!(tool.validate_input("./myfile.txt").is_ok());
+
+        // Line-range args parsed without error
+        assert!(tool.validate_input("src/main.rs 10 50").is_ok());
     }
 
     #[test]
@@ -665,12 +689,13 @@ mod tests {
         
         assert!(tools.contains(&"rg"));
         assert!(tools.contains(&"spawn"));
-        assert!(tools.contains(&"editfile"));
+        assert!(tools.contains(&"readfile"));
+        assert!(tools.contains(&"editfile")); // alias
         assert!(tools.contains(&"writefile"));
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8); // readfile + editfile alias = 8
     }
 
     #[test]

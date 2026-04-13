@@ -914,7 +914,7 @@ impl App {
              You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
              AVAILABLE TOOLS:\n\
              • rg — ripgrep search: find patterns in files/dirs\n\
-             • editfile — read a file\n\
+             • readfile — read a file (optionally: readfile path start end for a line range)\n\
              • writefile — write/create a file with new content\n\
              • spawn — run commands: ls, git, cargo, python, etc.\n\
              • commit — git commit changes\n\
@@ -925,7 +925,8 @@ impl App {
              <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
              TOOL EXAMPLES:\n\
              <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
-             <|tool>editfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
+             <|tool>readfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
+             <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool> — read lines 50-100\n\
              <|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {{}}<|end_tool> — write file\n\
              <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
              <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n\
@@ -946,7 +947,7 @@ impl App {
              \n\
              WORKFLOW:\n\
              1. Discover pending todos: rg TODO .yggdra/todo/\n\
-             2. Read task details: editfile .yggdra/todo/TASKNAME.md\n\
+             2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
              3. Work on task (use all tools freely)\n\
              4. Update todo status to done\n\
              5. Commit: commit 'message'\n\
@@ -961,7 +962,7 @@ impl App {
             base.push_str(ctx);
         } else {
             base.push_str("\n\nNo AGENTS.md exists yet. If you haven't already, explore the \
-                directory and create one with editfile AGENTS.md.");
+                directory and create one with readfile/writefile AGENTS.md.");
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
@@ -1976,11 +1977,11 @@ impl App {
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name {
-                "editfile" | "commit" | "python" | "ruste" => {
+                "writefile" | "commit" | "python" | "ruste" => {
                     self.notify(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     return;
                 }
-                _ => {} // rg and spawn are allowed (read-only)
+                _ => {} // rg, readfile, editfile, spawn are allowed
             }
         }
 
