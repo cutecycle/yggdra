@@ -2620,6 +2620,34 @@ impl App {
 
     /// Format tool output with indented bordered block
     fn format_tool_content(&self, content: &str) -> String {
+        // Pretty-print [TOOL_OUTPUT: name = content] injections
+        if let Some(rest) = content.strip_prefix("[TOOL_OUTPUT: ") {
+            if let Some(eq) = rest.find(" = ") {
+                let name = &rest[..eq];
+                let body = &rest[eq + 3..].trim_end_matches(']');
+                let lines: Vec<&str> = body.lines().collect();
+                let total_lines = lines.len();
+                let total_chars = body.len();
+                let preview: String = lines.iter().take(3)
+                    .map(|l| format!("│  {}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let more = if total_lines > 3 {
+                    format!("\n│  … ({} lines, {} chars total)", total_lines, total_chars)
+                } else {
+                    String::new()
+                };
+                return format!("🔧 {}  ({} lines, {} chars)\n{}{}", name, total_lines, total_chars, preview, more);
+            }
+        }
+        if let Some(rest) = content.strip_prefix("[TOOL_ERROR: ") {
+            if let Some(eq) = rest.find(" = ") {
+                let name = &rest[..eq];
+                let err = rest[eq + 3..].trim_end_matches(']');
+                return format!("❌ {}: {}", name, err);
+            }
+        }
+        // All other tool messages (user /tool, /shell, /mem etc.) — keep │ borders
         let mut result = String::new();
         for line in content.lines() {
             result.push_str("│  ");
