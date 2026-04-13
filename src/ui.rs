@@ -892,8 +892,25 @@ impl App {
      fn steering_text(&self) -> String {
         let os = std::env::consts::OS;
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+        let mode_block = match self.mode {
+            AppMode::Ask =>
+                "MODE: ASK (read-only). You may search and read files, but MUST NOT write files, \
+                 edit code, run commits, or make any changes. Use rg, editfile, spawn (read-only \
+                 commands like ls/cat/git log) only. If asked to make changes, explain what you \
+                 would do but don't do it.",
+            AppMode::Plan =>
+                "MODE: PLAN (interactive). Discuss, analyse, and suggest. Use tools to explore \
+                 and understand the codebase. Prefer explaining your plan before acting. \
+                 Write files and run commits only when the user explicitly asks.",
+            AppMode::Build =>
+                "MODE: BUILD (autonomous). Execute immediately and continuously. \
+                 Read todos, write code, run tests, commit. Do not wait for permission. \
+                 Work through tasks end-to-end. Say [DONE] at each milestone then continue.",
+        };
         let mut base = format!(
             "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
+             {mode_block}\n\
+             \n\
              You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
              AVAILABLE TOOLS:\n\
              • rg — ripgrep search: find patterns in files/dirs\n\
