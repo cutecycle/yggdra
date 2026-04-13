@@ -190,6 +190,8 @@ pub struct App {
     user_scrolled: bool,
     /// Last time a 🕐 clock event was inserted (for 5-min interval markers)
     last_clock: std::time::Instant,
+    /// When the current streaming turn started (for prefill elapsed timer)
+    stream_start_time: Option<std::time::Instant>,
     /// Whether the command palette is open
     palette_open: bool,
     /// Which palette item is highlighted
@@ -292,6 +294,7 @@ impl App {
             scroll_offset: 0,
             user_scrolled: false,
             last_clock: std::time::Instant::now(),
+            stream_start_time: None,
             palette_open: false,
             palette_selection: 0,
             model_picker_open: false,
@@ -494,6 +497,7 @@ impl App {
 
     /// Streaming finished: persist response, check for tool calls, maybe continue
     fn complete_streaming_turn(&mut self) {
+        self.stream_start_time = None;
         if self.streaming_text.is_empty() {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
@@ -586,6 +590,7 @@ impl App {
                     self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
                     self.tool_iteration_count = 0;
                     return; // don't clear stream_rx below
                 } else {
@@ -636,6 +641,7 @@ impl App {
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
             self.tool_iteration_count = 0;
             self.last_build_kick = std::time::Instant::now();
         }
@@ -756,6 +762,7 @@ impl App {
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
         }
     }
 
@@ -839,6 +846,7 @@ impl App {
                     self.stream_rx = Some(rx);
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
                 } else {
                     self.notify("⚠️ Ollama offline — retrying after next message");
                     self.turn_phase = TurnPhase::Idle;
@@ -1327,10 +1335,22 @@ impl App {
         // Smooth robot-yapping animation: static 🤖💬 + cycling dot ligature
         const DOTS: &[&str] = &["·", "··", "···", "····", "···", "··"];
         let dot = DOTS[(self.tick_count / 12) as usize % DOTS.len()];
-        let yap = &format!("🤖💬 {}", dot);
-        let input_hint = match &self.turn_phase {
+        let yap = format!("🤖💬 {}", dot);
+        let prefill_hint;
+        let input_hint: &str = match &self.turn_phase {
             TurnPhase::Idle => "(type message or /help for commands)",
-            TurnPhase::Streaming => yap,
+            TurnPhase::Streaming => {
+                if self.streaming_text.is_empty() {
+                    // Still in prefill — prompt is being processed
+                    let elapsed = self.stream_start_time
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    prefill_hint = format!("🤖 prefill… {}s", elapsed);
+                    &prefill_hint
+                } else {
+                    &yap
+                }
+            }
             TurnPhase::ExecutingTool(_) => "🔧 …",
         };
         let input_text = if self.input_buffer.is_empty() {
@@ -2073,6 +2093,7 @@ impl App {
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
             self.tool_iteration_count = 0;
         }
     }
@@ -2515,6 +2536,7 @@ impl App {
         }
 
         self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
         self.tool_iteration_count = 0;
         self.status_message = "⏳ Streaming response...".to_string();
 
