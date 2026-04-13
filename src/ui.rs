@@ -1192,8 +1192,8 @@ impl App {
             };
 
             rendered.push(RenderedMsg { text: text_content, style, height: height + 1 });
-            // Add blank line for breathing room
-            rendered.push(RenderedMsg { text: "\n".to_string(), style: Style::default(), height: 1 });
+            // Spacer line inherits the message band color so there's no color gap
+            rendered.push(RenderedMsg { text: "\n".to_string(), style, height: 1 });
         }
 
         // Add streaming text as a virtual message at the end
