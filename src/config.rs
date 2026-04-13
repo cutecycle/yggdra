@@ -49,12 +49,20 @@ impl std::str::FromStr for AppMode {
 }
 
 /// UI settings for visual preferences
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UISettings {
     /// Enable subtle vertical gradient background in message area
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub gradient_enabled: bool,
 }
+
+impl Default for UISettings {
+    fn default() -> Self {
+        Self { gradient_enabled: true }
+    }
+}
+
+fn default_true() -> bool { true }
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
