@@ -32,3 +32,4 @@ Thumbs.db
 .yggdra/log/
 .yggdra/gaps
 .yggdra/todo/
+.yggdra/debug.log

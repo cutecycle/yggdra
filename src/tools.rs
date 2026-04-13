@@ -198,6 +198,21 @@ impl ReadfileTool {
     }
 }
 
+/// Expand a leading `~/` to the user's home directory.
+fn expand_tilde(path: &str) -> std::borrow::Cow<str> {
+    if path.starts_with("~/") || path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            let expanded = if path == "~" {
+                home.to_string_lossy().into_owned()
+            } else {
+                format!("{}/{}", home.to_string_lossy(), &path[2..])
+            };
+            return std::borrow::Cow::Owned(expanded);
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 impl Tool for ReadfileTool {
     fn name(&self) -> &str {
         "readfile"
@@ -224,11 +239,12 @@ impl Tool for ReadfileTool {
 
         // Parse: "path [start_line [end_line]]"
         let mut parts = args.splitn(3, char::is_whitespace);
-        let file_path = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'');
+        let raw_path = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'');
         let start_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
         let end_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
 
-        let path = Path::new(file_path);
+        let file_path = expand_tilde(raw_path);
+        let path = Path::new(file_path.as_ref());
         if !path.exists() {
             return Ok(format!("📄 {} does not exist yet", file_path));
         }
@@ -296,10 +312,11 @@ impl Tool for WritefileTool {
         self.validate_input(args)?;
 
         let mut parts = args.splitn(2, '\x00');
-        let path_str = parts.next().unwrap_or("").trim();
+        let raw_path = parts.next().unwrap_or("").trim();
         let content = parts.next().unwrap_or("");
 
-        let path = Path::new(path_str);
+        let path_str = expand_tilde(raw_path);
+        let path = Path::new(path_str.as_ref());
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
@@ -534,6 +551,20 @@ impl Tool for RusteTool {
     }
 }
 
+// ===== Think Tool (no-op chain-of-thought) =====
+
+pub struct ThinkTool;
+
+impl Tool for ThinkTool {
+    fn name(&self) -> &str { "think" }
+    fn validate_input(&self, _args: &str) -> Result<()> { Ok(()) }
+    fn execute(&self, _args: &str) -> Result<String> {
+        // Chain-of-thought tool — model uses this to reason out loud.
+        // We acknowledge it and let the model continue.
+        Ok("ok".to_string())
+    }
+}
+
 // ===== Tool Registry =====
 
 pub struct ToolRegistry {
@@ -553,6 +584,7 @@ impl ToolRegistry {
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
         tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
+        tools.insert("think".to_string(), Box::new(ThinkTool) as Box<dyn Tool>);
 
         Self { tools }
     }
@@ -695,7 +727,8 @@ mod tests {
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
-        assert_eq!(tools.len(), 8); // readfile + editfile alias = 8
+        assert!(tools.contains(&"think"));
+        assert_eq!(tools.len(), 9); // readfile + editfile alias + think = 9
     }
 
     #[test]

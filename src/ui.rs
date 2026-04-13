@@ -61,6 +61,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
     PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
+    PaletteCommand { name: "save",   description: "Save current plan as a todo task",    keywords: "save plan todo task write markdown",  fill: "/save" },
     PaletteCommand { name: "mode",  description: "Cycle or set mode (ask/plan/build)", keywords: "mode switch cycle toggle ask plan build", fill: "/mode " },
     PaletteCommand { name: "copycode",  description: "Copy code block from last reply",   keywords: "copy code block clipboard snippet", fill: "/copycode" },
     PaletteCommand { name: "copytext",  description: "Copy full last reply as plain text", keywords: "copy text clipboard message",      fill: "/copytext" },
@@ -220,6 +221,8 @@ pub struct App {
     last_build_kick: std::time::Instant,
     /// Whether gradient background is enabled in message area
     gradient_enabled: bool,
+    /// Adaptive detection: thinking model suppresses <|tool> content — use bracket format
+    thinking_suppresses_content: bool,
 }
 
 impl App {
@@ -310,6 +313,7 @@ impl App {
             agents_config,
             last_build_kick: std::time::Instant::now(),
             gradient_enabled,
+            thinking_suppresses_content: false,
         }
     }
 
@@ -433,9 +437,15 @@ impl App {
                         self.scroll_offset = 0;
                     }
                 }
-                Ok(StreamEvent::Done(prompt_tokens, gen_tokens)) => {
+                Ok(StreamEvent::Done(prompt_tokens, gen_tokens, had_thinking)) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
                     self.total_tokens_used += prompt_tokens + gen_tokens;
+                    // Adaptive detection: if model had thinking but no content, it suppresses content via <|tool>
+                    if had_thinking && self.streaming_text.trim().is_empty() && !self.thinking_suppresses_content {
+                        self.thinking_suppresses_content = true;
+                        self.refresh_steering();
+                        self.notify("🔀 Detected thinking model — switched to bracket tool format".to_string());
+                    }
                     self.complete_streaming_turn();
                     return;
                 }
@@ -525,9 +535,6 @@ impl App {
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
 
-        // Save as todo in plan mode
-        self.save_plan_as_todo(&response_text);
-
         // Fire-and-forget gap reflection: ask the model what it wished it knew
         if let Some(client) = self.ollama_client.clone() {
             let model = self.config.model.clone();
@@ -566,18 +573,36 @@ impl App {
             self.execute_subagent_async(task_id.clone(), task_desc.clone());
             self.turn_phase = TurnPhase::ExecutingTool(format!("spawn_agent:{}", task_id));
         } else if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
-            // Execute FIRST tool call only (one per turn to avoid dependency issues)
-            let call = &tool_calls[0];
-            // For writefile, show the parsed path so the user can verify it was parsed correctly
-            let status = if call.name == "writefile" {
-                let path = call.args.split('\x00').next().unwrap_or("?");
-                format!("🔧 writefile: {}", path)
+            if tool_calls.len() > 1 {
+                // Batch execution for multiple tool calls
+                let calls: Vec<(String, String)> = tool_calls.iter()
+                    .map(|c| (c.name.clone(), c.args.clone()))
+                    .collect();
+                self.status_message = format!("🔧 Executing {} tools in batch...", calls.len());
+                let (tx, rx) = oneshot::channel::<ToolResult>();
+                tokio::spawn(async move {
+                    let output = App::execute_tools_batch_async(calls).await;
+                    let _ = tx.send(ToolResult {
+                        tool_name: "__batch__".to_string(),
+                        _args: String::new(),
+                        output: Ok(output),
+                    });
+                });
+                self.tool_result_rx = Some(rx);
+                self.turn_phase = TurnPhase::ExecutingTool("batch".to_string());
             } else {
-                format!("🔧 Executing tool: {} ...", call.name)
-            };
-            self.status_message = status;
-            self.execute_tool_async(call.name.clone(), call.args.clone());
-            self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
+                // Single tool call — existing behavior
+                let call = &tool_calls[0];
+                let status = if call.name == "writefile" {
+                    let path = call.args.split('\x00').next().unwrap_or("?");
+                    format!("🔧 writefile: {}", path)
+                } else {
+                    format!("🔧 Executing tool: {} ...", call.name)
+                };
+                self.status_message = status;
+                self.execute_tool_async(call.name.clone(), call.args.clone());
+                self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
+            }
         } else {
             // No tool calls — plain response, treat as done
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
@@ -789,12 +814,17 @@ impl App {
 
                 let output_text = match &result.output {
                     Ok(output) => {
-                        let truncated = if output.len() > 4000 {
-                            format!("{}...(truncated)", &output[..4000])
-                        } else {
+                        // Pre-formatted batch output — use directly
+                        if output.starts_with("[TOOL_OUTPUT:") || output.starts_with("[TOOL_ERROR:") {
                             output.clone()
-                        };
-                        format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncated)
+                        } else {
+                            let truncated = if output.len() > 4000 {
+                                format!("{}...(truncated)", &output[..4000])
+                            } else {
+                                output.clone()
+                            };
+                            format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncated)
+                        }
                     }
                     Err(e) => format!("[TOOL_ERROR: {} = {}]", result.tool_name, e),
                 };
@@ -811,7 +841,10 @@ impl App {
                     .unwrap_or(self.cached_message_count + 1);
 
                 // Start next streaming generation with full history including tool result
-                self.tool_iteration_count += 1;
+                // think tool calls don't count against the iteration limit
+                if result.tool_name != "think" {
+                    self.tool_iteration_count += 1;
+                }
                 self.status_message = format!(
                     "⏳ Continuing after {} (step {}/{})...",
                     result.tool_name, self.tool_iteration_count, MAX_TOOL_ITERATIONS
@@ -886,9 +919,8 @@ impl App {
                  commands like ls/cat/git log) only. If asked to make changes, explain what you \
                  would do but don't do it.",
             AppMode::Plan =>
-                "MODE: PLAN (interactive). Discuss, analyse, and suggest. Use tools to explore \
-                 and understand the codebase. Prefer explaining your plan before acting. \
-                 Write files and run commits only when the user explicitly asks.",
+                "MODE: PLAN (interactive). Discuss, analyse, and suggest. \
+                 rg/readfile/spawn freely; writefile/commit only when user explicitly requests changes.",
             AppMode::Build =>
                 "MODE: BUILD (autonomous). Execute immediately and continuously. \
                  Read todos, write code, run tests, commit. Do not wait for permission. \
@@ -908,16 +940,40 @@ impl App {
              • python — run Python code\n\
              • ruste — compile & run Rust code\n\
              • think — reasoning block (use freely)\n\
-             TOOL FORMAT (Qwen/Gemma):\n\
-             <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
-             TOOL EXAMPLES:\n\
-             <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
-             <|tool>readfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
-             <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool> — read lines 50-100\n\
-             <|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {{}}<|end_tool> — write file\n\
-             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
-             <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n\
-             Never say \"I cannot access files.\" Use rg or spawn instead.\n\
+             TOOL FORMAT:\n"
+        );
+        // Select tool format based on model name or adaptive detection
+        let model_lower = self.config.model.to_lowercase();
+        let use_legacy_format = self.thinking_suppresses_content
+            || model_lower.contains("heretic")
+            || model_lower.contains("qwq")
+            || model_lower.contains("thinking")
+            || model_lower.contains("r1")
+            || model_lower.contains("reasoner");
+        if use_legacy_format {
+            base.push_str(
+                "             [TOOL: name arg1 arg2]\n\
+                 TOOL EXAMPLES:\n\
+                 [TOOL: rg TODO src/] — find TODO comments\n\
+                 [TOOL: readfile Cargo.toml] — read file\n\
+                 [TOOL: writefile src/foo.rs\ncontent here] — write file\n\
+                 [TOOL: spawn ls .yggdra/todo/] — list dir\n\
+                 [TOOL: commit \"feat: description\"] — commit\n"
+            );
+        } else {
+            base.push_str(
+                "             <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
+                 TOOL EXAMPLES:\n\
+                 <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
+                 <|tool>readfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
+                 <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool> — read lines 50-100\n\
+                 <|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {{}}<|end_tool> — write file\n\
+                 <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
+                 <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n"
+            );
+        }
+        base.push_str(
+            "Never say \"I cannot access files.\" Use rg or spawn instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
              \n\
              PROJECT DIRS:\n\
@@ -948,6 +1004,29 @@ impl App {
                 directory and create one with readfile/writefile AGENTS.md.");
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
+    }
+
+    /// No-op: steering is computed dynamically on each call to steering_text().
+    /// Called after adaptive format detection or model switches for consistency.
+    fn refresh_steering(&mut self) {}
+
+    /// Execute multiple tool calls in parallel (blocking) and return pre-formatted output.
+    async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>) -> String {
+        tokio::task::spawn_blocking(move || {
+            let registry = ToolRegistry::new();
+            let results: Vec<String> = tool_calls
+                .into_iter()
+                .map(|(name, args)| {
+                    match registry.execute(&name, &args) {
+                        Ok(output) => format!("[TOOL_OUTPUT: {} = {}]", name, output),
+                        Err(e) => format!("[TOOL_ERROR: {} = {}]", name, e),
+                    }
+                })
+                .collect();
+            results.join("\n")
+        })
+        .await
+        .unwrap_or_else(|e| format!("[TOOL_ERROR: batch = {}]", e))
     }
 
     /// Autocompact: drop oldest messages (keep last 20 conversational turns)
@@ -1035,8 +1114,8 @@ impl App {
     fn persist_message(&mut self, msg: Message) -> bool {
         // Insert clock marker every 5 minutes
         if self.last_clock.elapsed() >= std::time::Duration::from_secs(300) {
-            let timestamp = chrono::Local::now().format("%H:%M").to_string();
-            let clock_msg = Message::new("clock", format!("🕐 {}", timestamp));
+            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+            let clock_msg = Message::new("clock", timestamp);
             if let Some(sender) = &self.log_sender as &Option<crate::msglog::LogSender> {
                 sender.log(&clock_msg);
             }
@@ -1540,6 +1619,8 @@ impl App {
                         if let Err(e) = self.config.save() {
                             eprintln!("⚠️ Failed to save config: {}", e);
                         }
+                        self.thinking_suppresses_content = false;
+                        self.refresh_steering();
                         let endpoint = self.config.endpoint.clone();
                         match OllamaClient::new(&endpoint, &model_name).await {
                             Ok(client) => {
@@ -1771,6 +1852,9 @@ impl App {
             self.handle_tasks_command();
         } else if command == "/gaps" {
             self.handle_gaps_command();
+        } else if command == "/save" {
+            self.save_plan_as_todo();
+            self.notify("📋 Plan saved as todo".to_string());
         } else if command.starts_with("/checkpoint") {
             let name = command.strip_prefix("/checkpoint ").unwrap_or("").trim();
             self.handle_checkpoint_command(if name.is_empty() { None } else { Some(name) });
@@ -2251,11 +2335,16 @@ impl App {
         urls
     }
 
-    /// Save assistant response as todo item in plan mode
-    fn save_plan_as_todo(&mut self, message: &str) {
-        if self.mode != AppMode::Plan {
-            return; // Only save in plan mode
-        }
+    /// Save last assistant response as todo item (triggered by /save command)
+    fn save_plan_as_todo(&mut self) {
+        let message = match self.last_assistant_message() {
+            Some(m) => m,
+            None => {
+                self.notify("❌ No assistant message to save".to_string());
+                return;
+            }
+        };
+        let message = message.clone();
 
         // Generate a filename from the first line of the message
         let first_line = message.lines().next().unwrap_or("plan");

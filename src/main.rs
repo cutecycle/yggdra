@@ -1,5 +1,6 @@
 mod battery;
 mod config;
+mod dlog;
 mod gaps;
 mod knowledge_index;
 mod msglog;
@@ -95,6 +96,10 @@ async fn main() -> Result<()> {
     let yggdra_dir = cwd.join(".yggdra");
     let _ = std::fs::create_dir_all(yggdra_dir.join("log"));
     let _ = std::fs::create_dir_all(yggdra_dir.join("todo"));
+
+    // Init debug log (writes to .yggdra/debug.log)
+    dlog::init();
+    dlog::log(&format!("startup: mode={} model={} endpoint={}", config.mode, config.model, config.endpoint));
 
     // Spawn filesystem watcher for config.json and AGENTS.md changes
     let config_watcher_rx = match crate::watcher::spawn_watcher(cwd.clone()) {

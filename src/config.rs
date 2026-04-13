@@ -69,8 +69,11 @@ fn default_true() -> bool { true }
 pub struct Config {
     pub endpoint: String,
     pub model: String,
-    /// Context window size in tokens (None = use 4096 default)
+    /// Context window size in tokens (None = use model default)
     pub context_window: Option<u32>,
+    /// Max chars per tool output injected into context (None = 3000).
+    /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
+    pub tool_output_cap: Option<usize>,
     /// Application mode: ask, build, or plan
     #[serde(default)]
     pub mode: AppMode,
@@ -128,6 +131,9 @@ pub struct ModelParams {
     /// Max tokens to generate; -1 = unlimited
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
+    /// Context window size forwarded to Ollama as num_ctx
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
 }
 
 impl ModelParams {
@@ -138,6 +144,7 @@ impl ModelParams {
             && self.top_p.is_none()
             && self.repeat_penalty.is_none()
             && self.num_predict.is_none()
+            && self.num_ctx.is_none()
     }
 
     /// Merge: self wins for any field set; base fills the rest.
@@ -148,6 +155,7 @@ impl ModelParams {
             top_p: self.top_p.or(base.top_p),
             repeat_penalty: self.repeat_penalty.or(base.repeat_penalty),
             num_predict: self.num_predict.or(base.num_predict),
+            num_ctx: self.num_ctx.or(base.num_ctx),
         }
     }
 
@@ -230,6 +238,7 @@ impl ModelParams {
         if let Some(v) = self.top_p       { parts.push(format!("top_p={}", v)); }
         if let Some(v) = self.repeat_penalty { parts.push(format!("repeat_penalty={}", v)); }
         if let Some(v) = self.num_predict  { parts.push(format!("num_predict={}", v)); }
+        if let Some(v) = self.num_ctx      { parts.push(format!("num_ctx={}", v)); }
         if parts.is_empty() { "defaults".to_string() } else { parts.join(" ") }
     }
 }
@@ -240,6 +249,7 @@ struct FileConfig {
     endpoint: Option<String>,
     model: Option<String>,
     context_window: Option<u32>,
+    tool_output_cap: Option<usize>,
     mode: Option<String>,
     knowledge_index: Option<KnowledgeIndexSettings>,
     #[serde(default)]
@@ -278,6 +288,7 @@ impl Default for Config {
             endpoint: "http://localhost:11434".to_string(),
             model: "qwen:3.5".to_string(),
             context_window: None,
+            tool_output_cap: None,
             mode: AppMode::Plan,
             knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
@@ -302,6 +313,7 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .or(file.context_window);
+        let tool_output_cap = file.tool_output_cap;
         
         let mode = file.mode
             .and_then(|m| m.parse::<AppMode>().ok())
@@ -311,7 +323,7 @@ impl Config {
         let params = file.params;
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        Config { endpoint, model, context_window, mode, knowledge_index, params, ui_settings }
+        Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params, ui_settings }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -346,6 +358,7 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .or(file.context_window);
+        let tool_output_cap = file.tool_output_cap;
         
         let mode = file.mode
             .and_then(|m| m.parse::<AppMode>().ok())
@@ -354,7 +367,7 @@ impl Config {
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        let cfg = Config { endpoint, model, context_window, mode, knowledge_index, params: file.params, ui_settings };
+        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params: file.params, ui_settings };
         (cfg, validated_client)
     }
 

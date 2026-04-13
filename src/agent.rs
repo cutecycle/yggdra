@@ -24,6 +24,13 @@ pub enum ToolFormat {
 /// Detect expected tool call format from model name
 pub fn detect_tool_format(model: &str) -> ToolFormat {
     let lower = model.to_lowercase();
+    // Thinking/heretic models: <|tool> uses Gemma's own control tokens → model enters
+    // thinking-only mode and produces empty content. Use legacy [TOOL: ...] format instead.
+    if lower.contains("heretic") || lower.contains("qwq") || lower.contains("thinking")
+        || lower.contains("r1") || lower.contains("reasoner")
+    {
+        return ToolFormat::Legacy;
+    }
     // Qwen 4b models emit the <|tool_call> format
     // Match "qwen:4b" or "qwen-4b" but not "qwen:14b", "qwen:24b", etc
     if lower.contains("qwen") && (lower == "qwen:4b" || lower == "qwen-4b" || 
@@ -98,8 +105,9 @@ pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
         Regex::new(r"(?s)<\|?tool_call\|?>[ \t]*call:(\w+)(.*?)(?:<\|end_tool>|</tool_call>|<\|tool_call\|?>)").unwrap()
     });
     
+    // (?s) so .* matches newlines — needed for multiline writefile content
     let re_legacy = RE_LEGACY.get_or_init(|| {
-        Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]").unwrap()
+        Regex::new(r"(?s)\[TOOL:\s+(\w+)\s+(.*?)\]").unwrap()
     });
     
     let mut calls = Vec::new();
@@ -150,10 +158,19 @@ pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
     if calls.is_empty() {
         for cap in re_legacy.captures_iter(output) {
             if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                calls.push(ToolCall {
-                    name: name_match.as_str().to_string(),
-                    args: args_match.as_str().trim().to_string(),
-                });
+                let name = name_match.as_str().to_string();
+                let raw = args_match.as_str().trim();
+                // writefile: first line is path, rest is file content
+                let args = if name == "writefile" {
+                    if let Some(nl) = raw.find('\n') {
+                        format!("{}\x00{}", raw[..nl].trim(), &raw[nl + 1..])
+                    } else {
+                        raw.to_string()
+                    }
+                } else {
+                    raw.to_string()
+                };
+                calls.push(ToolCall { name, args });
             }
         }
     }
@@ -176,7 +193,8 @@ pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<Too
     });
     
     let re_legacy = RE_LEGACY.get_or_init(|| {
-        Regex::new(r"\[TOOL:\s+(\w+)\s+(.+?)\]").unwrap()
+        // (?s) so .* matches newlines — needed for multiline writefile content
+        Regex::new(r"(?s)\[TOOL:\s+(\w+)\s+(.*?)\]").unwrap()
     });
     
     let mut calls = Vec::new();
@@ -223,10 +241,18 @@ pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<Too
         ToolFormat::Legacy => {
             for cap in re_legacy.captures_iter(output) {
                 if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                    calls.push(ToolCall {
-                        name: name_match.as_str().to_string(),
-                        args: args_match.as_str().trim().to_string(),
-                    });
+                    let name = name_match.as_str().to_string();
+                    let raw = args_match.as_str().trim();
+                    let args = if name == "writefile" {
+                        if let Some(nl) = raw.find('\n') {
+                            format!("{}\x00{}", raw[..nl].trim(), &raw[nl + 1..])
+                        } else {
+                            raw.to_string()
+                        }
+                    } else {
+                        raw.to_string()
+                    };
+                    calls.push(ToolCall { name, args });
                 }
             }
         }
@@ -427,7 +453,7 @@ impl Agent {
                         }
                         llm_output.push_str(&tok);
                     }
-                    StreamEvent::Done(_, _) => break,
+                    StreamEvent::Done(..) => break,
                     StreamEvent::Error(e) => return Err(anyhow!("stream error: {}", e)),
                 }
             }
