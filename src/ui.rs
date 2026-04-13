@@ -53,6 +53,8 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "params", description: "Set model params (temperature, top_k…)", keywords: "temperature top_k top_p repeat penalty params sampling", fill: "/set_params " },
     PaletteCommand { name: "temperature", description: "Set sampling temperature (0.0–2.0)", keywords: "temperature heat creativity sampling randomness", fill: "/temperature " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
+    PaletteCommand { name: "toolcap", description: "Set tool output cap (chars, or 'off')", keywords: "tool output truncate cap compress context", fill: "/toolcap " },
+    PaletteCommand { name: "compress", description: "Summarize session and reset context", keywords: "compress summarize archive context reset memory", fill: "/compress" },
     PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
@@ -566,7 +568,14 @@ impl App {
         } else if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
             // Execute FIRST tool call only (one per turn to avoid dependency issues)
             let call = &tool_calls[0];
-            self.status_message = format!("🔧 Executing tool: {} ...", call.name);
+            // For writefile, show the parsed path so the user can verify it was parsed correctly
+            let status = if call.name == "writefile" {
+                let path = call.args.split('\x00').next().unwrap_or("?");
+                format!("🔧 writefile: {}", path)
+            } else {
+                format!("🔧 Executing tool: {} ...", call.name)
+            };
+            self.status_message = status;
             self.execute_tool_async(call.name.clone(), call.args.clone());
             self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
         } else {
@@ -605,7 +614,8 @@ impl App {
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
         if let Some(client) = &self.ollama_client {
-            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
+            let (tool_cap, ctx_win) = self.compression_params();
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
@@ -725,7 +735,8 @@ impl App {
         if let Some(client) = self.ollama_client.clone() {
             let messages: Vec<Message> = self.message_buffer.messages().unwrap_or_default();
             let steering = self.steering_text();
-            let rx = client.generate_streaming(messages, Some(&steering), self.effective_params());
+            let (tool_cap, ctx_win) = self.compression_params();
+            let rx = client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win);
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
@@ -809,7 +820,8 @@ impl App {
                 if let Some(client) = &self.ollama_client {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
-                    let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params());
+                    let (tool_cap, ctx_win) = self.compression_params();
+                    let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
                     self.stream_rx = Some(rx);
                     self.streaming_text.clear();
                     self.turn_phase = TurnPhase::Streaming;
@@ -989,7 +1001,18 @@ impl App {
 
     /// Compute the effective model params: runtime_params > config.json > AGENTS.md defaults.
     fn effective_params(&self) -> crate::config::ModelParams {
-        self.runtime_params.merge_over(&self.config.params.merge_over(&self.agents_config.params))
+        let mut p = self.runtime_params.merge_over(&self.config.params.merge_over(&self.agents_config.params));
+        // Inject context_window as num_ctx so Ollama doesn't default to the model's
+        // (often very large) built-in context length, which causes long prefill stalls.
+        if p.num_ctx.is_none() {
+            p.num_ctx = self.config.context_window;
+        }
+        p
+    }
+
+    /// Returns (tool_output_cap, context_window) for smart context compression.
+    fn compression_params(&self) -> (Option<usize>, Option<u32>) {
+        (self.config.tool_output_cap, self.config.context_window)
     }
 
     fn push_system_event(&mut self, text: impl Into<String>) {
@@ -1816,6 +1839,26 @@ impl App {
                 let current = self.config.context_window.unwrap_or(4096);
                 self.notify(format!("❌ Usage: /ctx <number> (current: {})", current));
             }
+        } else if command.starts_with("/toolcap ") {
+            let arg = command.strip_prefix("/toolcap ").unwrap_or("").trim();
+            if arg == "off" || arg == "0" {
+                self.config.tool_output_cap = None;
+                let _ = self.config.save();
+                self.notify("🗜️ Tool output cap disabled (unlimited)");
+            } else if let Ok(n) = arg.parse::<usize>() {
+                if n < 100 {
+                    self.notify("❌ Tool output cap must be at least 100 chars");
+                } else {
+                    self.config.tool_output_cap = Some(n);
+                    let _ = self.config.save();
+                    self.notify(format!("🗜️ Tool output cap set to {} chars", n));
+                }
+            } else {
+                let current = self.config.tool_output_cap.map(|n| n.to_string()).unwrap_or_else(|| "3000 (default)".to_string());
+                self.notify(format!("❌ Usage: /toolcap <chars|off>  (current: {})", current));
+            }
+        } else if command == "/compress" {
+            self.handle_compress().await;
         } else if command == "/gradient" || command.starts_with("/gradient ") {
             let arg = command.strip_prefix("/gradient").unwrap_or("").trim();
             self.handle_gradient_command(arg);
@@ -1850,6 +1893,8 @@ impl App {
              /model NAME   - Switch AI model\n\
              /models       - List available models\n\
              /ctx NUM      - Set context window size\n\
+             /toolcap NUM  - Cap tool outputs at N chars (or 'off'); default 3000\n\
+             /compress     - Summarize session → archive → inject summary\n\
              /set_params K=V - Set model params (temperature, top_k, etc.) — persists\n\
              /temperature N  - Set temperature (0.0–2.0) shorthand\n\
              /mode MODE    - Switch mode (ask/plan/build)\n\
@@ -1899,6 +1944,86 @@ impl App {
         }
         
         gradients
+    }
+
+    /// Handle /compress — summarize session, archive to scrollback, inject summary
+    async fn handle_compress(&mut self) {
+        let msg_count = self.message_buffer.count().unwrap_or(0);
+        if msg_count == 0 {
+            self.notify("📭 Nothing to compress — conversation is empty");
+            return;
+        }
+
+        // Build a compact summary prompt from the current history
+        let messages = match self.message_buffer.messages() {
+            Ok(m) => m,
+            Err(e) => {
+                self.notify(format!("❌ Failed to read messages: {}", e));
+                return;
+            }
+        };
+
+        // Compose a concise transcript to summarize
+        let transcript: String = messages.iter()
+            .filter(|m| m.role != "system" && m.role != "clock")
+            .take(60) // cap at 60 messages for the summarizer
+            .map(|m| {
+                let role = match m.role.as_str() {
+                    "assistant" => "Assistant",
+                    "tool" | "kick" => "ToolResult",
+                    _ => "User",
+                };
+                // Truncate long messages for the summarizer input
+                let content = if m.content.len() > 500 {
+                    format!("{}…", &m.content[..500])
+                } else {
+                    m.content.clone()
+                };
+                format!("[{}]: {}", role, content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let summary_prompt = format!(
+            "Summarize this conversation as a compact bullet list (10 bullets max). \
+             Focus on: what was accomplished, key decisions, files changed, and what was in progress. \
+             Be terse — this summary replaces the full history.\n\n{}",
+            transcript
+        );
+
+        self.notify(format!("🗜️ Summarizing {} messages…", msg_count));
+
+        // Call the model synchronously (non-streaming for simplicity)
+        let summary = if let Some(client) = self.ollama_client.clone() {
+            let summary_msg = vec![crate::message::Message::new("user", &summary_prompt)];
+            let (tool_cap, ctx_win) = self.compression_params();
+            match client.generate(summary_msg, None, &self.effective_params(), tool_cap, ctx_win).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.notify(format!("❌ Summarization failed: {}", e));
+                    return;
+                }
+            }
+        } else {
+            self.notify("❌ No Ollama connection — cannot compress");
+            return;
+        };
+
+        // Archive current messages to scrollback
+        let archived = self.message_buffer.archive_to_scrollback().unwrap_or(0);
+
+        // Inject the summary as context for the next turn
+        let summary_msg = crate::message::Message::new(
+            "assistant",
+            format!("**[Session summary — {} messages archived]**\n\n{}", archived, summary),
+        );
+        if let Err(e) = self.message_buffer.add_and_persist(summary_msg) {
+            self.notify(format!("❌ Failed to store summary: {}", e));
+            return;
+        }
+
+        self.cached_message_count = self.message_buffer.count().unwrap_or(0);
+        self.notify(format!("✅ Compressed: {} messages → summary injected", archived));
     }
 
     /// Handle /gradient command — toggle pastel gradient background
@@ -2053,7 +2178,8 @@ impl App {
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
         if let Some(client) = &self.ollama_client {
-            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params()));
+            let (tool_cap, ctx_win) = self.compression_params();
+            self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
@@ -2511,7 +2637,8 @@ impl App {
 
         // Start streaming — returns immediately, tokens arrive via channel
         if let Some(client) = &self.ollama_client {
-            let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text), self.effective_params());
+            let (tool_cap, ctx_win) = self.compression_params();
+            let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
             self.last_build_kick = std::time::Instant::now();

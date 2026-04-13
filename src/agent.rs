@@ -51,9 +51,23 @@ fn build_tool_args(name: &str, args_section: &str) -> String {
         // Split on first two <|tool_sep>: sections[0] is empty, [1] is path, [2..] is content
         let mut sections = args_section.splitn(3, "<|tool_sep>");
         let _empty = sections.next();
-        let path = sections.next().map(|s| s.trim()).unwrap_or("");
-        let content = sections.next().unwrap_or("");
-        format!("{}\x00{}", path, content)
+        let path_raw = sections.next().map(|s| s.trim()).unwrap_or("");
+        let content_raw = sections.next();
+
+        let (path, content) = if let Some(c) = content_raw {
+            // Normal case: two <|tool_sep> separators — path and content are distinct
+            (path_raw, c)
+        } else {
+            // Fallback: model used a newline instead of a second <|tool_sep>
+            // e.g. <|tool>writefile<|tool_sep>path\ncontent<|end_tool>
+            if let Some(nl) = path_raw.find('\n') {
+                (&path_raw[..nl], &path_raw[nl + 1..])
+            } else {
+                (path_raw, "")
+            }
+        };
+
+        format!("{}\x00{}", path.trim(), content)
     } else {
         args_section
             .split("<|tool_sep>")
@@ -780,6 +794,18 @@ mod tests {
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
         assert_eq!(parts[0], "out.txt");
         assert_eq!(parts[1], content);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_writefile_newline_fallback() {
+        // Model uses newline instead of second <|tool_sep> between path and content
+        let output = "<|tool>writefile<|tool_sep>src/foo.rs\nfn main() {\n    println!(\"hi\");\n}\n<|end_tool>";
+        let calls = parse_tool_calls(output);
+        assert_eq!(calls.len(), 1, "should parse despite missing second tool_sep");
+        let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
+        assert_eq!(parts[0], "src/foo.rs", "path must not include content");
+        assert!(parts[1].contains("fn main"), "content should be recovered");
+        assert!(parts[1].contains('\n'), "newlines must be in content");
     }
 
     #[test]
