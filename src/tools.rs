@@ -22,22 +22,6 @@ pub trait Tool: Send + Sync {
 
 pub struct RipgrepTool;
 
-impl RipgrepTool {
-    fn is_potentially_dangerous(s: &str) -> bool {
-        // Block shell metacharacters and obvious escape attempts
-        let shell_metacharacters = vec![
-            "|", "&", ";", ">", "<", "$", "`",
-        ];
-        let dangerous_commands = vec![
-            "rm ", "dd ", "curl ", "wget ",
-            "nc ", "/bin/", "/usr/bin/",
-        ];
-        let lower = s.to_lowercase();
-        shell_metacharacters.iter().any(|p| lower.contains(p))
-            || dangerous_commands.iter().any(|p| lower.contains(p))
-    }
-}
-
 impl Tool for RipgrepTool {
     fn name(&self) -> &str {
         "rg"
@@ -46,9 +30,6 @@ impl Tool for RipgrepTool {
     fn validate_input(&self, args: &str) -> Result<()> {
         if args.is_empty() {
             return Err(anyhow!("rg: empty arguments"));
-        }
-        if Self::is_potentially_dangerous(args) {
-            return Err(anyhow!("rg: dangerous pattern detected in: {}", args));
         }
         Ok(())
     }
@@ -706,17 +687,20 @@ mod tests {
     #[test]
     fn test_ripgrep_validation() {
         let tool = RipgrepTool;
-        
-        // Valid inputs (including language names as search patterns)
+
+        // Valid inputs — plain patterns
         assert!(tool.validate_input(r#""pattern" "/path""#).is_ok());
         assert!(tool.validate_input("python .").is_ok());
         assert!(tool.validate_input("bash_script test/").is_ok());
-        
-        // Invalid inputs (shell metacharacters and dangerous commands)
+
+        // Shell metacharacters are fine: rg runs via Command::new, not a shell
+        assert!(tool.validate_input("pattern | other").is_ok());
+        assert!(tool.validate_input("pattern; rm -rf").is_ok());
+        assert!(tool.validate_input("pattern && curl foo").is_ok());
+        assert!(tool.validate_input("foo > /dev/null").is_ok());
+
+        // Only truly empty input is rejected
         assert!(tool.validate_input("").is_err());
-        assert!(tool.validate_input("pattern | other").is_err());
-        assert!(tool.validate_input("pattern; rm -rf").is_err());
-        assert!(tool.validate_input("pattern && curl foo").is_err());
     }
 
     #[test]
