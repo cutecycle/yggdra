@@ -97,6 +97,20 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(yggdra_dir.join("log"));
     let _ = std::fs::create_dir_all(yggdra_dir.join("todo"));
 
+    // Create .yggdra/knowledge symlink → ~/source/repos/offlinebase if missing
+    let knowledge_link = yggdra_dir.join("knowledge");
+    if !knowledge_link.exists() && !knowledge_link.is_symlink() {
+        if let Some(home) = dirs::home_dir() {
+            let offlinebase = home.join("source").join("repos").join("offlinebase");
+            if offlinebase.exists() {
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&offlinebase, &knowledge_link);
+                #[cfg(not(unix))]
+                let _ = std::fs::create_dir_all(&knowledge_link); // fallback on non-unix
+            }
+        }
+    }
+
     // Init debug log (writes to .yggdra/debug.log)
     dlog::init();
     dlog::log(&format!("startup: mode={} model={} endpoint={}", config.mode, config.model, config.endpoint));

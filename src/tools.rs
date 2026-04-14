@@ -276,8 +276,97 @@ impl Tool for ReadfileTool {
     }
 }
 
-// Alias so old tool calls using "editfile" still work
-pub type EditfileTool = ReadfileTool;
+// ===== Editfile Tool (editfile) — surgical old→new replacement =====
+
+pub struct EditfileTool;
+
+impl EditfileTool {
+    fn contains_escape_attempt(path: &str) -> bool {
+        path.contains("../") || path.contains("..\\")
+    }
+
+    /// Parse args into (path, old_str, new_str).
+    ///
+    /// Standard format (from <|tool_sep> → \x00):  `path\x00old\x00new`
+    /// Legacy bracket format:                       `path\nold\n---\nnew`
+    fn parse_args(args: &str) -> Option<(String, String, String)> {
+        if args.contains('\x00') {
+            let mut parts = args.splitn(3, '\x00');
+            let path = parts.next()?.trim().to_string();
+            let old  = parts.next()?.to_string();
+            let new  = parts.next()?.to_string();
+            Some((path, old, new))
+        } else {
+            // Legacy: first line = path, remainder split on "\n---\n"
+            let (path_line, rest) = args.split_once('\n')?;
+            let (old, new) = rest.split_once("\n---\n")?;
+            Some((path_line.trim().to_string(), old.to_string(), new.to_string()))
+        }
+    }
+}
+
+impl Tool for EditfileTool {
+    fn name(&self) -> &str {
+        "editfile"
+    }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        let path = match Self::parse_args(args) {
+            Some((p, _, _)) => p,
+            None => return Err(anyhow!("editfile: expected format: path<sep>old_text<sep>new_text")),
+        };
+        if path.is_empty() {
+            return Err(anyhow!("editfile: empty file path"));
+        }
+        if Self::contains_escape_attempt(&path) {
+            return Err(anyhow!("editfile: path traversal attempt blocked: {}", path));
+        }
+        if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
+            return Err(anyhow!("editfile: system file edit blocked: {}", path));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        self.validate_input(args)?;
+
+        let (raw_path, old_str, new_str) = Self::parse_args(args)
+            .ok_or_else(|| anyhow!("editfile: could not parse arguments"))?;
+
+        if old_str.is_empty() {
+            return Err(anyhow!("editfile: old_str is empty — cannot replace nothing"));
+        }
+
+        let path_str = expand_tilde(&raw_path);
+        let path = Path::new(path_str.as_ref());
+
+        if !path.exists() {
+            return Err(anyhow!("editfile: {} does not exist (use writefile to create)", path_str));
+        }
+
+        let content = fs::read_to_string(path)
+            .map_err(|e| anyhow!("editfile: failed to read {}: {}", path_str, e))?;
+
+        let count = content.matches(old_str.as_str()).count();
+        if count == 0 {
+            return Err(anyhow!("editfile: text not found in {} — read the file first to get exact text", path_str));
+        }
+        if count > 1 {
+            return Err(anyhow!("editfile: ambiguous — {} occurrences found in {} — include more context to be specific", count, path_str));
+        }
+
+        let old_lines = old_str.lines().count();
+        let new_lines = new_str.lines().count();
+        let patched = content.replacen(old_str.as_str(), new_str.as_str(), 1);
+
+        fs::write(path, &patched)
+            .map_err(|e| anyhow!("editfile: failed to write {}: {}", path_str, e))?;
+
+        let diff = new_lines as i64 - old_lines as i64;
+        let sign = if diff >= 0 { "+" } else { "" };
+        Ok(format!("✅ edited {} ({}{}  lines)", path_str, sign, diff))
+    }
+}
 
 // ===== Writefile Tool (writefile) =====
 
@@ -579,7 +668,7 @@ impl ToolRegistry {
         tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
         tools.insert("spawn".to_string(), Box::new(SpawnTool) as Box<dyn Tool>);
         tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
-        tools.insert("editfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>); // alias
+        tools.insert("editfile".to_string(), Box::new(EditfileTool) as Box<dyn Tool>);
         tools.insert("writefile".to_string(), Box::new(WritefileTool) as Box<dyn Tool>);
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
@@ -722,13 +811,13 @@ mod tests {
         assert!(tools.contains(&"rg"));
         assert!(tools.contains(&"spawn"));
         assert!(tools.contains(&"readfile"));
-        assert!(tools.contains(&"editfile")); // alias
+        assert!(tools.contains(&"editfile")); // real edit tool
         assert!(tools.contains(&"writefile"));
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
         assert!(tools.contains(&"think"));
-        assert_eq!(tools.len(), 9); // readfile + editfile alias + think = 9
+        assert_eq!(tools.len(), 9); // rg spawn readfile editfile writefile commit python ruste think
     }
 
     #[test]
@@ -790,5 +879,80 @@ mod tests {
         let result = registry.execute("nonexistent", "args");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
+    }
+
+    #[test]
+    fn test_editfile_parse_args_standard() {
+        let args = "src/main.rs\x00fn old() {\x00fn new() {";
+        let parsed = EditfileTool::parse_args(args);
+        assert_eq!(parsed, Some(("src/main.rs".to_string(), "fn old() {".to_string(), "fn new() {".to_string())));
+    }
+
+    #[test]
+    fn test_editfile_parse_args_legacy() {
+        let args = "src/main.rs\nfn old() {\n---\nfn new() {";
+        let parsed = EditfileTool::parse_args(args);
+        assert_eq!(parsed, Some(("src/main.rs".to_string(), "fn old() {".to_string(), "fn new() {".to_string())));
+    }
+
+    #[test]
+    fn test_editfile_roundtrip() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_editfile.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "hello world\nfoo bar\n").unwrap();
+
+        let tool = EditfileTool;
+        let args = format!("{}\x00foo bar\x00baz qux", path_str);
+        let result = tool.execute(&args).expect("editfile should succeed");
+        assert!(result.contains("✅"), "result: {}", result);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello world\nbaz qux\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_editfile_not_found() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_editfile_nf.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "hello world\n").unwrap();
+
+        let tool = EditfileTool;
+        let args = format!("{}\x00does not exist\x00replacement", path_str);
+        let err = tool.execute(&args).unwrap_err().to_string();
+        assert!(err.contains("not found"), "error: {}", err);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_editfile_ambiguous() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_editfile_amb.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "foo\nfoo\n").unwrap();
+
+        let tool = EditfileTool;
+        let args = format!("{}\x00foo\x00bar", path_str);
+        let err = tool.execute(&args).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "error: {}", err);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_editfile_empty_old_str() {
+        let tool = EditfileTool;
+        let args = "some/file.txt\x00\x00new content";
+        let err = tool.execute(args).unwrap_err().to_string();
+        assert!(err.contains("empty"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_editfile_validation() {
+        let tool = EditfileTool;
+        assert!(tool.validate_input("../escape\x00old\x00new").is_err());
+        assert!(tool.validate_input("/etc/passwd\x00old\x00new").is_err());
+        assert!(tool.validate_input("valid/path.rs\x00old\x00new").is_ok());
     }
 }

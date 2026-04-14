@@ -376,22 +376,62 @@ impl Agent {
     /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering() -> String {
         let steering = SteeringDirective::custom(
-            "You are an agentic assistant with access to tools and subagent spawning. \
+            "You are an agentic assistant with access to tools and subagent spawning.\n\
              When you need to execute tasks, use the <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool> format for tool calls.\n\
-             Available tools: rg, spawn, readfile, writefile, commit, python, ruste, set_params.\n\
-             - readfile: read a file (full, no truncation). readfile path start end for a line range.\n\
-             - writefile: write/create a file with new content.\n\
-             - editfile: alias for readfile (legacy).\n\
-             Examples:\n\
-             <|tool>rg<|tool_sep>TODO<|tool_sep>.yggdra/todo/<|end_tool>\n\
-             <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool>\n\
-             <|tool>readfile<|tool_sep>src/main.rs<|end_tool>\n\
-             <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool>\n\
-             <|tool>writefile<|tool_sep>src/main.rs<|tool_sep>fn main() {\n    println!(\"hello\");\n}\n<|end_tool>\n\
-             <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_k=40<|end_tool>\n\
-             For divisible tasks, spawn subagents: <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"description\"<|end_tool>\n\
-             Subagents run in parallel; combine results for final output.\n\
-             When done with a task, respond with plain text — no special marker needed."
+             \n\
+             AVAILABLE TOOLS:\n\
+             \n\
+             rg (ripgrep): Search files with patterns. No pipes, redirects, or shell metacharacters allowed.\n\
+               <|tool>rg<|tool_sep>pattern<|tool_sep>directory<|end_tool>\n\
+               HINT: Use this to search .yggdra/knowledge/ for documentation, tutorials, reference materials.\n\
+             \n\
+             spawn: Execute binaries/commands (resolved via PATH). Dangerous system paths blocked.\n\
+               <|tool>spawn<|tool_sep>command<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
+             \n\
+             readfile: Read file contents. Supports line ranges (1-indexed).\n\
+               <|tool>readfile<|tool_sep>path<|end_tool>                   (full file)\n\
+               <|tool>readfile<|tool_sep>path<|tool_sep>10<|tool_sep>50<|end_tool>  (lines 10-50)\n\
+             \n\
+             writefile: Create/overwrite a file with content.\n\
+               <|tool>writefile<|tool_sep>path<|tool_sep>content<|end_tool>\n\
+             \n\
+             editfile: Surgical in-place replacement. Finds exact text match, replaces once.\n\
+               <|tool>editfile<|tool_sep>path<|tool_sep>old_text<|tool_sep>new_text<|end_tool>\n\
+             \n\
+             commit: Create git commit with message.\n\
+               <|tool>commit<|tool_sep>message<|end_tool>\n\
+             \n\
+             python: Run Python script. Network imports (requests, urllib, etc.) are blocked.\n\
+               <|tool>python<|tool_sep>script_path<|end_tool>\n\
+             \n\
+             ruste: Compile and execute Rust code. Network code (TcpStream, reqwest, etc.) is blocked.\n\
+               <|tool>ruste<|tool_sep>rust_file_path<|end_tool>\n\
+             \n\
+             set_params: Adjust LLM parameters at runtime.\n\
+               <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_p=0.9<|tool_sep>top_k=40<|end_tool>\n\
+             \n\
+             spawn_agent: Spawn subagent for parallel task execution.\n\
+               <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"task description\"<|end_tool>\n\
+             \n\
+             OFFLINE KNOWLEDGE BASE:\n\
+             The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories:\n\
+             - Programming: rust, python, go, javascript, c++, typescript, shell, etc.\n\
+             - Platforms: godot, unreal, unity, blender, android, ios, web\n\
+             - Science: physics, chemistry, biology, astronomy, mathematics\n\
+             - Engineering: spacecraft, robotics, networks, databases, algorithms\n\
+             - Reference: standards, specifications, tutorials, research papers\n\
+             STRATEGY: For any question about libraries, frameworks, languages, standards, or techniques:\n\
+             1. Search .yggdra/knowledge/ first with rg to find relevant documentation\n\
+             2. Read the best matches with readfile\n\
+             3. Apply that knowledge to solve the problem\n\
+             This offline base eliminates dependency on internet access and model training cutoff.\n\
+             \n\
+             IMPORTANT NOTES:\n\
+             - Tool output is capped at 3000 chars by default; full output stored in session.\n\
+             - After calling a tool, include the result in your next response and continue reasoning.\n\
+             - Subagents run in parallel; wait for all results before combining for final output.\n\
+             - Path traversal (../) and system files (/etc, /bin) are blocked by security layer.\n\
+             - When task is fully complete, respond with summary of results — no special marker needed."
         );
         steering.format_for_system_prompt()
     }

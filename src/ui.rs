@@ -10,6 +10,7 @@ use crate::theme::Theme;
 use crate::tools::ToolRegistry;
 use crate::metrics::MetricsTracker;
 use anyhow::Result;
+use unicode_width::UnicodeWidthStr;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
@@ -734,8 +735,9 @@ impl App {
             .take(3)
             .collect::<Vec<_>>()
             .join("\n");
-        let preview = if preview.len() > 200 {
-            format!("{}…", &preview[..200])
+        let preview = if preview.chars().count() > 200 {
+            let truncated: String = preview.chars().take(200).collect();
+            format!("{}…", truncated)
         } else {
             preview
         };
@@ -818,8 +820,9 @@ impl App {
                         if output.starts_with("[TOOL_OUTPUT:") || output.starts_with("[TOOL_ERROR:") {
                             output.clone()
                         } else {
-                            let truncated = if output.len() > 4000 {
-                                format!("{}...(truncated)", &output[..4000])
+                            let truncated = if output.chars().count() > 4000 {
+                                let truncated: String = output.chars().take(4000).collect();
+                                format!("{}...(truncated)", truncated)
                             } else {
                                 output.clone()
                             };
@@ -934,7 +937,8 @@ impl App {
              AVAILABLE TOOLS:\n\
              • rg — ripgrep search: find patterns in files/dirs\n\
              • readfile — read a file (optionally: readfile path start end for a line range)\n\
-             • writefile — write/create a file with new content\n\
+             • editfile — patch a file: provide exact old text and new text; fails if not found exactly once\n\
+             • writefile — create or fully overwrite a file\n\
              • spawn — run commands: ls, git, cargo, python, etc.\n\
              • commit — git commit changes\n\
              • python — run Python code\n\
@@ -956,7 +960,8 @@ impl App {
                  TOOL EXAMPLES:\n\
                  [TOOL: rg TODO src/] — find TODO comments\n\
                  [TOOL: readfile Cargo.toml] — read file\n\
-                 [TOOL: writefile src/foo.rs\ncontent here] — write file\n\
+                 [TOOL: editfile src/foo.rs\nold line\n---\nnew line] — patch a file (requires exact match; fails if 0 or 2+ matches)\n\
+                 [TOOL: writefile src/new.rs\ncontent here] — create/overwrite a file\n\
                  [TOOL: spawn ls .yggdra/todo/] — list dir\n\
                  [TOOL: commit \"feat: description\"] — commit\n"
             );
@@ -967,7 +972,8 @@ impl App {
                  <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
                  <|tool>readfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
                  <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool> — read lines 50-100\n\
-                 <|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {{}}<|end_tool> — write file\n\
+                 <|tool>editfile<|tool_sep>src/foo.rs<|tool_sep>old line<|tool_sep>new line<|end_tool> — patch a file (requires exact match; fails if 0 or 2+ matches)\n\
+                 <|tool>writefile<|tool_sep>src/new.rs<|tool_sep>fn main() {{}}<|end_tool> — create/overwrite a file\n\
                  <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
                  <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n"
             );
@@ -1153,7 +1159,7 @@ impl App {
                     Constraint::Length(2),
                     Constraint::Min(5),
                     Constraint::Length(input_height),
-                    Constraint::Length(2),
+                    Constraint::Length(1),
                 ]
                 .as_ref(),
             )
@@ -1247,7 +1253,7 @@ impl App {
             let line_count = text_content.lines().count().max(1);
             let wrap_extra: usize = if area_width > 0 {
                 text_content.lines()
-                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
                     .sum::<u16>() as usize
             } else { 0 };
             let height = (line_count + wrap_extra).max(1) as u16;
@@ -1281,7 +1287,7 @@ impl App {
             let line_count = stream_text.lines().count().max(1);
             let wrap_extra: usize = if area_width > 0 {
                 stream_text.lines()
-                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
                     .sum::<u16>() as usize
             } else { 0 };
             let height = (line_count + wrap_extra).max(1) as u16;
@@ -1297,16 +1303,17 @@ impl App {
         if !self.subagent_live_text.is_empty() {
             let tint = if exchange_idx % 2 == 0 { self.theme.band_b } else { self.theme.band_a };
             // Show last 500 chars to keep it concise
-            let tail = if self.subagent_live_text.len() > 500 {
-                &self.subagent_live_text[self.subagent_live_text.len() - 500..]
+            let tail = if self.subagent_live_text.chars().count() > 500 {
+                let start_idx = self.subagent_live_text.chars().count() - 500;
+                self.subagent_live_text.chars().skip(start_idx).collect::<String>()
             } else {
-                &self.subagent_live_text
+                self.subagent_live_text.clone()
             };
             let sub_text = format!("🔀 subagent: {}▌", tail);
             let line_count = sub_text.lines().count().max(1);
             let wrap_extra: usize = if area_width > 0 {
                 sub_text.lines()
-                    .map(|l| (l.len() as u16).saturating_sub(1) / area_width.max(1))
+                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
                     .sum::<u16>() as usize
             } else { 0 };
             let height = (line_count + wrap_extra).max(1) as u16;
@@ -1384,11 +1391,12 @@ impl App {
         // Scroll indicator in top-right of messages area
         if effective_scroll > 0 {
             let indicator = format!("↑{}", effective_scroll);
-            let ind_x = messages_area.right().saturating_sub(indicator.len() as u16 + 1);
+            let ind_width = indicator.width() as u16 + 1;
+            let ind_x = messages_area.right().saturating_sub(ind_width);
             let ind_area = Rect {
                 x: ind_x,
                 y: messages_area.top(),
-                width: indicator.len() as u16 + 1,
+                width: ind_width,
                 height: 1,
             };
             let ind_widget = Paragraph::new(indicator)
@@ -1567,11 +1575,10 @@ impl App {
             format!("🪙 0/{}", ctx_window)
         };
         let status = format!(
-            "🔢 {} | {} | 💬 {} | {}",
+            "🔢 {} | {} | 💬 {}",
             &self.session.id[..8],
             token_info,
             self.cached_message_count,
-            self.status_message.lines().next().unwrap_or("")
         );
         let status_bar = Paragraph::new(status);
         f.render_widget(status_bar, chunks[3]);
@@ -2058,8 +2065,9 @@ impl App {
                     _ => "User",
                 };
                 // Truncate long messages for the summarizer input
-                let content = if m.content.len() > 500 {
-                    format!("{}…", &m.content[..500])
+                let content = if m.content.chars().count() > 500 {
+                    let truncated: String = m.content.chars().take(500).collect();
+                    format!("{}…", truncated)
                 } else {
                     m.content.clone()
                 };
