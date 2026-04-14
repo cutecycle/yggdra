@@ -2,6 +2,7 @@ pub mod battery;
 pub mod config;
 pub mod dlog;
 pub mod gaps;
+pub mod highlight;
 pub mod knowledge_index;
 pub mod msglog;
 pub mod message;

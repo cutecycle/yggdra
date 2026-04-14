@@ -6,6 +6,39 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Split a string into shell-style arguments, respecting double and single quotes.
+/// Strips the outer quotes from quoted arguments.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_double = false;
+    let mut in_single = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            ' ' | '\t' if !in_double && !in_single => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 /// Tool trait: defines interface for executable tools
 pub trait Tool: Send + Sync {
     /// Unique identifier for the tool
@@ -140,23 +173,17 @@ impl Tool for SpawnTool {
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        let binary = parts[0];
-        let child_args = if parts.len() > 1 { parts[1] } else { "" };
+        let parsed = shell_split(args);
+        let binary = &parsed[0];
+        let child_args = &parsed[1..];
 
         let resolved = Self::resolve_binary(binary)
             .ok_or_else(|| anyhow!("spawn: binary not found: {}", binary))?;
 
-        let output = if child_args.is_empty() {
-            Command::new(&resolved)
-                .output()
-                .map_err(|e| anyhow!("spawn: execution failed: {}", e))?
-        } else {
-            Command::new(&resolved)
-                .args(child_args.split_whitespace())
-                .output()
-                .map_err(|e| anyhow!("spawn: execution failed: {}", e))?
-        };
+        let output = Command::new(&resolved)
+            .args(child_args)
+            .output()
+            .map_err(|e| anyhow!("spawn: execution failed: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -734,6 +761,61 @@ mod tests {
 
         // Non-existent names should return None
         assert!(SpawnTool::resolve_binary("xyzzy_no_such_binary").is_none());
+    }
+
+    #[test]
+    fn test_shell_split_basics() {
+        // Simple whitespace splitting
+        assert_eq!(shell_split("ls -la"), vec!["ls", "-la"]);
+        assert_eq!(shell_split("echo hello world"), vec!["echo", "hello", "world"]);
+
+        // Double-quoted args stay together
+        assert_eq!(
+            shell_split(r#"echo "hello world""#),
+            vec!["echo", "hello world"]
+        );
+
+        // Single-quoted args stay together
+        assert_eq!(
+            shell_split("echo 'hello world'"),
+            vec!["echo", "hello world"]
+        );
+
+        // Mixed quoting
+        assert_eq!(
+            shell_split(r#"grep "foo bar" 'baz qux' file.txt"#),
+            vec!["grep", "foo bar", "baz qux", "file.txt"]
+        );
+
+        // Quotes in the middle of a token
+        assert_eq!(
+            shell_split(r#"echo he"llo wo"rld"#),
+            vec!["echo", "hello world"]
+        );
+
+        // Empty string
+        assert_eq!(shell_split(""), Vec::<String>::new());
+
+        // Extra whitespace
+        assert_eq!(shell_split("  ls   -la  "), vec!["ls", "-la"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_spawn_double_quoted_args() {
+        let tool = SpawnTool;
+
+        // echo with a double-quoted argument should preserve the full string
+        let result = tool.execute(r#"echo "hello world""#).unwrap();
+        assert_eq!(result.trim(), "hello world");
+
+        // single-quoted argument should also work
+        let result = tool.execute("echo 'hello world'").unwrap();
+        assert_eq!(result.trim(), "hello world");
+
+        // unquoted should split normally (echo sees two args)
+        let result = tool.execute("echo hello world").unwrap();
+        assert_eq!(result.trim(), "hello world");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 /// TUI module: minimal terminal UI with streaming responses, tool execution, and multi-window sync
 use crate::agent;
+use crate::battery::BatteryState;
 use crate::config::{Config, AppMode};
+use crate::highlight::Highlighter;
 use crate::message::{Message, MessageBuffer};
 use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
@@ -224,6 +226,14 @@ pub struct App {
     gradient_enabled: bool,
     /// Adaptive detection: thinking model suppresses <|tool> content — use bracket format
     thinking_suppresses_content: bool,
+    /// Inference rate from last completed generation (tokens/second)
+    last_infer_rate: Option<f64>,
+    /// Cached battery power state (refreshed every 30s)
+    on_battery: BatteryState,
+    /// Last time battery status was checked
+    last_battery_check: std::time::Instant,
+    /// Syntax highlighter for code blocks
+    highlighter: Highlighter,
 }
 
 impl App {
@@ -235,12 +245,14 @@ impl App {
         agents_md: Option<String>,
         config_watcher_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::watcher::ConfigChange>>,
     ) -> Self {
-        let message_buffer = MessageBuffer::from_db(&session.messages_db)
+        let mut message_buffer = MessageBuffer::from_db(&session.messages_db)
             .unwrap_or_else(|e| {
                 eprintln!("🌹 Failed to open messages DB: {}", e);
                 MessageBuffer::new(&session.messages_db)
                     .expect("Cannot create message database")
             });
+        // Clean up any kick messages persisted by older versions of yggdra
+        let _ = message_buffer.purge_kicks();
         let task_manager = TaskManager::from_db(&session.tasks_db)
             .unwrap_or_else(|e| {
                 eprintln!("🌹 Failed to open tasks DB: {}", e);
@@ -315,6 +327,10 @@ impl App {
             last_build_kick: std::time::Instant::now(),
             gradient_enabled,
             thinking_suppresses_content: false,
+            last_infer_rate: None,
+            on_battery: crate::battery::battery_state(),
+            last_battery_check: std::time::Instant::now(),
+            highlighter: Highlighter::new(),
         }
     }
 
@@ -334,35 +350,46 @@ impl App {
 
             let is_new_session = self.message_buffer.count().unwrap_or(0) == 0;
             
-            let kick = if self.agents_context.is_none() {
-                // No AGENTS.md — terraforming mode: explore and create it
-                format!(
-                    "New session started in `{cwd}`. \
-                     This directory has no AGENTS.md yet — you need to terraform it. \
-                     First, explore the directory: [TOOL: spawn ls -la .] and read any \
-                     key files (README, Cargo.toml, package.json, etc.). \
-                     Then write an AGENTS.md that describes the project: its purpose, \
-                     structure, build commands, conventions, and any gotchas. \
-                     After writing AGENTS.md, continue with normal autonomous work."
-                )
-            } else if is_new_session {
-                // AGENTS.md exists, new session — normal autonomous kick
-                format!(
-                    "New session started in `{cwd}`. \
-                     Orient yourself: list the directory, check .yggdra/todo/ for pending tasks, \
-                     review .yggdra/log/ history, and begin working autonomously. \
-                     Use tools to explore. When a task is fully complete, continue to the next."
-                )
-            } else {
-                // Session restored with messages — continue work
-                format!(
-                    "Session restored in `{cwd}`. \
-                     Review recent work in chat history. Check .yggdra/todo/ for pending tasks. \
-                     Continue working autonomously. Use tools to explore and progress."
-                )
-            };
-            self.handle_message(&kick).await;
-            self.last_build_kick = std::time::Instant::now();
+            // Only fire startup kick for NEW sessions or terraforming
+            // Restored sessions will be auto-kicked by the 5-second idle watchdog
+            let should_kick = is_new_session || self.agents_context.is_none();
+            
+            if should_kick {
+                let kick = if self.agents_context.is_none() {
+                    // No AGENTS.md — terraforming mode: explore and create it
+                    format!(
+                        "New session started in `{cwd}`. \
+                         This directory has no AGENTS.md yet — you need to terraform it. \
+                         First, explore the directory: [TOOL: spawn ls -la .] and read any \
+                         key files (README, Cargo.toml, package.json, etc.). \
+                         Then write an AGENTS.md that describes the project: its purpose, \
+                         structure, build commands, conventions, and any gotchas. \
+                         After writing AGENTS.md, continue with normal autonomous work."
+                    )
+                } else {
+                    // AGENTS.md exists, new session — normal autonomous kick
+                    format!(
+                        "New session started in `{cwd}`. \
+                         Orient yourself: list the directory, check .yggdra/todo/ for pending tasks, \
+                         review .yggdra/log/ history, and begin working autonomously. \
+                         Use tools to explore. When a task is fully complete, continue to the next."
+                    )
+                };
+                // Use ephemeral kick (like inject_continue_kick) — never persisted to DB
+                let kick_msg = Message::new("kick", &kick);
+                let steering = self.steering_text();
+                let mut messages = self.message_buffer.messages().unwrap_or_default();
+                messages.push(kick_msg);
+                if let Some(client) = &self.ollama_client {
+                    let (tool_cap, ctx_win) = self.compression_params();
+                    self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
+                    self.streaming_text.clear();
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
+                    self.tool_iteration_count = 0;
+                }
+                self.last_build_kick = std::time::Instant::now();
+            }
         }
 
         loop {
@@ -396,6 +423,12 @@ impl App {
             self.check_gap_result();
             // Check for completed subagent execution
             self.check_subagent_result();
+
+            // Refresh battery state every 30 seconds
+            if self.last_battery_check.elapsed() > Duration::from_secs(30) {
+                self.on_battery = crate::battery::battery_state();
+                self.last_battery_check = std::time::Instant::now();
+            }
 
             terminal.draw(|f| self.draw(f))?;
 
@@ -438,9 +471,15 @@ impl App {
                         self.scroll_offset = 0;
                     }
                 }
-                Ok(StreamEvent::Done(prompt_tokens, gen_tokens, had_thinking)) => {
+                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking, eval_duration_ns }) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
                     self.total_tokens_used += prompt_tokens + gen_tokens;
+                    // Compute inference rate (tok/s)
+                    self.last_infer_rate = match eval_duration_ns {
+                        Some(ns) if ns > 0 && gen_tokens > 0 =>
+                            Some(gen_tokens as f64 / (ns as f64 / 1_000_000_000.0)),
+                        _ => None,
+                    };
                     // Adaptive detection: if model had thinking but no content, it suppresses content via <|tool>
                     if had_thinking && self.streaming_text.trim().is_empty() && !self.thinking_suppresses_content {
                         self.thinking_suppresses_content = true;
@@ -456,6 +495,7 @@ impl App {
                     self.stream_rx = None;
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
+                    self.last_infer_rate = None;
                     // Build mode: retry after surfacing the error
                     if self.mode == AppMode::Build {
                         self.inject_continue_kick();
@@ -630,21 +670,18 @@ impl App {
 
     /// Inject a continue-kick message and immediately start a new streaming turn (for Build mode & /ctx)
     fn inject_continue_kick(&mut self) {
-        // Use "kick" role: forwarded to Ollama as "user" but hidden from UI rendering
+        // Kick is ephemeral: appended to the messages list in memory only, never persisted.
+        // Persisting kicks causes them to accumulate in context over long sessions.
         let kick = Message::new("kick", "Keep going. Find the next task or improvement.");
-        if let Err(e) = self.message_buffer.add_and_persist(kick) {
-            self.notify(format!("⚠️ Continue kick persist error: {}", e));
-        }
-        self.cached_message_count = self.message_buffer.count()
-            .unwrap_or(self.cached_message_count + 1);
         let steering = self.steering_text();
-        let messages = self.message_buffer.messages().unwrap_or_default();
+        let mut messages = self.message_buffer.messages().unwrap_or_default();
+        messages.push(kick);
         if let Some(client) = &self.ollama_client {
             let (tool_cap, ctx_win) = self.compression_params();
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
             self.streaming_text.clear();
             self.turn_phase = TurnPhase::Streaming;
-                    self.stream_start_time = Some(std::time::Instant::now());
+            self.stream_start_time = Some(std::time::Instant::now());
             self.tool_iteration_count = 0;
             self.last_build_kick = std::time::Instant::now();
         }
@@ -1076,6 +1113,7 @@ impl App {
         }
 
         self.last_token_counts = (0, 0);
+        self.last_infer_rate = None;
         self.last_warned_ctx_pct = 0; // reset so threshold warnings fire again after compaction
         self.cached_message_count = self.message_buffer.count().unwrap_or(0);
         self.push_system_event(format!(
@@ -1211,9 +1249,19 @@ impl App {
 
         // Pre-compute each message's formatted text, style, and estimated height
         struct RenderedMsg {
-            text: String,
+            content: ratatui::text::Text<'static>,
             style: Style,
             height: u16,
+        }
+
+        fn text_height(text: &ratatui::text::Text, area_width: u16) -> u16 {
+            let line_count = text.lines.len().max(1);
+            let wrap_extra: usize = if area_width > 0 {
+                text.lines.iter()
+                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
+                    .sum::<u16>() as usize
+            } else { 0 };
+            (line_count + wrap_extra).max(1) as u16
         }
 
         let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(messages_list.len() + 1);
@@ -1243,20 +1291,14 @@ impl App {
                 _        => ("💬", None, false),
             };
 
-            let text_content = if msg.role == "tool" || msg.role == "spawn" {
-                format!("{} {}", emoji, self.format_tool_content(&msg.content))
+            let content = if msg.role == "tool" || msg.role == "spawn" {
+                let text_str = format!("{} {}", emoji, self.format_tool_content(&msg.content));
+                ratatui::text::Text::from(text_str)
             } else {
-                format!("{} {}", emoji, self.format_message_content(&msg.content))
+                self.format_message_styled(emoji, &msg.content)
             };
 
-            // Estimate height accounting for line wrapping
-            let line_count = text_content.lines().count().max(1);
-            let wrap_extra: usize = if area_width > 0 {
-                text_content.lines()
-                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
-                    .sum::<u16>() as usize
-            } else { 0 };
-            let height = (line_count + wrap_extra).max(1) as u16;
+            let height = text_height(&content, area_width);
 
             let style = if show_band {
                 // Dark theme: set explicit light fg so text contrasts against dark band
@@ -1270,9 +1312,9 @@ impl App {
                 Style::default()
             };
 
-            rendered.push(RenderedMsg { text: text_content, style, height: height + 1 });
+            rendered.push(RenderedMsg { content, style, height: height + 1 });
             // Spacer line inherits the message band color so there's no color gap
-            rendered.push(RenderedMsg { text: "\n".to_string(), style, height: 1 });
+            rendered.push(RenderedMsg { content: ratatui::text::Text::from("\n".to_string()), style, height: 1 });
         }
 
         // Add streaming text as a virtual message at the end
@@ -1284,19 +1326,14 @@ impl App {
                 String::new()
             };
             let stream_text = format!("🤖{} {}▌", agent_badge, self.streaming_text);
-            let line_count = stream_text.lines().count().max(1);
-            let wrap_extra: usize = if area_width > 0 {
-                stream_text.lines()
-                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
-                    .sum::<u16>() as usize
-            } else { 0 };
-            let height = (line_count + wrap_extra).max(1) as u16;
+            let stream_content = ratatui::text::Text::from(stream_text);
+            let height = text_height(&stream_content, area_width);
             let stream_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
                 Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
             } else {
                 Style::default().bg(tint)
             };
-            rendered.push(RenderedMsg { text: stream_text, style: stream_style, height });
+            rendered.push(RenderedMsg { content: stream_content, style: stream_style, height });
         }
 
         // Show live subagent output while a subagent is running
@@ -1310,19 +1347,14 @@ impl App {
                 self.subagent_live_text.clone()
             };
             let sub_text = format!("🔀 subagent: {}▌", tail);
-            let line_count = sub_text.lines().count().max(1);
-            let wrap_extra: usize = if area_width > 0 {
-                sub_text.lines()
-                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
-                    .sum::<u16>() as usize
-            } else { 0 };
-            let height = (line_count + wrap_extra).max(1) as u16;
+            let sub_content = ratatui::text::Text::from(sub_text);
+            let height = text_height(&sub_content, area_width);
             let sub_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
                 Style::default().fg(Color::Rgb(180, 210, 255)).bg(tint)
             } else {
                 Style::default().bg(tint)
             };
-            rendered.push(RenderedMsg { text: sub_text, style: sub_style, height });
+            rendered.push(RenderedMsg { content: sub_content, style: sub_style, height });
         }
 
         // Calculate total content height and clamp scroll_offset
@@ -1372,7 +1404,7 @@ impl App {
                 break;
             }
 
-            let msg_para = Paragraph::new(rm.text.clone())
+            let msg_para = Paragraph::new(rm.content.clone())
                 .style(rm.style)
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .scroll((partial_skip, 0));
@@ -1574,12 +1606,48 @@ impl App {
         } else {
             format!("🪙 0/{}", ctx_window)
         };
-        let status = format!(
-            "🔢 {} | {} | 💬 {}",
-            &self.session.id[..8],
-            token_info,
-            self.cached_message_count,
-        );
+        // Battery + inference rate segment
+        let battery_icon = match self.on_battery {
+            BatteryState::OnBattery => "🔋",
+            BatteryState::AC => "🔌",
+            BatteryState::Unknown => "",
+        };
+        let rate_text = match self.last_infer_rate {
+            Some(r) => format!("⚡ {:.1} tok/s", r),
+            None => String::new(),
+        };
+        let power_segment = match (battery_icon.is_empty(), rate_text.is_empty()) {
+            (false, false) => format!("{} {}", battery_icon, rate_text),
+            (false, true)  => battery_icon.to_string(),
+            (true, false)  => rate_text,
+            (true, true)   => String::new(),
+        };
+
+        let width = chunks[3].width as usize;
+        let status = if width >= 60 && !power_segment.is_empty() {
+            format!(
+                "🔢 {} | {} | 💬 {} | {}",
+                &self.session.id[..8],
+                token_info,
+                self.cached_message_count,
+                power_segment,
+            )
+        } else if width >= 40 && !power_segment.is_empty() {
+            // Drop session ID on narrow terminals
+            format!(
+                "{} | 💬 {} | {}",
+                token_info,
+                self.cached_message_count,
+                power_segment,
+            )
+        } else {
+            format!(
+                "🔢 {} | {} | 💬 {}",
+                &self.session.id[..8],
+                token_info,
+                self.cached_message_count,
+            )
+        };
         let status_bar = Paragraph::new(status);
         f.render_widget(status_bar, chunks[3]);
     }
@@ -2783,7 +2851,96 @@ impl App {
         }
     }
 
+    /// Format message content as styled ratatui Text with syntax-highlighted code blocks
+    fn format_message_styled(&self, emoji: &str, content: &str) -> ratatui::text::Text<'static> {
+        use ratatui::text::{Line as RLine, Text as RText};
+
+        let is_dark = self.theme.kind == crate::theme::ThemeKind::Dark;
+        let mut lines: Vec<RLine<'static>> = Vec::new();
+        let mut in_code_block = false;
+        let mut code_language = String::new();
+        let mut code_buffer = String::new();
+        let mut first_line = true;
+
+        const KNOWN_LANGS: &[&str] = &[
+            "rust","python","py","javascript","js","typescript","ts","go","java",
+            "c","cpp","c++","cs","csharp","bash","sh","zsh","fish","toml","yaml",
+            "yml","json","html","css","sql","dockerfile","makefile","zig","kotlin",
+            "swift","ruby","php","scala","haskell","elixir","erlang","ocaml","r",
+            "markdown","md","xml","csv","diff","patch","text","txt","plaintext",
+            "proto","graphql","nix","vim","assembly","asm","wgsl","glsl","hlsl",
+        ];
+
+        for line in content.lines() {
+            if line.trim_start().starts_with("```") {
+                if !in_code_block {
+                    let lang_part = line.trim_start().strip_prefix("```").unwrap_or("").trim();
+                    let canonical = lang_part.to_lowercase();
+                    code_language = if lang_part.is_empty() {
+                        "code".to_string()
+                    } else if KNOWN_LANGS.contains(&canonical.as_str()) {
+                        lang_part.to_string()
+                    } else {
+                        "code".to_string()
+                    };
+                    let header = format!("┌─ {}", code_language);
+                    if first_line {
+                        lines.push(RLine::from(format!("{} {}", emoji, header)));
+                        first_line = false;
+                    } else {
+                        lines.push(RLine::from(header));
+                    }
+                    in_code_block = true;
+                    code_buffer.clear();
+                } else {
+                    // End of code block — highlight accumulated code
+                    let highlighted = self.highlighter.highlight_code(&code_buffer, &code_language, is_dark);
+                    lines.extend(highlighted);
+                    lines.push(RLine::from("└─".to_string()));
+                    in_code_block = false;
+                    code_language.clear();
+                    code_buffer.clear();
+                }
+                continue;
+            }
+
+            if in_code_block {
+                if !code_buffer.is_empty() {
+                    code_buffer.push('\n');
+                }
+                code_buffer.push_str(line);
+            } else {
+                let text = if line.starts_with("    ") || line.starts_with('\t') {
+                    format!("    {}", line)
+                } else {
+                    line.to_string()
+                };
+                if first_line {
+                    lines.push(RLine::from(format!("{} {}", emoji, text)));
+                    first_line = false;
+                } else {
+                    lines.push(RLine::from(text));
+                }
+            }
+        }
+
+        // Handle unclosed code block
+        if in_code_block && !code_buffer.is_empty() {
+            let highlighted = self.highlighter.highlight_code(&code_buffer, &code_language, is_dark);
+            lines.extend(highlighted);
+        }
+
+        // Ensure at least one line with the emoji
+        if lines.is_empty() {
+            lines.push(RLine::from(format!("{} ", emoji)));
+        }
+
+        RText::from(lines)
+    }
+
     /// Format message content with nice code block indentation and language detection
+    /// (Plain-text fallback; used by format_message_styled for non-highlighted paths)
+    #[allow(dead_code)]
     fn format_message_content(&self, content: &str) -> String {
         let mut result = String::new();
         let mut in_code_block = false;

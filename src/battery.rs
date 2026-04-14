@@ -1,56 +1,66 @@
 /// Battery status detection for adaptive rate limiting
 use std::process::Command;
 
-/// Check if system is running on battery power
-/// Returns true if on battery, false if on AC power
-/// Returns false if detection fails (assume AC to prevent throttling issues)
+/// Tri-state battery status — distinguishes "on AC" from "detection unavailable"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryState {
+    OnBattery,
+    AC,
+    Unknown,
+}
+
+/// Detect current battery state
 #[cfg(target_os = "macos")]
-pub fn is_on_battery() -> bool {
-    // macOS: check `pmset -g batt` for "AC Power" status
+pub fn battery_state() -> BatteryState {
     if let Ok(output) = Command::new("pmset")
         .arg("-g")
         .arg("batt")
         .output()
     {
         if let Ok(stdout) = String::from_utf8(output.stdout) {
-            // If output contains "AC Power", we're on AC (not on battery)
-            return !stdout.contains("AC Power");
+            return if stdout.contains("AC Power") {
+                BatteryState::AC
+            } else {
+                BatteryState::OnBattery
+            };
         }
     }
-    false // Assume AC power if detection fails
+    BatteryState::Unknown
 }
 
 #[cfg(target_os = "linux")]
-pub fn is_on_battery() -> bool {
-    // Linux: check /sys/class/power_supply/BAT*/status
-    // or /sys/class/power_supply/BAT*/uevent
+pub fn battery_state() -> BatteryState {
     if let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("BAT")) {
                 let status_file = path.join("status");
                 if let Ok(status) = std::fs::read_to_string(&status_file) {
-                    if status.trim() == "Discharging" {
-                        return true;
-                    }
+                    return if status.trim() == "Discharging" {
+                        BatteryState::OnBattery
+                    } else {
+                        BatteryState::AC
+                    };
                 }
             }
         }
     }
-    false // Assume AC power if no battery found
+    BatteryState::Unknown
 }
 
 #[cfg(target_os = "windows")]
-pub fn is_on_battery() -> bool {
-    // Windows: use `powercfg /status` or WMI
-    // For now, assume AC (most Windows users have stable power)
-    false
+pub fn battery_state() -> BatteryState {
+    BatteryState::Unknown
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn battery_state() -> BatteryState {
+    BatteryState::Unknown
+}
+
+/// Convenience wrapper for existing callers (knowledge_index.rs)
 pub fn is_on_battery() -> bool {
-    // Unknown platform: assume AC power (safe default)
-    false
+    battery_state() == BatteryState::OnBattery
 }
 
 #[cfg(test)]
@@ -59,7 +69,12 @@ mod tests {
 
     #[test]
     fn test_battery_detection_runs() {
-        // Just verify the function runs without panicking
-        let _ = is_on_battery();
+        let state = battery_state();
+        // Just verify it runs without panicking and returns a valid variant
+        match state {
+            BatteryState::OnBattery | BatteryState::AC | BatteryState::Unknown => {}
+        }
+        // Convenience wrapper should be consistent
+        assert_eq!(is_on_battery(), state == BatteryState::OnBattery);
     }
 }

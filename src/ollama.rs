@@ -97,6 +97,8 @@ struct StreamChunk {
     prompt_eval_count: Option<u32>,
     /// Tokens generated (only present on final done=true chunk)
     eval_count: Option<u32>,
+    /// Time spent generating tokens in nanoseconds (only on final chunk)
+    eval_duration: Option<u64>,
 }
 
 /// Response from Ollama generate endpoint (non-streaming)
@@ -108,8 +110,14 @@ pub struct GenerateResponse {
 /// Token event sent from streaming to UI
 pub enum StreamEvent {
     Token(String),
-    /// Stream finished; carries (prompt_tokens, generated_tokens, had_thinking)
-    Done(u32, u32, bool),
+    /// Stream finished with generation stats
+    Done {
+        prompt_tokens: u32,
+        gen_tokens: u32,
+        had_thinking: bool,
+        /// Time spent generating tokens (nanoseconds), for tok/s computation
+        eval_duration_ns: Option<u64>,
+    },
     Error(String),
 }
 
@@ -354,7 +362,12 @@ impl OllamaClient {
                                         let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
                                         let gen_tokens = chunk.eval_count.unwrap_or(0);
                                         dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
-                                        let _ = tx.send(StreamEvent::Done(prompt_tokens, gen_tokens, had_thinking));
+                                        let _ = tx.send(StreamEvent::Done {
+                                            prompt_tokens,
+                                            gen_tokens,
+                                            had_thinking,
+                                            eval_duration_ns: chunk.eval_duration,
+                                        });
                                         return;
                                     }
                                 }
@@ -372,7 +385,12 @@ impl OllamaClient {
             }
 
             // Stream ended without done signal
-            let _ = tx.send(StreamEvent::Done(0, 0, had_thinking));
+            let _ = tx.send(StreamEvent::Done {
+                prompt_tokens: 0,
+                gen_tokens: 0,
+                had_thinking,
+                eval_duration_ns: None,
+            });
         });
 
         rx
@@ -439,7 +457,12 @@ impl OllamaClient {
                                     if chunk.done {
                                         let p = chunk.prompt_eval_count.unwrap_or(0);
                                         let g = chunk.eval_count.unwrap_or(0);
-                                        let _ = tx.send(StreamEvent::Done(p, g, had_thinking));
+                                        let _ = tx.send(StreamEvent::Done {
+                                            prompt_tokens: p,
+                                            gen_tokens: g,
+                                            had_thinking,
+                                            eval_duration_ns: chunk.eval_duration,
+                                        });
                                         return;
                                     }
                                 }
@@ -453,7 +476,12 @@ impl OllamaClient {
                     }
                 }
             }
-            let _ = tx.send(StreamEvent::Done(0, 0, had_thinking));
+            let _ = tx.send(StreamEvent::Done {
+                prompt_tokens: 0,
+                gen_tokens: 0,
+                had_thinking,
+                eval_duration_ns: None,
+            });
         });
 
         rx
@@ -610,6 +638,46 @@ mod tests {
         let json = r#"{"message":{"role":"assistant","content":""},"done":true}"#;
         let chunk: StreamChunk = serde_json::from_str(json).unwrap();
         assert!(chunk.done);
+        assert!(chunk.eval_duration.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_with_eval_duration() {
+        let json = r#"{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":100,"eval_count":50,"eval_duration":2000000000}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        assert!(chunk.done);
+        assert_eq!(chunk.eval_count, Some(50));
+        assert_eq!(chunk.eval_duration, Some(2_000_000_000));
+        // 50 tokens in 2 seconds = 25 tok/s
+        let rate = chunk.eval_count.unwrap() as f64
+            / (chunk.eval_duration.unwrap() as f64 / 1_000_000_000.0);
+        assert!((rate - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_infer_rate_zero_duration() {
+        // Zero duration should not cause div-by-zero
+        let eval_duration_ns: Option<u64> = Some(0);
+        let gen_tokens: u32 = 50;
+        let rate = match eval_duration_ns {
+            Some(ns) if ns > 0 && gen_tokens > 0 =>
+                Some(gen_tokens as f64 / (ns as f64 / 1_000_000_000.0)),
+            _ => None,
+        };
+        assert!(rate.is_none());
+    }
+
+    #[test]
+    fn test_infer_rate_zero_tokens() {
+        // Zero tokens should yield None
+        let eval_duration_ns: Option<u64> = Some(1_000_000_000);
+        let gen_tokens: u32 = 0;
+        let rate = match eval_duration_ns {
+            Some(ns) if ns > 0 && gen_tokens > 0 =>
+                Some(gen_tokens as f64 / (ns as f64 / 1_000_000_000.0)),
+            _ => None,
+        };
+        assert!(rate.is_none());
     }
 
     #[test]

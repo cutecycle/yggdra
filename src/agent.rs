@@ -493,7 +493,7 @@ impl Agent {
                         }
                         llm_output.push_str(&tok);
                     }
-                    StreamEvent::Done(..) => break,
+                    StreamEvent::Done { .. } => break,
                     StreamEvent::Error(e) => return Err(anyhow!("stream error: {}", e)),
                 }
             }

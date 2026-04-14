@@ -206,4 +206,9 @@ impl MessageBuffer {
     pub fn scrollback_count(&self) -> SqliteResult<usize> {
         self.conn.query_row("SELECT COUNT(*) FROM scrollback", [], |row| row.get(0))
     }
+
+    /// Remove all persisted kick messages (one-time cleanup for sessions that accumulated them)
+    pub fn purge_kicks(&mut self) -> SqliteResult<usize> {
+        self.conn.execute("DELETE FROM messages WHERE role = 'kick'", [])
+    }
 }

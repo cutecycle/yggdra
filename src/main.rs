@@ -2,6 +2,7 @@ mod battery;
 mod config;
 mod dlog;
 mod gaps;
+mod highlight;
 mod knowledge_index;
 mod msglog;
 mod message;
