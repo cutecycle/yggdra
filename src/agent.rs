@@ -10,42 +10,6 @@ use regex::Regex;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
-/// Tool call format preference based on model
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolFormat {
-    /// JSON: {"tool_calls": [{"name": "...", "parameters": {...}}]} — most reliable
-    Json,
-    /// Standard: <|tool>name<|tool_sep>arg<|end_tool>
-    Standard,
-    /// Qwen 4b quirk: <|tool_call>call:name args<|tool_sep|>none
-    ToolCall,
-    /// Legacy: [TOOL: name args]
-    Legacy,
-}
-
-/// Detect expected tool call format from model name
-pub fn detect_tool_format(model: &str) -> ToolFormat {
-    let lower = model.to_lowercase();
-    // Thinking/heretic models: <|tool> uses Gemma's own control tokens → model enters
-    // thinking-only mode and produces empty content. Use legacy [TOOL: ...] format instead.
-    if lower.contains("heretic") || lower.contains("qwq") || lower.contains("thinking")
-        || lower.contains("r1") || lower.contains("reasoner")
-    {
-        return ToolFormat::Legacy;
-    }
-    // Legacy Qwen 4b (not qwen3.5) emits the <|tool_call> format.
-    if (lower.starts_with("qwen:") || lower.starts_with("qwen-"))
-        && !lower.starts_with("qwen3")
-        && (lower.ends_with(":4b") || lower.ends_with("-4b")
-            || lower.contains(":4b-") || lower.contains("-4b-"))
-    {
-        ToolFormat::ToolCall
-    } else {
-        // JSON is the default — most reliable for instruction-following models
-        ToolFormat::Json
-    }
-}
-
 /// Tool call representation parsed from LLM output
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -76,7 +40,7 @@ pub fn sanitize_model_output(text: &str) -> String {
 /// Detect when a model hallucinates a full conversation turn — generating both
 /// tool calls and fake tool outputs in a single response.
 pub fn is_hallucinated_output(text: &str) -> bool {
-    let has_tool_call = text.contains("[TOOL:") || text.contains("<|tool>") || text.contains("\"tool_calls\"");
+    let has_tool_call = text.contains("\"tool_calls\"");
     let has_tool_output = text.contains("[TOOL_OUTPUT:");
     has_tool_call && has_tool_output
 }
@@ -373,198 +337,9 @@ fn build_tool_args(name: &str, args_section: &str) -> String {
     }
 }
 
-/// Parse tool calls from LLM output
-/// Supports two formats:
-/// 1. Qwen/Gemma: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
-/// 2. Qwen 4b:   <|tool_call>call:name arg1\narg2<|tool_sep|>none<|tool_sep|>none<|end_tool>
-/// 3. Legacy:    [TOOL: name args]
+/// Parse tool calls from LLM output — JSON only.
 pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
-    // Lazy-compile regex patterns (once per binary, not per call)
-    static RE_QWEN_GEMMA: OnceLock<Regex> = OnceLock::new();
-    static RE_TOOL_CALL: OnceLock<Regex> = OnceLock::new();
-    static RE_LEGACY: OnceLock<Regex> = OnceLock::new();
-    
-    let re_qwen_gemma = RE_QWEN_GEMMA.get_or_init(|| {
-        Regex::new(r"(?s)<\|tool>(\w+)(.*?)<\|end_tool>").unwrap()
-    });
-    
-    let re_tool_call = RE_TOOL_CALL.get_or_init(|| {
-        Regex::new(r"(?s)<\|?tool_call\|?>[ \t]*call:(\w+)(.*?)(?:<\|end_tool>|</tool_call>|<\|tool_call\|?>)").unwrap()
-    });
-    
-    // (?s) so .* matches newlines — needed for multiline writefile content
-    let re_legacy = RE_LEGACY.get_or_init(|| {
-        Regex::new(r"(?s)\[TOOL:\s+(\w+)\s+(.*?)\]").unwrap()
-    });
-    
-    let mut calls = Vec::new();
-    
-    // Parse Qwen/Gemma format: <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>
-    for cap in re_qwen_gemma.captures_iter(output) {
-        if let Some(name_match) = cap.get(1) {
-            let name = name_match.as_str().to_string();
-            let full_match = cap.get(0).unwrap().as_str();
-            let args_section = full_match
-                .trim_start_matches(&format!("<|tool>{}", name))
-                .trim_end_matches("<|end_tool>");
-            
-            let args = build_tool_args(&name, args_section);
-            
-            if !name.is_empty() {
-                calls.push(ToolCall { name, args });
-            }
-        }
-    }
-
-    // Parse <|tool_call>call:name or <tool_call>call:name variants
-    // Separators: <|tool_sep|> or <|tool_sep>
-    // Closers:    <|end_tool> or </tool_call>
-    if calls.is_empty() {
-        for cap in re_tool_call.captures_iter(output) {
-            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                let name = name_match.as_str().to_string();
-                let raw_args = args_match.as_str();
-                // Split on either separator variant, then on whitespace; filter "none" placeholders
-                let args = raw_args
-                    .replace("<|tool_sep|>", "\x00")
-                    .replace("<|tool_sep>", "\x00")
-                    .split('\x00')
-                    .flat_map(|chunk| chunk.split_whitespace())
-                    .filter(|s| !s.eq_ignore_ascii_case("none"))
-                    .filter(|s| !s.starts_with('<') && !s.ends_with('>'))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !name.is_empty() {
-                    calls.push(ToolCall { name, args });
-                }
-            }
-        }
-    }
-    
-    // If no Qwen format found, try legacy format: [TOOL: name args]
-    if calls.is_empty() {
-        for cap in re_legacy.captures_iter(output) {
-            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                let name = name_match.as_str().to_string();
-                let raw = args_match.as_str().trim();
-                // writefile: first line is path, rest is file content
-                let args = if name == "writefile" {
-                    if let Some(nl) = raw.find('\n') {
-                        format!("{}\x00{}", raw[..nl].trim(), &raw[nl + 1..])
-                    } else {
-                        raw.to_string()
-                    }
-                } else {
-                    raw.to_string()
-                };
-                calls.push(ToolCall { name, args });
-            }
-        }
-    }
-    
-    calls
-}
-
-/// Parse tool calls with a format hint — tries expected format first, then falls back
-pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<ToolCall> {
-    let calls = parse_single_format(output, format);
-    if !calls.is_empty() {
-        return calls;
-    }
-    // Fallback: try other formats (non-recursive)
-    for format_variant in &[ToolFormat::Json, ToolFormat::Standard, ToolFormat::ToolCall, ToolFormat::Legacy] {
-        if *format_variant != format {
-            let calls = parse_single_format(output, *format_variant);
-            if !calls.is_empty() {
-                return calls;
-            }
-        }
-    }
-    Vec::new()
-}
-
-/// Parse tool calls using exactly one format (no fallback, no recursion).
-fn parse_single_format(output: &str, format: ToolFormat) -> Vec<ToolCall> {
-    static RE_QWEN_GEMMA: OnceLock<Regex> = OnceLock::new();
-    static RE_TOOL_CALL: OnceLock<Regex> = OnceLock::new();
-    static RE_LEGACY: OnceLock<Regex> = OnceLock::new();
-    
-    let re_qwen_gemma = RE_QWEN_GEMMA.get_or_init(|| {
-        Regex::new(r"(?s)<\|tool>(\w+)(.*?)<\|end_tool>").unwrap()
-    });
-    
-    let re_tool_call = RE_TOOL_CALL.get_or_init(|| {
-        Regex::new(r"(?s)<\|?tool_call\|?>[ \t]*call:(\w+)(.*?)(?:<\|end_tool>|</tool_call>|<\|tool_call\|?>)").unwrap()
-    });
-    
-    let re_legacy = RE_LEGACY.get_or_init(|| {
-        Regex::new(r"(?s)\[TOOL:\s+(\w+)\s+(.*?)\]").unwrap()
-    });
-    
-    let mut calls = Vec::new();
-    
-    match format {
-        ToolFormat::Json => {
-            calls = parse_json_tool_calls(output);
-        }
-        ToolFormat::Standard => {
-            for cap in re_qwen_gemma.captures_iter(output) {
-                if let Some(name_match) = cap.get(1) {
-                    let name = name_match.as_str().to_string();
-                    let full_match = cap.get(0).unwrap().as_str();
-                    let args_section = full_match
-                        .trim_start_matches(&format!("<|tool>{}", name))
-                        .trim_end_matches("<|end_tool>");
-                    
-                    let args = build_tool_args(&name, args_section);
-                    
-                    if !name.is_empty() {
-                        calls.push(ToolCall { name, args });
-                    }
-                }
-            }
-        }
-        ToolFormat::ToolCall => {
-            for cap in re_tool_call.captures_iter(output) {
-                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                    let name = name_match.as_str().to_string();
-                    let raw_args = args_match.as_str();
-                    let args = raw_args
-                        .replace("<|tool_sep|>", "\x00")
-                        .replace("<|tool_sep>", "\x00")
-                        .split('\x00')
-                        .flat_map(|chunk| chunk.split_whitespace())
-                        .filter(|s| !s.eq_ignore_ascii_case("none"))
-                        .filter(|s| !s.starts_with('<') && !s.ends_with('>'))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !name.is_empty() {
-                        calls.push(ToolCall { name, args });
-                    }
-                }
-            }
-        }
-        ToolFormat::Legacy => {
-            for cap in re_legacy.captures_iter(output) {
-                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                    let name = name_match.as_str().to_string();
-                    let raw = args_match.as_str().trim();
-                    let args = if name == "writefile" {
-                        if let Some(nl) = raw.find('\n') {
-                            format!("{}\x00{}", raw[..nl].trim(), &raw[nl + 1..])
-                        } else {
-                            raw.to_string()
-                        }
-                    } else {
-                        raw.to_string()
-                    };
-                    calls.push(ToolCall { name, args });
-                }
-            }
-        }
-    }
-    
-    calls
+    parse_json_tool_calls(output)
 }
 
 /// Agent configuration
@@ -765,8 +540,7 @@ impl Agent {
             }
 
             // Check for tool calls (no subagent spawning here)
-            let format = detect_tool_format(&self.config.model);
-            let tool_calls = parse_tool_calls_with_format(&llm_output, format);
+            let tool_calls = parse_json_tool_calls(&llm_output);
 
             // No tool calls = task complete (model gave a plain response)
             if tool_calls.is_empty() {
@@ -861,8 +635,7 @@ impl Agent {
             }
 
             // Check for tool calls
-            let format = detect_tool_format(&self.config.model);
-            let tool_calls = parse_tool_calls_with_format(&llm_output, format);
+            let tool_calls = parse_json_tool_calls(&llm_output);
             let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
             
             // Disable subagent spawning if recursion depth limit reached
@@ -953,93 +726,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tool_calls_single() {
-        let output = "I'll search for the pattern. [TOOL: rg \"fn main\" \"/path\"]";
-        let calls = parse_tool_calls(output);
-        
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "rg");
-        assert!(calls[0].args.contains("fn main"));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_multiple() {
-        let output = "First [TOOL: rg \"pattern\" \"/path\"] then [TOOL: commit \"fix bug\"]";
-        let calls = parse_tool_calls(output);
-        
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "rg");
-        assert_eq!(calls[1].name, "commit");
-    }
-
-    #[test]
     fn test_parse_no_tool_calls() {
         let output = "This is just text without any tools";
         let calls = parse_tool_calls(output);
-        
         assert_eq!(calls.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_tool_calls_embedded_in_prose() {
-        let output = "Let me search for that. [TOOL: rg \"fn main\" .] I'll check the results.";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "rg");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_editfile() {
-        let output = "I'll read the file. [TOOL: editfile src/main.rs]";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "editfile");
-        assert_eq!(calls[0].args, "src/main.rs");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_tool_call_format() {
-        // <tool_call>call:name format (some Qwen 4b variants)
-        let output = "<tool_call>call:rg \"TODO\"\n.yggdra/todo/<|tool_sep>none<|tool_sep>none<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "rg");
-        assert!(calls[0].args.contains("TODO"));
-        assert!(calls[0].args.contains(".yggdra/todo/"));
-        assert!(!calls[0].args.contains("none"));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_pipe_tool_call_format() {
-        // <|tool_call>call:name format — ACTUAL Qwen 4b output with piped delimiters
-        let output = "<|tool_call>call:spawn ls -la .yggdra/todo/<|tool_sep|>none<|tool_sep|>none<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1, "should parse <|tool_call> format");
-        assert_eq!(calls[0].name, "spawn");
-        assert!(calls[0].args.contains("ls"), "args should contain ls");
-        assert!(calls[0].args.contains(".yggdra/todo/"), "args should contain path");
-        assert!(!calls[0].args.contains("none"), "none placeholders should be filtered");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_pipe_sep_pipe_format() {
-        // <|tool_sep|> variant (closing pipe) must also be handled
-        let output = "<|tool_call>call:rg \"TODO\"\n.yggdra/todo/<|tool_sep|>none<|tool_sep|>none<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "rg");
-        assert!(calls[0].args.contains("TODO"));
-        assert!(calls[0].args.contains(".yggdra/todo/"));
-    }
-
-    #[test]
-    fn test_parse_qwen_none_filtered() {
-        // <|tool> format with "none" placeholder args should be filtered
-        let output = "<|tool>spawn<|tool_sep>ls<|tool_sep>-la<|tool_sep>none<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "spawn");
-        assert_eq!(calls[0].args, "ls -la");
     }
 
     #[test]
@@ -1059,95 +749,25 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_tool_format_qwen_4b() {
-        let format = detect_tool_format("qwen:4b");
-        assert_eq!(format, ToolFormat::ToolCall);
-    }
-
-    #[test]
-    fn test_detect_tool_format_qwen35_not_toolcall() {
-        // qwen3.5 variants should get Json (default), not ToolCall
-        assert_eq!(detect_tool_format("qwen3.5:4b"), ToolFormat::Json);
-        assert_eq!(detect_tool_format("qwen3.5:9b-q4_K_M"), ToolFormat::Json);
-    }
-
-    #[test]
-    fn test_detect_tool_format_heretic_is_legacy() {
-        assert_eq!(detect_tool_format("qwen3.5-heretic-4b:f16"), ToolFormat::Legacy);
-        assert_eq!(detect_tool_format("qwen3.5-heretic-9b:q4_K_M"), ToolFormat::Legacy);
-        assert_eq!(detect_tool_format("qwen3.5-heretic-27b:q4_K_M"), ToolFormat::Legacy);
-    }
-
-    #[test]
-    fn test_detect_tool_format_qwen_other_versions() {
-        // Non-4b qwen → Json (default)
-        assert_eq!(detect_tool_format("qwen:7b"), ToolFormat::Json);
-        assert_eq!(detect_tool_format("qwen:14b"), ToolFormat::Json);
-    }
-
-    #[test]
-    fn test_detect_tool_format_non_qwen() {
-        // All standard models get Json as default
-        assert_eq!(detect_tool_format("llama2"), ToolFormat::Json);
-        assert_eq!(detect_tool_format("mistral"), ToolFormat::Json);
-        assert_eq!(detect_tool_format("neural-chat"), ToolFormat::Json);
-    }
-
-    #[test]
-    fn test_parse_tool_calls_with_format_fallback() {
-        // Standard format input with ToolCall hint should fallback and succeed
-        let output = "<|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool>";
-        let calls = parse_tool_calls_with_format(output, ToolFormat::ToolCall);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "spawn");
-        assert_eq!(calls[0].args, "ls -la");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_with_angle_brackets_in_args() {
-        // Regression: regex previously stopped at < — Rust generics should pass through
-        let output = "<|tool>rg<|tool_sep>Vec<String><|tool_sep>src/<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1, "should parse despite < in args");
-        assert_eq!(calls[0].name, "rg");
-        assert!(calls[0].args.contains("Vec"), "args should include Vec");
-    }
-
-    #[test]
     fn test_parse_tool_calls_writefile_preserves_content() {
-        // writefile args must be encoded as path\0content with newlines intact
-        let output = "<|tool>writefile<|tool_sep>src/foo.rs<|tool_sep>fn main() {\n    println!(\"hi\");\n}\n<|end_tool>";
-        let calls = parse_tool_calls(output);
+        // JSON writefile: path\0content with newlines intact
+        let output = r#"{"tool_calls": [{"name": "writefile", "parameters": {"path": "src/foo.rs", "content": "fn main() {\n    println!(\"hi\");\n}\n"}}]}"#;
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "writefile");
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
         assert_eq!(parts[0], "src/foo.rs");
         assert!(parts[1].contains("fn main"), "content should be preserved");
-        assert!(parts[1].contains('\n'), "newlines must be preserved in writefile content");
     }
 
     #[test]
     fn test_parse_tool_calls_writefile_multiline() {
-        // Multi-line file content across separator
-        let content = "line1\nline2\nline3\n";
-        let output = format!("<|tool>writefile<|tool_sep>out.txt<|tool_sep>{}<|end_tool>", content);
-        let calls = parse_tool_calls(&output);
+        let output = r#"{"tool_calls": [{"name": "writefile", "parameters": {"path": "out.txt", "content": "line1\nline2\nline3\n"}}]}"#;
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
         assert_eq!(parts[0], "out.txt");
-        assert_eq!(parts[1], content);
-    }
-
-    #[test]
-    fn test_parse_tool_calls_writefile_newline_fallback() {
-        // Model uses newline instead of second <|tool_sep> between path and content
-        let output = "<|tool>writefile<|tool_sep>src/foo.rs\nfn main() {\n    println!(\"hi\");\n}\n<|end_tool>";
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1, "should parse despite missing second tool_sep");
-        let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
-        assert_eq!(parts[0], "src/foo.rs", "path must not include content");
-        assert!(parts[1].contains("fn main"), "content should be recovered");
-        assert!(parts[1].contains('\n'), "newlines must be in content");
+        assert!(parts[1].contains("line1"));
     }
 
     #[test]
@@ -1184,33 +804,23 @@ mod tests {
 
     #[test]
     fn test_sanitize_preserves_clean_output() {
-        let input = "[TOOL: readfile src/main.rs]";
-        assert_eq!(sanitize_model_output(input), input);
-    }
-
-    #[test]
-    fn test_sanitize_preserves_tool_markers() {
-        // <|tool> is a yggdra tool format, not a training artifact
-        let input = "<|tool>rg<|tool_sep>pattern<|end_tool>";
+        let input = r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "main"}}]}"#;
         assert_eq!(sanitize_model_output(input), input);
     }
 
     #[test]
     fn test_hallucination_detection_basic() {
-        let hallucinated = "[TOOL: readfile src/main.rs]\n[TOOL_OUTPUT: readfile = fn main() {}]";
+        // Model generates both a JSON tool call AND a fake tool output — hallucination
+        let hallucinated = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs"}}]}
+[TOOL_OUTPUT: readfile = fn main() {}]"#;
         assert!(is_hallucinated_output(hallucinated));
     }
 
     #[test]
     fn test_hallucination_detection_normal_tool_call() {
-        let normal = "[TOOL: readfile src/main.rs]";
+        // Just the tool call itself — not a hallucination
+        let normal = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs"}}]}"#;
         assert!(!is_hallucinated_output(normal));
-    }
-
-    #[test]
-    fn test_hallucination_detection_standard_format() {
-        let hallucinated = "<|tool>readfile<|tool_sep>src/main.rs<|end_tool>\n[TOOL_OUTPUT: readfile = fn main()]";
-        assert!(is_hallucinated_output(hallucinated));
     }
 
     #[test]
@@ -1318,14 +928,5 @@ mod tests {
         assert_eq!(calls[0].name, "spawn_agent");
         assert!(calls[0].args.contains("search-docs"));
         assert!(calls[0].args.contains("Search the docs"));
-    }
-
-    #[test]
-    fn test_json_format_fallback_to_legacy() {
-        // If model outputs [TOOL:] instead of JSON, fallback should catch it
-        let output = "[TOOL: readfile src/main.rs]";
-        let calls = parse_tool_calls_with_format(output, ToolFormat::Json);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "readfile");
     }
 }

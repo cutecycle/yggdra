@@ -1291,11 +1291,12 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(2),                      // Header
-                    Constraint::Min(5),                         // Messages
-                    Constraint::Length(inline_results_height),  // Inline results (0 if no results)
-                    Constraint::Length(input_height),           // Input
-                    Constraint::Length(1),                      // Status bar
+                    Constraint::Length(2),                      // [0] Header
+                    Constraint::Min(5),                         // [1] Messages
+                    Constraint::Length(1),                      // [2] Spacer above boxes
+                    Constraint::Length(inline_results_height),  // [3] Inline results (0 if no results)
+                    Constraint::Length(input_height),           // [4] Input
+                    Constraint::Length(1),                      // [5] Status bar
                 ]
                 .as_ref(),
             )
@@ -1464,7 +1465,7 @@ impl App {
         // lines_to_skip = total_height - viewport_height - scroll_offset
         let lines_to_skip = (total_height - viewport_height - effective_scroll as i32).max(0);
 
-        // Render gradient background if enabled
+        // Render gradient background — covers messages + spacer + boxes for seamless blend
         if self.gradient_enabled {
             let gradient_paras = self.render_gradient_background(messages_area);
             for (y_offset, para) in gradient_paras.iter().enumerate() {
@@ -1474,6 +1475,30 @@ impl App {
                     width: messages_area.width,
                     height: 1,
                 };
+                f.render_widget(para, gradient_area);
+            }
+            // Continue gradient into spacer + results + input areas
+            let extra_start = chunks[2].y;
+            let extra_end   = chunks[4].y + chunks[4].height;
+            let total_height = messages_area.height + (extra_end - extra_start);
+            for y in extra_start..extra_end {
+                let offset = messages_area.height + (y - extra_start);
+                let t = if total_height > 1 {
+                    offset as f32 / (total_height - 1) as f32
+                } else {
+                    1.0
+                };
+                let color = match (self.theme.gradient_start, self.theme.gradient_end) {
+                    (Color::Rgb(sr, sg, sb), Color::Rgb(er, eg, eb)) => {
+                        let r = (sr as f32 + (er as f32 - sr as f32) * t) as u8;
+                        let g = (sg as f32 + (eg as f32 - sg as f32) * t) as u8;
+                        let b = (sb as f32 + (eb as f32 - sb as f32) * t) as u8;
+                        Color::Rgb(r, g, b)
+                    }
+                    _ => self.theme.gradient_end,
+                };
+                let para = Paragraph::new(" ").style(Style::default().bg(color));
+                let gradient_area = Rect { x: area.x, y, width: area.width, height: 1 };
                 f.render_widget(para, gradient_area);
             }
         }
@@ -1568,31 +1593,50 @@ impl App {
             AppMode::Ask => (" 🔍ASK ", Color::Yellow),
         };
 
+        // Compute a "frosted" bg for the boxes: gradient end color, slightly lightened
+        let box_bg = if self.gradient_enabled {
+            match self.theme.gradient_end {
+                Color::Rgb(r, g, b) => Color::Rgb(
+                    r.saturating_add(18),
+                    g.saturating_add(18),
+                    b.saturating_add(18),
+                ),
+                c => c,
+            }
+        } else {
+            Color::Reset
+        };
+        let box_style = Style::default().bg(box_bg);
+
         // Render inline tool results panel if there are results
-        if !self.inline_tool_results.is_empty() && chunks[2].height > 0 {
+        if !self.inline_tool_results.is_empty() && chunks[3].height > 0 {
             let results_text = self.format_inline_results();
             let results_panel = Paragraph::new(results_text)
                 .block(Block::default()
                     .title(" 🔧 Tool Results ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)))
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .style(box_style))
+                .style(box_style)
                 .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(results_panel, chunks[2]);
+            f.render_widget(results_panel, chunks[3]);
         }
 
         let input = Paragraph::new(format!("> {}", input_text))
             .block(Block::default()
                 .title(format!(" 🌱 Input {}", mode_badge))
                 .border_style(Style::default().fg(mode_border_color))
-                .borders(Borders::ALL))
+                .borders(Borders::ALL)
+                .style(box_style))
+            .style(box_style)
             .wrap(ratatui::widgets::Wrap { trim: false });
-        f.render_widget(input, chunks[3]);
+        f.render_widget(input, chunks[4]);
 
         // Command palette overlay (above input box)
         if self.palette_open {
             let matches = self.palette_matches();
             if !matches.is_empty() {
-                let area = chunks[3];
+                let area = chunks[4];
                 let max_palette_rows = area.y.saturating_sub(chunks[0].height);
                 let visible_items = matches.len().min(8).min(max_palette_rows.saturating_sub(2) as usize);
                 let palette_height = (visible_items + 2) as u16;
@@ -1733,7 +1777,7 @@ impl App {
             (true, true)   => String::new(),
         };
 
-        let width = chunks[4].width as usize;
+        let width = chunks[5].width as usize;
         let status = if width >= 60 && !power_segment.is_empty() {
             format!(
                 "🔢 {} | {} | 💬 {} | {}",
@@ -1759,7 +1803,7 @@ impl App {
             )
         };
         let status_bar = Paragraph::new(status);
-        f.render_widget(status_bar, chunks[4]);
+        f.render_widget(status_bar, chunks[5]);
     }
 
     /// Handle keyboard input
