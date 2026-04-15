@@ -198,11 +198,35 @@ impl Tool for SpawnTool {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let output = Command::new(&resolved)
+        let mut child = Command::new(&resolved)
             .args(child_args)
             .current_dir(&cwd)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| anyhow!("spawn: execution failed: {}", e))?;
+
+        // Poll with timeout — kill the process if it hangs past SPAWN_TIMEOUT_SECS
+        const SPAWN_TIMEOUT_SECS: u64 = 30;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(SPAWN_TIMEOUT_SECS);
+        loop {
+            match child.try_wait().map_err(|e| anyhow!("spawn: wait error: {}", e))? {
+                Some(_status) => break, // process finished
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(anyhow!(
+                            "spawn: command timed out after {}s (killed): {}",
+                            SPAWN_TIMEOUT_SECS, args
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+
+        let output = child.wait_with_output()
+            .map_err(|e| anyhow!("spawn: failed to collect output: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

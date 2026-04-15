@@ -768,13 +768,30 @@ impl App {
 
         let (tx, rx) = oneshot::channel();
 
-        tokio::task::spawn_blocking(move || {
-            let registry = ToolRegistry::new();
-            let result = registry.execute(&tool_name, &args);
+        // Wrap in tokio timeout as a safety net — spawn's own timeout handles the
+        // common case, but this catches any other tool that could hang indefinitely.
+        tokio::spawn(async move {
+            const TOOL_TIMEOUT_SECS: u64 = 60;
+            let tool_name_for_result = tool_name.clone();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    let registry = ToolRegistry::new();
+                    registry.execute(&tool_name, &args)
+                        .map_err(|e| e.to_string())
+                }),
+            ).await;
+
+            let output = match result {
+                Ok(Ok(Ok(output))) => Ok(output),
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(join_err)) => Err(format!("tool panicked: {}", join_err)),
+                Err(_) => Err(format!("tool timed out after {}s", TOOL_TIMEOUT_SECS)),
+            };
             let _ = tx.send(ToolResult {
-                tool_name,
-                _args: args,
-                output: result.map_err(|e| e.to_string()),
+                tool_name: tool_name_for_result,
+                _args: String::new(),
+                output,
             });
         });
 
