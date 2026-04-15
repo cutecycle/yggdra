@@ -140,6 +140,15 @@ struct ToolResult {
     output: std::result::Result<String, String>,
 }
 
+/// Inline tool result state — shows tool results in real-time panel
+#[derive(Debug, Clone)]
+struct InlineToolResult {
+    tool_name: String,
+    start_time: std::time::Instant,
+    output: String,
+    is_complete: bool,
+}
+
 /// Minimal TUI application
 pub struct App {
     config: Config,
@@ -234,6 +243,8 @@ pub struct App {
     last_battery_check: std::time::Instant,
     /// Syntax highlighter for code blocks
     highlighter: Highlighter,
+    /// Currently displayed inline tool results (cleared when tool completes and is added to history)
+    inline_tool_results: Vec<InlineToolResult>,
 }
 
 impl App {
@@ -331,6 +342,7 @@ impl App {
             on_battery: crate::battery::battery_state(),
             last_battery_check: std::time::Instant::now(),
             highlighter: Highlighter::new(),
+            inline_tool_results: Vec::new(),
         }
     }
 
@@ -894,6 +906,18 @@ impl App {
                     Err(e) => format!("[TOOL_ERROR: {} = {}]", result.tool_name, e),
                 };
 
+                // Add to inline results panel (for immediate display)
+                let output_for_display = match &result.output {
+                    Ok(output) => output.clone(),
+                    Err(e) => format!("Error: {}", e),
+                };
+                self.inline_tool_results.push(InlineToolResult {
+                    tool_name: result.tool_name.clone(),
+                    start_time: std::time::Instant::now(),
+                    output: output_for_display,
+                    is_complete: true,
+                });
+
                 // Persist tool result
                 let tool_msg = Message::new("tool", &output_text);
                 if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {
@@ -1207,14 +1231,25 @@ impl App {
         let content_rows = ((input_content_len + inner_width - 1) / inner_width).max(1) as u16;
         let input_height = (content_rows + 2).min(12); // +2 for borders, cap at 12
 
+        // Calculate inline results panel height: 0 if no results, 1-8 lines if there are results
+        let inline_results_height = if self.inline_tool_results.is_empty() {
+            0
+        } else {
+            // Show summary line + first few lines of each result
+            let lines_per_result = 2; // tool name + one line of output
+            let max_height = (self.inline_tool_results.len() as u16 * lines_per_result).min(8);
+            max_height.max(3) // Minimum 3 lines if there are results
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(2),
-                    Constraint::Min(5),
-                    Constraint::Length(input_height),
-                    Constraint::Length(1),
+                    Constraint::Length(2),                      // Header
+                    Constraint::Min(5),                         // Messages
+                    Constraint::Length(inline_results_height),  // Inline results (0 if no results)
+                    Constraint::Length(input_height),           // Input
+                    Constraint::Length(1),                      // Status bar
                 ]
                 .as_ref(),
             )
@@ -1487,19 +1522,31 @@ impl App {
             AppMode::Ask => (" 🔍ASK ", Color::Yellow),
         };
 
+        // Render inline tool results panel if there are results
+        if !self.inline_tool_results.is_empty() && chunks[2].height > 0 {
+            let results_text = self.format_inline_results();
+            let results_panel = Paragraph::new(results_text)
+                .block(Block::default()
+                    .title(" 🔧 Tool Results ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)))
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            f.render_widget(results_panel, chunks[2]);
+        }
+
         let input = Paragraph::new(format!("> {}", input_text))
             .block(Block::default()
                 .title(format!(" 🌱 Input {}", mode_badge))
                 .border_style(Style::default().fg(mode_border_color))
                 .borders(Borders::ALL))
             .wrap(ratatui::widgets::Wrap { trim: false });
-        f.render_widget(input, chunks[2]);
+        f.render_widget(input, chunks[3]);
 
         // Command palette overlay (above input box)
         if self.palette_open {
             let matches = self.palette_matches();
             if !matches.is_empty() {
-                let area = chunks[2];
+                let area = chunks[3];
                 let max_palette_rows = area.y.saturating_sub(chunks[0].height);
                 let visible_items = matches.len().min(8).min(max_palette_rows.saturating_sub(2) as usize);
                 let palette_height = (visible_items + 2) as u16;
@@ -1640,7 +1687,7 @@ impl App {
             (true, true)   => String::new(),
         };
 
-        let width = chunks[3].width as usize;
+        let width = chunks[4].width as usize;
         let status = if width >= 60 && !power_segment.is_empty() {
             format!(
                 "🔢 {} | {} | 💬 {} | {}",
@@ -1666,7 +1713,7 @@ impl App {
             )
         };
         let status_bar = Paragraph::new(status);
-        f.render_widget(status_bar, chunks[3]);
+        f.render_widget(status_bar, chunks[4]);
     }
 
     /// Handle keyboard input
@@ -2053,6 +2100,7 @@ impl App {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
             // Message validation: no excessive length, check for reasonable content
+            self.inline_tool_results.clear(); // Clear inline results when user sends new message
             self.handle_message(&command).await;
         }
 
@@ -3017,6 +3065,55 @@ impl App {
             result.pop();
         }
         result
+    }
+
+    /// Format inline tool results panel showing active and completed tools
+    fn format_inline_results(&self) -> ratatui::text::Text<'static> {
+        use ratatui::text::{Line, Span};
+        let mut lines = Vec::new();
+
+        for (idx, result) in self.inline_tool_results.iter().enumerate() {
+            let elapsed = result.start_time.elapsed().as_secs();
+            let status_icon = if result.is_complete { "✅" } else { "⏳" };
+            
+            // Tool name line with elapsed time
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "{} {} ({}s): ",
+                    status_icon,
+                    result.tool_name,
+                    elapsed
+                )),
+            ]));
+
+            // Output preview (first 2 lines, truncated)
+            let output_lines: Vec<&str> = result.output.lines().collect();
+            let preview_lines = output_lines.iter().take(2).collect::<Vec<_>>();
+            
+            for line in preview_lines {
+                let truncated = if line.len() > 100 {
+                    format!("{}…", &line[..97])
+                } else {
+                    line.to_string()
+                };
+                lines.push(Line::from(Span::raw(format!("  {}", truncated))));
+            }
+
+            // If more content, show indicator
+            if output_lines.len() > 2 {
+                lines.push(Line::from(Span::raw(format!(
+                    "  … ({} more lines)",
+                    output_lines.len() - 2
+                ))));
+            }
+
+            // Separator between results if not the last one
+            if idx < self.inline_tool_results.len() - 1 {
+                lines.push(Line::from(""));
+            }
+        }
+
+        ratatui::text::Text::from(lines)
     }
 
     /// Format tool output with indented bordered block
