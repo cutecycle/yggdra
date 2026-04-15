@@ -586,18 +586,6 @@ impl App {
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
 
-        // Fire-and-forget gap reflection: ask the model what it wished it knew
-        if let Some(client) = self.ollama_client.clone() {
-            let model = self.config.model.clone();
-            let text = response_text.clone();
-            let (tx, rx) = oneshot::channel();
-            tokio::spawn(async move {
-                let result = crate::gaps::query_gap(&client, &model, &text).await;
-                let _ = tx.send(result.unwrap_or(None));
-            });
-            self.gap_rx = Some(rx);
-        }
-
         // Check for tool calls in the response
         let tool_calls = agent::parse_tool_calls(&response_text);
         let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
@@ -617,6 +605,25 @@ impl App {
         let tool_calls: Vec<_> = tool_calls.into_iter()
             .filter(|tc| tc.name != "spawn_agent")
             .collect();
+
+        // Fire-and-forget gap reflection: only on final prose responses (no tool calls).
+        // When the response IS a tool call, we haven't seen the result yet — firing then
+        // causes spurious "I wish I knew the search result" gaps. Reflect after the model
+        // has actually seen what it asked for.
+        let is_tool_response = !tool_calls.is_empty() || !spawn_calls.is_empty()
+            || response_text.contains("\"tool_calls\"");
+        if !is_tool_response {
+            if let Some(client) = self.ollama_client.clone() {
+                let model = self.config.model.clone();
+                let text = response_text.clone();
+                let (tx, rx) = oneshot::channel();
+                tokio::spawn(async move {
+                    let result = crate::gaps::query_gap(&client, &model, &text).await;
+                    let _ = tx.send(result.unwrap_or(None));
+                });
+                self.gap_rx = Some(rx);
+            }
+        }
 
         // Detect hallucinated conversations — model generating both tool calls and fake outputs
         let is_hallucinating = agent::is_hallucinated_output(&response_text);
