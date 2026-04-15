@@ -560,6 +560,9 @@ impl App {
 
         let response_text = self.streaming_text.clone();
 
+        // Sanitize training artifacts before persisting or parsing
+        let response_text = agent::sanitize_model_output(&response_text);
+
         // Persist assistant message
         let model_msg = Message::new("assistant", &response_text);
         if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
@@ -590,7 +593,29 @@ impl App {
 
         // Check for tool calls in the response
         let tool_calls = agent::parse_tool_calls(&response_text);
-        let spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
+        let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
+
+        // Also extract spawn_agent from JSON-parsed tool calls (if any)
+        for tc in &tool_calls {
+            if tc.name == "spawn_agent" {
+                let mut parts = tc.args.splitn(2, ' ');
+                let task_id = parts.next().unwrap_or("task").to_string();
+                let desc = parts.next().unwrap_or("").to_string();
+                if !spawn_calls.iter().any(|(id, _)| id == &task_id) {
+                    spawn_calls.push((task_id, desc));
+                }
+            }
+        }
+        // Filter spawn_agent out of tool_calls so it's not double-dispatched
+        let tool_calls: Vec<_> = tool_calls.into_iter()
+            .filter(|tc| tc.name != "spawn_agent")
+            .collect();
+
+        // Detect hallucinated conversations — model generating both tool calls and fake outputs
+        let is_hallucinating = agent::is_hallucinated_output(&response_text);
+        if is_hallucinating {
+            self.notify("⚠️ Model hallucinating tool outputs — stopping".to_string());
+        }
 
         // Optional milestone notification — fires if model happens to say [DONE], but doesn't
         // control flow. Any plain-text response (no tool calls) is treated as done.
@@ -600,7 +625,7 @@ impl App {
         }
 
         // Handle spawn_agent: show 🤖 N indicator in chat, execute first one
-        if !spawn_calls.is_empty() && self.subagent_result_rx.is_none() {
+        if !is_hallucinating && !spawn_calls.is_empty() && self.subagent_result_rx.is_none() {
             let (task_id, task_desc) = &spawn_calls[0];
             self.subagent_count += 1;
             self.active_subagents += 1;
@@ -613,7 +638,7 @@ impl App {
             self.status_message = format!("🤖 #{n} running: {task_id}");
             self.execute_subagent_async(task_id.clone(), task_desc.clone());
             self.turn_phase = TurnPhase::ExecutingTool(format!("spawn_agent:{}", task_id));
-        } else if !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
+        } else if !is_hallucinating && !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
             if tool_calls.len() > 1 {
                 // Batch execution for multiple tool calls
                 let calls: Vec<(String, String)> = tool_calls.iter()
@@ -1003,17 +1028,9 @@ impl App {
                  [TOOL: commit \"feat: description\"] — commit\n"
             );
         } else {
-            base.push_str(
-                "             <|tool>toolname<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
-                 TOOL EXAMPLES:\n\
-                 <|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool> — find TODO comments\n\
-                 <|tool>readfile<|tool_sep>Cargo.toml<|end_tool> — read file\n\
-                 <|tool>readfile<|tool_sep>src/main.rs<|tool_sep>50<|tool_sep>100<|end_tool> — read lines 50-100\n\
-                 <|tool>editfile<|tool_sep>src/foo.rs<|tool_sep>old line<|tool_sep>new line<|end_tool> — patch a file (requires exact match; fails if 0 or 2+ matches)\n\
-                 <|tool>writefile<|tool_sep>src/new.rs<|tool_sep>fn main() {{}}<|end_tool> — create/overwrite a file\n\
-                 <|tool>spawn<|tool_sep>ls<|tool_sep>-la<|end_tool> — list dir\n\
-                 <|tool>commit<|tool_sep>fix: bug<|end_tool> — commit\n"
-            );
+            // JSON format (most reliable for instruction-following models)
+            base.push_str(agent::json_tool_descriptions());
+            base.push('\n');
         }
         base.push_str(
             "Never say \"I cannot access files.\" Use rg or spawn instead.\n\

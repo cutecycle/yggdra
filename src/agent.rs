@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 /// Tool call format preference based on model
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFormat {
+    /// JSON: {"tool_calls": [{"name": "...", "parameters": {...}}]} — most reliable
+    Json,
     /// Standard: <|tool>name<|tool_sep>arg<|end_tool>
     Standard,
     /// Qwen 4b quirk: <|tool_call>call:name args<|tool_sep|>none
@@ -31,15 +33,16 @@ pub fn detect_tool_format(model: &str) -> ToolFormat {
     {
         return ToolFormat::Legacy;
     }
-    // Qwen 4b models emit the <|tool_call> format
-    // Match "qwen:4b" or "qwen-4b" but not "qwen:14b", "qwen:24b", etc
-    if lower.contains("qwen") && (lower == "qwen:4b" || lower == "qwen-4b" || 
-                                    lower.contains(":4b-") || lower.contains("-4b-") ||
-                                    lower.ends_with(":4b") || lower.ends_with("-4b")) {
+    // Legacy Qwen 4b (not qwen3.5) emits the <|tool_call> format.
+    if (lower.starts_with("qwen:") || lower.starts_with("qwen-"))
+        && !lower.starts_with("qwen3")
+        && (lower.ends_with(":4b") || lower.ends_with("-4b")
+            || lower.contains(":4b-") || lower.contains("-4b-"))
+    {
         ToolFormat::ToolCall
     } else {
-        // Default to standard Qwen/Gemma format for other models
-        ToolFormat::Standard
+        // JSON is the default — most reliable for instruction-following models
+        ToolFormat::Json
     }
 }
 
@@ -48,6 +51,200 @@ pub fn detect_tool_format(model: &str) -> ToolFormat {
 pub struct ToolCall {
     pub name: String,
     pub args: String,
+}
+
+/// Strip training artifacts from model output that indicate the model has
+/// overrun its stop token (e.g. `<|endoftext|>`, `<|im_start|>`, `<|im_end|>`).
+/// Everything after the first occurrence is discarded.
+pub fn sanitize_model_output(text: &str) -> String {
+    const STOP_MARKERS: &[&str] = &[
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|end_of_turn|>",
+    ];
+    let mut earliest = text.len();
+    for marker in STOP_MARKERS {
+        if let Some(pos) = text.find(marker) {
+            earliest = earliest.min(pos);
+        }
+    }
+    text[..earliest].trim_end().to_string()
+}
+
+/// Detect when a model hallucinates a full conversation turn — generating both
+/// tool calls and fake tool outputs in a single response.
+pub fn is_hallucinated_output(text: &str) -> bool {
+    let has_tool_call = text.contains("[TOOL:") || text.contains("<|tool>") || text.contains("\"tool_calls\"");
+    let has_tool_output = text.contains("[TOOL_OUTPUT:");
+    has_tool_call && has_tool_output
+}
+
+/// Canonical JSON tool descriptions used by both agent.rs and ui.rs prompts.
+pub fn json_tool_descriptions() -> &'static str {
+    r#"Available Tools: [
+  {"name": "rg", "description": "Search files with ripgrep. No shell metacharacters.", "parameters": {"pattern": "string", "directory": "string"}},
+  {"name": "spawn", "description": "Execute a command (resolved via PATH). System paths blocked.", "parameters": {"command": "string", "args": "string (optional, space-separated)"}},
+  {"name": "readfile", "description": "Read file contents. Supports optional line range.", "parameters": {"path": "string", "start_line": "number (optional)", "end_line": "number (optional)"}},
+  {"name": "writefile", "description": "Create or overwrite a file.", "parameters": {"path": "string", "content": "string"}},
+  {"name": "editfile", "description": "Surgical find-and-replace. Finds exact text, replaces once.", "parameters": {"path": "string", "old_text": "string", "new_text": "string"}},
+  {"name": "commit", "description": "Create a git commit.", "parameters": {"message": "string"}},
+  {"name": "python", "description": "Run a Python script. Network imports blocked.", "parameters": {"script_path": "string"}},
+  {"name": "ruste", "description": "Compile and run a Rust file. Network code blocked.", "parameters": {"rust_file_path": "string"}},
+  {"name": "set_params", "description": "Adjust LLM sampling parameters.", "parameters": {"settings": "string (e.g. temperature=0.8 top_p=0.9)"}},
+  {"name": "spawn_agent", "description": "Spawn a subagent for parallel task execution.", "parameters": {"task_id": "string", "description": "string"}}
+]
+
+Return tool calls as JSON. Do not add any text before or after the JSON:
+{"tool_calls": [{"name": "toolName", "parameters": {"key": "value"}}]}
+
+When the task is complete and no tools are needed, respond with plain text (no JSON)."#
+}
+
+/// Parse JSON tool calls from model output → Vec<ToolCall>.
+/// Robust extraction (finds JSON in code blocks or raw), strict schema validation.
+pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
+    // Try to find JSON: first in ```json blocks, then raw
+    let candidate = extract_json_candidate(output);
+    let json_str = match candidate {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    // Parse and validate schema
+    let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let tool_calls = match parsed.get("tool_calls").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut calls = Vec::new();
+    for tc in tool_calls {
+        let name = match tc.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let params = tc.get("parameters").cloned().unwrap_or(serde_json::Value::Null);
+        let args = json_params_to_args(&name, &params);
+        calls.push(ToolCall { name, args });
+    }
+    calls
+}
+
+/// Extract a JSON candidate from model output — handles code blocks and raw JSON.
+fn extract_json_candidate(output: &str) -> Option<String> {
+    // 1. Try ```json ... ``` code block
+    if let Some(start) = output.find("```json") {
+        let after = &output[start + 7..];
+        if let Some(end) = after.find("```") {
+            return Some(after[..end].trim().to_string());
+        }
+    }
+    // 2. Try ``` ... ``` generic code block containing tool_calls
+    if let Some(start) = output.find("```") {
+        let after = &output[start + 3..];
+        if let Some(end) = after.find("```") {
+            let block = after[..end].trim();
+            if block.contains("tool_calls") {
+                return Some(block.to_string());
+            }
+        }
+    }
+    // 3. Try raw JSON: find first { that leads to "tool_calls"
+    if let Some(pos) = output.find('{') {
+        let remainder = &output[pos..];
+        if remainder.contains("\"tool_calls\"") {
+            // Find matching closing brace
+            let mut depth = 0;
+            let mut end = 0;
+            for (i, ch) in remainder.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end > 0 {
+                return Some(remainder[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Convert JSON parameters to the flat args string expected by each tool.
+fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
+    let get_str = |key: &str| -> String {
+        params.get(key)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string().trim_matches('"').to_string(),
+            })
+            .unwrap_or_default()
+    };
+
+    match tool_name {
+        "rg" => {
+            let pattern = get_str("pattern");
+            let dir = get_str("directory");
+            format!("{} {}", pattern, dir)
+        }
+        "readfile" => {
+            let path = get_str("path");
+            let start = params.get("start_line").and_then(|v| v.as_u64());
+            let end = params.get("end_line").and_then(|v| v.as_u64());
+            match (start, end) {
+                (Some(s), Some(e)) => format!("{} {} {}", path, s, e),
+                (Some(s), None) => format!("{} {}", path, s),
+                _ => path,
+            }
+        }
+        "writefile" => {
+            let path = get_str("path");
+            let content = get_str("content");
+            format!("{}\x00{}", path, content)
+        }
+        "editfile" => {
+            let path = get_str("path");
+            let old = get_str("old_text");
+            let new = get_str("new_text");
+            format!("{}\x00{}\x00{}", path, old, new)
+        }
+        "spawn" => {
+            let cmd = get_str("command");
+            let args = get_str("args");
+            if args.is_empty() { cmd } else { format!("{} {}", cmd, args) }
+        }
+        "commit" => get_str("message"),
+        "python" => get_str("script_path"),
+        "ruste" => get_str("rust_file_path"),
+        "set_params" => get_str("settings"),
+        "spawn_agent" => {
+            let task_id = get_str("task_id");
+            let desc = get_str("description");
+            format!("{} {}", task_id, desc)
+        }
+        _ => {
+            // Generic fallback: space-join all string values
+            params.as_object()
+                .map(|obj| obj.values()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "))
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// Build tool args from the raw args section after the tool name.
@@ -180,6 +377,24 @@ pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
 
 /// Parse tool calls with a format hint — tries expected format first, then falls back
 pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<ToolCall> {
+    let calls = parse_single_format(output, format);
+    if !calls.is_empty() {
+        return calls;
+    }
+    // Fallback: try other formats (non-recursive)
+    for format_variant in &[ToolFormat::Json, ToolFormat::Standard, ToolFormat::ToolCall, ToolFormat::Legacy] {
+        if *format_variant != format {
+            let calls = parse_single_format(output, *format_variant);
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Parse tool calls using exactly one format (no fallback, no recursion).
+fn parse_single_format(output: &str, format: ToolFormat) -> Vec<ToolCall> {
     static RE_QWEN_GEMMA: OnceLock<Regex> = OnceLock::new();
     static RE_TOOL_CALL: OnceLock<Regex> = OnceLock::new();
     static RE_LEGACY: OnceLock<Regex> = OnceLock::new();
@@ -193,14 +408,15 @@ pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<Too
     });
     
     let re_legacy = RE_LEGACY.get_or_init(|| {
-        // (?s) so .* matches newlines — needed for multiline writefile content
         Regex::new(r"(?s)\[TOOL:\s+(\w+)\s+(.*?)\]").unwrap()
     });
     
     let mut calls = Vec::new();
     
-    // Try primary format first
     match format {
+        ToolFormat::Json => {
+            calls = parse_json_tool_calls(output);
+        }
         ToolFormat::Standard => {
             for cap in re_qwen_gemma.captures_iter(output) {
                 if let Some(name_match) = cap.get(1) {
@@ -253,18 +469,6 @@ pub fn parse_tool_calls_with_format(output: &str, format: ToolFormat) -> Vec<Too
                         raw.to_string()
                     };
                     calls.push(ToolCall { name, args });
-                }
-            }
-        }
-    }
-    
-    // Fallback to other formats if primary returned nothing
-    if calls.is_empty() {
-        for format_variant in &[ToolFormat::Standard, ToolFormat::ToolCall, ToolFormat::Legacy] {
-            if format_variant != &format {
-                calls = parse_tool_calls_with_format(output, *format_variant);
-                if !calls.is_empty() {
-                    break;
                 }
             }
         }
@@ -375,65 +579,24 @@ impl Agent {
 
     /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering() -> String {
-        let steering = SteeringDirective::custom(
+        let prompt = format!(
             "You are an agentic assistant with access to tools and subagent spawning.\n\
-             When you need to execute tasks, use the <|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool> format for tool calls.\n\
              \n\
-             AVAILABLE TOOLS:\n\
-             \n\
-             rg (ripgrep): Search files with patterns. No pipes, redirects, or shell metacharacters allowed.\n\
-               <|tool>rg<|tool_sep>pattern<|tool_sep>directory<|end_tool>\n\
-               HINT: Use this to search .yggdra/knowledge/ for documentation, tutorials, reference materials.\n\
-             \n\
-             spawn: Execute binaries/commands (resolved via PATH). Dangerous system paths blocked.\n\
-               <|tool>spawn<|tool_sep>command<|tool_sep>arg1<|tool_sep>arg2<|end_tool>\n\
-             \n\
-             readfile: Read file contents. Supports line ranges (1-indexed).\n\
-               <|tool>readfile<|tool_sep>path<|end_tool>                   (full file)\n\
-               <|tool>readfile<|tool_sep>path<|tool_sep>10<|tool_sep>50<|end_tool>  (lines 10-50)\n\
-             \n\
-             writefile: Create/overwrite a file with content.\n\
-               <|tool>writefile<|tool_sep>path<|tool_sep>content<|end_tool>\n\
-             \n\
-             editfile: Surgical in-place replacement. Finds exact text match, replaces once.\n\
-               <|tool>editfile<|tool_sep>path<|tool_sep>old_text<|tool_sep>new_text<|end_tool>\n\
-             \n\
-             commit: Create git commit with message.\n\
-               <|tool>commit<|tool_sep>message<|end_tool>\n\
-             \n\
-             python: Run Python script. Network imports (requests, urllib, etc.) are blocked.\n\
-               <|tool>python<|tool_sep>script_path<|end_tool>\n\
-             \n\
-             ruste: Compile and execute Rust code. Network code (TcpStream, reqwest, etc.) is blocked.\n\
-               <|tool>ruste<|tool_sep>rust_file_path<|end_tool>\n\
-             \n\
-             set_params: Adjust LLM parameters at runtime.\n\
-               <|tool>set_params<|tool_sep>temperature=0.8<|tool_sep>top_p=0.9<|tool_sep>top_k=40<|end_tool>\n\
-             \n\
-             spawn_agent: Spawn subagent for parallel task execution.\n\
-               <|tool>spawn_agent<|tool_sep>task_id<|tool_sep>\"task description\"<|end_tool>\n\
+             {}\n\
              \n\
              OFFLINE KNOWLEDGE BASE:\n\
-             The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories:\n\
-             - Programming: rust, python, go, javascript, c++, typescript, shell, etc.\n\
-             - Platforms: godot, unreal, unity, blender, android, ios, web\n\
-             - Science: physics, chemistry, biology, astronomy, mathematics\n\
-             - Engineering: spacecraft, robotics, networks, databases, algorithms\n\
-             - Reference: standards, specifications, tutorials, research papers\n\
-             STRATEGY: For any question about libraries, frameworks, languages, standards, or techniques:\n\
-             1. Search .yggdra/knowledge/ first with rg to find relevant documentation\n\
-             2. Read the best matches with readfile\n\
-             3. Apply that knowledge to solve the problem\n\
-             This offline base eliminates dependency on internet access and model training cutoff.\n\
+             The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories.\n\
+             STRATEGY: Search .yggdra/knowledge/ with rg first, then readfile the best matches.\n\
              \n\
              IMPORTANT NOTES:\n\
              - Tool output is capped at 3000 chars by default; full output stored in session.\n\
              - After calling a tool, include the result in your next response and continue reasoning.\n\
              - Subagents run in parallel; wait for all results before combining for final output.\n\
              - Path traversal (../) and system files (/etc, /bin) are blocked by security layer.\n\
-             - When task is fully complete, respond with summary of results — no special marker needed."
+             - When task is fully complete, respond with summary of results — no special marker needed.",
+            json_tool_descriptions()
         );
-        steering.format_for_system_prompt()
+        SteeringDirective::custom(&prompt).format_for_system_prompt()
     }
 
     /// Check if LLM output indicates completion (explicit marker only)
@@ -502,6 +665,14 @@ impl Agent {
                 role: "assistant".to_string(),
                 content: llm_output.clone(),
             });
+
+            // Sanitize: strip training artifacts that indicate overrun
+            let llm_output = sanitize_model_output(&llm_output);
+
+            // Detect hallucinated conversation (model fabricating tool outputs)
+            if is_hallucinated_output(&llm_output) {
+                return Ok(llm_output);
+            }
 
             // Check for tool calls (no subagent spawning here)
             let format = detect_tool_format(&self.config.model);
@@ -590,6 +761,14 @@ impl Agent {
                 role: "assistant".to_string(),
                 content: llm_output.clone(),
             });
+
+            // Sanitize: strip training artifacts that indicate overrun
+            let llm_output = sanitize_model_output(&llm_output);
+
+            // Detect hallucinated conversation (model fabricating tool outputs)
+            if is_hallucinated_output(&llm_output) {
+                return Ok(llm_output);
+            }
 
             // Check for tool calls
             let format = detect_tool_format(&self.config.model);
@@ -796,25 +975,32 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_tool_format_qwen35_not_toolcall() {
+        // qwen3.5 variants should get Json (default), not ToolCall
+        assert_eq!(detect_tool_format("qwen3.5:4b"), ToolFormat::Json);
+        assert_eq!(detect_tool_format("qwen3.5:9b-q4_K_M"), ToolFormat::Json);
+    }
+
+    #[test]
+    fn test_detect_tool_format_heretic_is_legacy() {
+        assert_eq!(detect_tool_format("qwen3.5-heretic-4b:f16"), ToolFormat::Legacy);
+        assert_eq!(detect_tool_format("qwen3.5-heretic-9b:q4_K_M"), ToolFormat::Legacy);
+        assert_eq!(detect_tool_format("qwen3.5-heretic-27b:q4_K_M"), ToolFormat::Legacy);
+    }
+
+    #[test]
     fn test_detect_tool_format_qwen_other_versions() {
-        // Only 4b has the quirky format; others default to Standard
-        let format = detect_tool_format("qwen:7b");
-        assert_eq!(format, ToolFormat::Standard);
-        
-        let format = detect_tool_format("qwen:14b");
-        assert_eq!(format, ToolFormat::Standard);
+        // Non-4b qwen → Json (default)
+        assert_eq!(detect_tool_format("qwen:7b"), ToolFormat::Json);
+        assert_eq!(detect_tool_format("qwen:14b"), ToolFormat::Json);
     }
 
     #[test]
     fn test_detect_tool_format_non_qwen() {
-        let format = detect_tool_format("llama2");
-        assert_eq!(format, ToolFormat::Standard);
-        
-        let format = detect_tool_format("mistral");
-        assert_eq!(format, ToolFormat::Standard);
-        
-        let format = detect_tool_format("neural-chat");
-        assert_eq!(format, ToolFormat::Standard);
+        // All standard models get Json as default
+        assert_eq!(detect_tool_format("llama2"), ToolFormat::Json);
+        assert_eq!(detect_tool_format("mistral"), ToolFormat::Json);
+        assert_eq!(detect_tool_format("neural-chat"), ToolFormat::Json);
     }
 
     #[test]
@@ -890,5 +1076,166 @@ mod tests {
         let config = AgentConfig::new("llama2", "http://localhost:11434")
             .with_app_mode(AppMode::Ask);
         assert_eq!(config.app_mode, AppMode::Ask);
+    }
+
+    #[test]
+    fn test_sanitize_strips_endoftext() {
+        let input = "4<|endoftext|><|im_start|>user\nI'm a student";
+        assert_eq!(sanitize_model_output(input), "4");
+    }
+
+    #[test]
+    fn test_sanitize_strips_im_start() {
+        let input = "\n\n<think>\n\n</think>\n\n4<|endoftext|><|im_start|>\n<|im_start|>\n";
+        let cleaned = sanitize_model_output(input);
+        assert!(cleaned.contains("4"));
+        assert!(!cleaned.contains("<|im_start|>"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_clean_output() {
+        let input = "[TOOL: readfile src/main.rs]";
+        assert_eq!(sanitize_model_output(input), input);
+    }
+
+    #[test]
+    fn test_sanitize_preserves_tool_markers() {
+        // <|tool> is a yggdra tool format, not a training artifact
+        let input = "<|tool>rg<|tool_sep>pattern<|end_tool>";
+        assert_eq!(sanitize_model_output(input), input);
+    }
+
+    #[test]
+    fn test_hallucination_detection_basic() {
+        let hallucinated = "[TOOL: readfile src/main.rs]\n[TOOL_OUTPUT: readfile = fn main() {}]";
+        assert!(is_hallucinated_output(hallucinated));
+    }
+
+    #[test]
+    fn test_hallucination_detection_normal_tool_call() {
+        let normal = "[TOOL: readfile src/main.rs]";
+        assert!(!is_hallucinated_output(normal));
+    }
+
+    #[test]
+    fn test_hallucination_detection_standard_format() {
+        let hallucinated = "<|tool>readfile<|tool_sep>src/main.rs<|end_tool>\n[TOOL_OUTPUT: readfile = fn main()]";
+        assert!(is_hallucinated_output(hallucinated));
+    }
+
+    #[test]
+    fn test_hallucination_detection_plain_text() {
+        let plain = "The answer is 42.";
+        assert!(!is_hallucinated_output(plain));
+    }
+
+    // ─── JSON tool format tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_json_readfile() {
+        let output = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "readfile");
+        assert_eq!(calls[0].args, "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_json_readfile_with_lines() {
+        let output = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs", "start_line": 10, "end_line": 50}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, "src/main.rs 10 50");
+    }
+
+    #[test]
+    fn test_parse_json_writefile() {
+        let output = r#"{"tool_calls": [{"name": "writefile", "parameters": {"path": "src/foo.rs", "content": "fn main() {}\n"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "writefile");
+        let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
+        assert_eq!(parts[0], "src/foo.rs");
+        assert!(parts[1].contains("fn main"));
+    }
+
+    #[test]
+    fn test_parse_json_editfile() {
+        let output = r#"{"tool_calls": [{"name": "editfile", "parameters": {"path": "src/lib.rs", "old_text": "old code", "new_text": "new code"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        let parts: Vec<&str> = calls[0].args.splitn(3, '\x00').collect();
+        assert_eq!(parts[0], "src/lib.rs");
+        assert_eq!(parts[1], "old code");
+        assert_eq!(parts[2], "new code");
+    }
+
+    #[test]
+    fn test_parse_json_rg() {
+        let output = r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "fn main", "directory": "src/"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, "fn main src/");
+    }
+
+    #[test]
+    fn test_parse_json_multiple_calls() {
+        let output = r#"{"tool_calls": [
+            {"name": "readfile", "parameters": {"path": "src/main.rs"}},
+            {"name": "readfile", "parameters": {"path": "Cargo.toml"}}
+        ]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].args, "src/main.rs");
+        assert_eq!(calls[1].args, "Cargo.toml");
+    }
+
+    #[test]
+    fn test_parse_json_in_code_block() {
+        let output = "I'll read that file:\n```json\n{\"tool_calls\": [{\"name\": \"readfile\", \"parameters\": {\"path\": \"src/main.rs\"}}]}\n```";
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "readfile");
+    }
+
+    #[test]
+    fn test_parse_json_with_surrounding_text() {
+        let output = "Let me search for that pattern.\n{\"tool_calls\": [{\"name\": \"rg\", \"parameters\": {\"pattern\": \"TODO\", \"directory\": \".\"}}]}\nDone.";
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "rg");
+    }
+
+    #[test]
+    fn test_parse_json_empty_tool_calls() {
+        let output = r#"{"tool_calls": []}"#;
+        let calls = parse_json_tool_calls(output);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_plain_text_no_json() {
+        let output = "The answer is 42. No tools needed.";
+        let calls = parse_json_tool_calls(output);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_spawn_agent() {
+        let output = r#"{"tool_calls": [{"name": "spawn_agent", "parameters": {"task_id": "search-docs", "description": "Search the docs for auth info"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "spawn_agent");
+        assert!(calls[0].args.contains("search-docs"));
+        assert!(calls[0].args.contains("Search the docs"));
+    }
+
+    #[test]
+    fn test_json_format_fallback_to_legacy() {
+        // If model outputs [TOOL:] instead of JSON, fallback should catch it
+        let output = "[TOOL: readfile src/main.rs]";
+        let calls = parse_tool_calls_with_format(output, ToolFormat::Json);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "readfile");
     }
 }

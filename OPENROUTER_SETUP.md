@@ -34,9 +34,12 @@ launchctl load ~/Library/LaunchAgents/com.yggdra.openrouter-proxy.plist
 
 Models are defined in `models.json`:
 
-- **gemma-4-26b** (primary) → `google/gemma-4-26b-a4b-it`
-- **deepseek-r1** (alternative) → `deepseek/deepseek-r1-0528:free`
-- **kimi-k2** (alternative) → `moonshotai/kimi-k2:free`
+- **gemma-4-26b** (primary, reliable) → `google/gemma-4-26b-a4b-it`
+- **deepseek-r1** (free-tier, may be unavailable) → `deepseek/deepseek-r1-0528:free`
+- **kimi-k2.5** (free-tier, may be unavailable) → `moonshotai/kimi-k2.5:free`
+
+> **Note:** Free-tier OpenRouter models can go offline without notice.
+> Only `gemma-4-26b` is consistently available.
 
 To verify available models:
 
