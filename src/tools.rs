@@ -77,14 +77,14 @@ impl Tool for RipgrepTool {
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        // Parse arguments: expect "pattern" "path" format
-        let parts: Vec<&str> = args.split_whitespace().collect();
+        // Parse arguments respecting quoted strings (e.g. "hello world" path/)
+        let parts = shell_split(args);
         if parts.len() < 2 {
             return Err(anyhow!("rg: usage: rg PATTERN PATH"));
         }
 
-        let pattern = parts[0].trim_matches('"').trim_matches('\'');
-        let path = parts[1].trim_matches('"').trim_matches('\'');
+        let pattern = &parts[0];
+        let path = &parts[1];
 
         // Ensure path exists (may be a symlink — follow it)
         if !Path::new(path).exists() {
@@ -722,6 +722,27 @@ mod tests {
 
         // Only truly empty input is rejected
         assert!(tool.validate_input("").is_err());
+    }
+
+    #[test]
+    fn test_ripgrep_quoted_pattern_parsing() {
+        // Verify that shell_split is used: multi-word quoted patterns should yield
+        // exactly two parts, not be split on the space inside quotes.
+        let parts = shell_split(r#""hello world" src/"#);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "hello world");
+        assert_eq!(parts[1], "src/");
+
+        // Single-quoted pattern
+        let parts = shell_split("'foo bar baz' .yggdra/knowledge/");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "foo bar baz");
+        assert_eq!(parts[1], ".yggdra/knowledge/");
+
+        // Unquoted single-word pattern still works
+        let parts = shell_split("pattern path/");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "pattern");
     }
 
     #[test]

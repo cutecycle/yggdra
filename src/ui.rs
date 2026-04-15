@@ -582,6 +582,29 @@ impl App {
         }
     }
 
+    /// Warn the user when the context window is getting full.
+    fn check_context_pressure(&mut self) {
+        let (prompt_tok, _) = self.last_token_counts;
+        if prompt_tok == 0 { return; }
+        let context_window = self.config.context_window.unwrap_or(4096) as f64;
+        let usage_pct = ((prompt_tok as f64) / context_window * 100.0).min(100.0) as u32;
+
+        let (threshold, msg) = if usage_pct >= 95 {
+            (95u32, format!("🔴 Context critical (~{}%) — /compress now or quality will degrade", usage_pct))
+        } else if usage_pct >= 90 {
+            (90u32, format!("🟠 Context at ~{}% — recommend /compress soon", usage_pct))
+        } else if usage_pct >= 80 {
+            (80u32, format!("⚠️ Context at ~{}% — consider /compress", usage_pct))
+        } else {
+            return;
+        };
+
+        if self.last_warned_ctx_pct < threshold {
+            self.last_warned_ctx_pct = threshold;
+            self.push_system_event(msg);
+        }
+    }
+
     /// Streaming finished: persist response, check for tool calls, maybe continue
     fn complete_streaming_turn(&mut self) {
         self.stream_start_time = None;
@@ -615,6 +638,9 @@ impl App {
         }
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
+
+        // Warn if context window is filling up
+        self.check_context_pressure();
 
         // Check for tool calls in the response
         let tool_calls = agent::parse_tool_calls(&response_text);
@@ -1201,7 +1227,16 @@ impl App {
                 .into_iter()
                 .map(|(name, args)| {
                     match registry.execute(&name, &args) {
-                        Ok(output) => format!("[TOOL_OUTPUT: {} = {}]", name, output),
+                        Ok(output) => {
+                            // Truncate to prevent SQLITE_TOOBIG when batch results are large
+                            let truncated = if output.chars().count() > 4000 {
+                                let t: String = output.chars().take(4000).collect();
+                                format!("{}...(truncated)", t)
+                            } else {
+                                output
+                            };
+                            format!("[TOOL_OUTPUT: {} = {}]", name, truncated)
+                        }
                         Err(e) => format!("[TOOL_ERROR: {} = {}]", name, e),
                     }
                 })
@@ -2008,6 +2043,8 @@ impl App {
                 if self.palette_open {
                     self.palette_open = false;
                     self.input_buffer.clear();
+                } else if self.turn_phase != TurnPhase::Idle {
+                    self.cancel_current_turn();
                 } else {
                     self.input_buffer.clear();
                 }
@@ -2026,6 +2063,19 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Cancel any in-progress inference, tool execution, or subagent run.
+    fn cancel_current_turn(&mut self) {
+        self.stream_rx = None;
+        self.tool_result_rx = None;
+        self.subagent_result_rx = None;
+        self.subagent_token_rx = None;
+        self.turn_phase = TurnPhase::Idle;
+        self.streaming_text.clear();
+        self.tool_iteration_count = 0;
+        self.consecutive_empty_kicks = 0;
+        self.push_system_event("⛔ Turn cancelled".to_string());
     }
 
     /// Handle mouse events (scroll wheel)
