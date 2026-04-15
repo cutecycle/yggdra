@@ -373,7 +373,7 @@ impl App {
                     format!(
                         "New session started in `{cwd}`. \
                          This directory has no AGENTS.md yet — you need to terraform it. \
-                         First, explore the directory: [TOOL: spawn ls -la .] and read any \
+                         First, explore the directory and read any \
                          key files (README, Cargo.toml, package.json, etc.). \
                          Then write an AGENTS.md that describes the project: its purpose, \
                          structure, build commands, conventions, and any gotchas. \
@@ -1078,30 +1078,9 @@ impl App {
              • think — reasoning block (use freely)\n\
              TOOL FORMAT:\n"
         );
-        // Select tool format based on model name or adaptive detection
-        let model_lower = self.config.model.to_lowercase();
-        let use_legacy_format = self.thinking_suppresses_content
-            || model_lower.contains("heretic")
-            || model_lower.contains("qwq")
-            || model_lower.contains("thinking")
-            || model_lower.contains("r1")
-            || model_lower.contains("reasoner");
-        if use_legacy_format {
-            base.push_str(
-                "             [TOOL: name arg1 arg2]\n\
-                 TOOL EXAMPLES:\n\
-                 [TOOL: rg TODO src/] — find TODO comments\n\
-                 [TOOL: readfile Cargo.toml] — read file\n\
-                 [TOOL: editfile src/foo.rs\nold line\n---\nnew line] — patch a file (requires exact match; fails if 0 or 2+ matches)\n\
-                 [TOOL: writefile src/new.rs\ncontent here] — create/overwrite a file\n\
-                 [TOOL: spawn ls .yggdra/todo/] — list dir\n\
-                 [TOOL: commit \"feat: description\"] — commit\n"
-            );
-        } else {
-            // JSON format (most reliable for instruction-following models)
-            base.push_str(agent::json_tool_descriptions());
-            base.push('\n');
-        }
+        // JSON format only — all production models (qwen3.5, gemma-4) support it
+        base.push_str(agent::json_tool_descriptions());
+        base.push('\n');
         base.push_str(
             "Never say \"I cannot access files.\" Use rg or spawn instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\
@@ -2430,7 +2409,7 @@ impl App {
                     tool_output.lines().take(30).collect::<Vec<_>>().join("\n")
                 };
 
-                let response = format!("[TOOL: {} {}]\n{}", tool_name, args, output_msg);
+                let response = format!("{}\n{}", tool_name, output_msg);
                 
                 let tool_msg = Message::new("tool", response);
                 if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {

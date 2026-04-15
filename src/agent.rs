@@ -6,8 +6,6 @@ use crate::steering::SteeringDirective;
 use crate::ollama::{OllamaClient, OllamaMessage, StreamEvent};
 use crate::config::AppMode;
 use anyhow::{anyhow, Result};
-use regex::Regex;
-use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
 /// Tool call representation parsed from LLM output
@@ -301,42 +299,6 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
     }
 }
 
-/// Build tool args from the raw args section after the tool name.
-/// For `writefile`: encodes as `path\0content` preserving newlines.
-/// For all other tools: space-joins trimmed sections (legacy behavior).
-fn build_tool_args(name: &str, args_section: &str) -> String {
-    if name == "writefile" {
-        // Split on first two <|tool_sep>: sections[0] is empty, [1] is path, [2..] is content
-        let mut sections = args_section.splitn(3, "<|tool_sep>");
-        let _empty = sections.next();
-        let path_raw = sections.next().map(|s| s.trim()).unwrap_or("");
-        let content_raw = sections.next();
-
-        let (path, content) = if let Some(c) = content_raw {
-            // Normal case: two <|tool_sep> separators — path and content are distinct
-            (path_raw, c)
-        } else {
-            // Fallback: model used a newline instead of a second <|tool_sep>
-            // e.g. <|tool>writefile<|tool_sep>path\ncontent<|end_tool>
-            if let Some(nl) = path_raw.find('\n') {
-                (&path_raw[..nl], &path_raw[nl + 1..])
-            } else {
-                (path_raw, "")
-            }
-        };
-
-        format!("{}\x00{}", path.trim(), content)
-    } else {
-        args_section
-            .split("<|tool_sep>")
-            .filter(|s| !s.trim().is_empty())
-            .filter(|s| !s.trim().eq_ignore_ascii_case("none"))
-            .map(|s| s.trim())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
 /// Parse tool calls from LLM output — JSON only.
 pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
     parse_json_tool_calls(output)
@@ -480,8 +442,8 @@ impl Agent {
         ];
 
         let steering = SteeringDirective::custom(
-            "Use tools to complete this task. Format tool calls as:\n\
-             <|tool>name<|tool_sep>arg<|end_tool>\n\
+            "Use tools to complete this task. Emit tool calls as JSON:\n\
+             {\"tool_calls\": [{\"name\": \"toolName\", \"parameters\": {\"key\": \"value\"}}]}\n\
              After execution, include results in your next response. \
              When the task is fully complete, respond with plain text summarising the result."
         );
@@ -587,9 +549,9 @@ impl Agent {
 
         // Add user query with steering injection for tool use
         let steering = SteeringDirective::custom(
-            "Use tools or spawn subagents to answer this query. Format calls as:\n\
-             [TOOL: name args] for local tools\n\
-             [TOOL: spawn_agent task_id \"description\"] for parallel subagents.\n\
+            "Use tools or spawn subagents to answer this query. Emit tool calls as JSON:\n\
+             {\"tool_calls\": [{\"name\": \"toolName\", \"parameters\": {\"key\": \"value\"}}]}\n\
+             For parallel subagents: {\"tool_calls\": [{\"name\": \"spawn_agent\", \"parameters\": {\"task_id\": \"id\", \"description\": \"task\"}}]}\n\
              After execution, include results in your next response."
         );
         let query_with_steering = format!(

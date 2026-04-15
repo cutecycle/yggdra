@@ -71,20 +71,20 @@ pub async fn spawn_subagent(
     }
 }
 
-/// Parse spawn_agent tool calls: [TOOL: spawn_agent task_id "description"]
+/// Parse spawn_agent tool calls from JSON output:
+/// {"tool_calls": [{"name": "spawn_agent", "parameters": {"task_id": "...", "description": "..."}}]}
 pub fn parse_spawn_agent_calls(output: &str) -> Vec<(String, String)> {
-    let mut calls = Vec::new();
-    if let Ok(re) = regex::Regex::new(r#"\[TOOL:\s+spawn_agent\s+(\w+)\s+"([^"]+)"\]"#) {
-        for cap in re.captures_iter(output) {
-            if let (Some(id_match), Some(desc_match)) = (cap.get(1), cap.get(2)) {
-                calls.push((
-                    id_match.as_str().to_string(),
-                    desc_match.as_str().to_string(),
-                ));
-            }
-        }
-    }
-    calls
+    crate::agent::parse_json_tool_calls(output)
+        .into_iter()
+        .filter(|tc| tc.name == "spawn_agent")
+        .filter_map(|tc| {
+            // args encoded as "task_id description" (space-separated, task_id is a single word)
+            let mut parts = tc.args.splitn(2, ' ');
+            let task_id = parts.next()?.to_string();
+            let description = parts.next().unwrap_or("").to_string();
+            if task_id.is_empty() { None } else { Some((task_id, description)) }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -107,11 +107,12 @@ mod tests {
 
     #[test]
     fn test_parse_spawn_agent_calls() {
-        let output = r#"I'll split this into subtasks. [TOOL: spawn_agent search "find patterns"] 
-        and [TOOL: spawn_agent analyze "compute stats"]"#;
+        let output = r#"{"tool_calls": [{"name": "spawn_agent", "parameters": {"task_id": "search", "description": "find patterns"}}, {"name": "spawn_agent", "parameters": {"task_id": "analyze", "description": "compute stats"}}]}"#;
         let calls = parse_spawn_agent_calls(output);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "search");
         assert_eq!(calls[0].1, "find patterns");
+        assert_eq!(calls[1].0, "analyze");
+        assert_eq!(calls[1].1, "compute stats");
     }
 }
