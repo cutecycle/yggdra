@@ -83,24 +83,52 @@ pub fn is_hallucinated_output(text: &str) -> bool {
 
 /// Canonical JSON tool descriptions used by both agent.rs and ui.rs prompts.
 pub fn json_tool_descriptions() -> &'static str {
-    r#"Available Tools: [
-  {"name": "rg", "description": "Search files with ripgrep. No shell metacharacters.", "parameters": {"pattern": "string", "directory": "string"}},
-  {"name": "spawn", "description": "Execute a command (resolved via PATH). System paths blocked.", "parameters": {"command": "string", "args": "string (optional, space-separated)"}},
-  {"name": "readfile", "description": "Read file contents. Supports optional line range.", "parameters": {"path": "string", "start_line": "number (optional)", "end_line": "number (optional)"}},
-  {"name": "writefile", "description": "Create or overwrite a file.", "parameters": {"path": "string", "content": "string"}},
-  {"name": "editfile", "description": "Surgical find-and-replace. Finds exact text, replaces once.", "parameters": {"path": "string", "old_text": "string", "new_text": "string"}},
-  {"name": "commit", "description": "Create a git commit.", "parameters": {"message": "string"}},
-  {"name": "python", "description": "Run a Python script. Network imports blocked.", "parameters": {"script_path": "string"}},
-  {"name": "ruste", "description": "Compile and run a Rust file. Network code blocked.", "parameters": {"rust_file_path": "string"}},
-  {"name": "set_params", "description": "Adjust LLM sampling parameters.", "parameters": {"settings": "string (e.g. temperature=0.8 top_p=0.9)"}},
-  {"name": "spawn_agent", "description": "Spawn a subagent for parallel task execution.", "parameters": {"task_id": "string", "description": "string"}}
-]
+    r#"Available Tools (EXACT NAMES ONLY — do not invent tools):
 
-Return tool calls as JSON. Do not add any text before or after the JSON:
-{"tool_calls": [{"name": "toolName", "parameters": {"key": "value"}}]}
+1. "rg" — Search files with ripgrep
+   Parameters: {"pattern": "string (regex)", "directory": "string"}
+   Examples: {"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}
+   Note: directory must be a path, NOT a glob
 
-When the task is complete and no tools are needed, respond with plain text (no JSON)."#
+2. "spawn" — Execute a shell command
+   Parameters: {"command": "string (shell command)"}
+   Examples: {"name": "spawn", "parameters": {"command": "npm test"}}
+   Note: Commands run in current directory; NO glob expansion needed
+
+3. "readfile" — Read a SINGLE file (NOT globs)
+   Parameters: {"path": "string (exact file path)", "start_line": "number (optional)", "end_line": "number (optional)"}
+   Examples: {"name": "readfile", "parameters": {"path": "README.md"}}
+   WRONG: {"path": "*.md"} ← INVALID: globs not supported, use spawn with ls instead
+
+4. "writefile" — Create or overwrite a file
+   Parameters: {"path": "string", "content": "string"}
+   Examples: {"name": "writefile", "parameters": {"path": "file.txt", "content": "hello"}}
+
+5. "editfile" — Find-and-replace in a file
+   Parameters: {"path": "string", "old_text": "string (exact match)", "new_text": "string"}
+   Examples: {"name": "editfile", "parameters": {"path": "main.rs", "old_text": "fn main()", "new_text": "fn run()"}}
+
+6. "commit" — Create a git commit
+   Parameters: {"message": "string"}
+   Examples: {"name": "commit", "parameters": {"message": "Fix: update docs"}}
+
+7. "python" — Run a Python script
+   Parameters: {"script_path": "string"}
+   Examples: {"name": "python", "parameters": {"script_path": "script.py"}}
+
+8. "ruste" — Compile and run Rust code
+   Parameters: {"rust_file_path": "string"}
+   Examples: {"name": "ruste", "parameters": {"rust_file_path": "main.rs"}}
+
+CRITICAL: These are the ONLY valid tools. Do NOT use: ls, cat, find, bash, shell, sh, cmd, etc.
+To list files, use: {"name": "spawn", "parameters": {"command": "ls -la directory/"}}
+
+Return tool calls as VALID JSON only:
+{"tool_calls": [{"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}]}
+
+REQUIRED: Respond with ONLY the JSON object. No markdown code blocks. No text before or after."#
 }
+
 
 /// Parse JSON tool calls from model output → Vec<ToolCall>.
 /// Robust extraction (finds JSON in code blocks or raw), strict schema validation.
@@ -129,7 +157,20 @@ pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
             Some(n) => n.to_string(),
             None => continue,
         };
+        
+        // Validate tool name
+        if !is_valid_tool(&name) {
+            eprintln!("⚠️  Invalid tool name: {} (not in allowed list)", name);
+            continue;
+        }
+        
         let params = tc.get("parameters").cloned().unwrap_or(serde_json::Value::Null);
+        
+        // Validate parameters for known issues
+        if let Some(warning) = validate_tool_params(&name, &params) {
+            eprintln!("{}", warning);
+        }
+        
         let args = json_params_to_args(&name, &params);
         calls.push(ToolCall { name, args });
     }
@@ -179,6 +220,55 @@ fn extract_json_candidate(output: &str) -> Option<String> {
                 return Some(remainder[..end].to_string());
             }
         }
+    }
+    None
+}
+
+/// Check if a tool name is valid.
+fn is_valid_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "rg" | "spawn" | "readfile" | "writefile" | "editfile" | "commit" | "python"
+            | "ruste" | "spawn_agent" | "set_params"
+    )
+}
+
+/// Validate tool parameters and return warning if problematic.
+fn validate_tool_params(tool_name: &str, params: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "readfile" => {
+            // Check if path contains glob patterns (common error)
+            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                if path.contains('*') || path.contains('?') || path.contains('[') {
+                    return Some(format!(
+                        "⚠️  readfile: path contains glob '{}' (not supported). \
+                         Use spawn with 'find' or 'ls' instead.",
+                        path
+                    ));
+                }
+            }
+        }
+        "rg" => {
+            // Check if directory is missing or empty
+            if let Some(dir) = params.get("directory").and_then(|v| v.as_str()) {
+                if dir.is_empty() {
+                    return Some("⚠️  rg: directory is empty. Provide a directory path.".to_string());
+                }
+            } else {
+                return Some("⚠️  rg: missing 'directory' parameter.".to_string());
+            }
+        }
+        "spawn" => {
+            // Check if command is a disallowed tool name
+            if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
+                let bare_cmd = cmd.split_whitespace().next().unwrap_or("");
+                if matches!(bare_cmd, "ls" | "cat" | "find" | "bash" | "sh" | "zsh" | "cmd") {
+                    // These are OK via spawn, just inform
+                    return None;
+                }
+            }
+        }
+        _ => {}
     }
     None
 }
