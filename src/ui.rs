@@ -246,6 +246,9 @@ pub struct App {
     highlighter: Highlighter,
     /// Currently displayed inline tool results (cleared when tool completes and is added to history)
     inline_tool_results: Vec<InlineToolResult>,
+    /// Cached message list — refreshed from SQLite only when cached_message_count changes.
+    /// Avoids running a full SELECT on every draw frame during streaming.
+    messages_cache: Vec<crate::message::Message>,
 }
 
 impl App {
@@ -344,6 +347,7 @@ impl App {
             last_battery_check: std::time::Instant::now(),
             highlighter: Highlighter::new(),
             inline_tool_results: Vec::new(),
+            messages_cache: Vec::new(),
         }
     }
 
@@ -443,27 +447,53 @@ impl App {
                 self.last_battery_check = std::time::Instant::now();
             }
 
+            // Refresh messages cache only when the count has changed — avoids
+            // running a full SQL SELECT on every draw frame during streaming.
+            if self.cached_message_count != self.messages_cache.len() {
+                if let Ok(msgs) = self.message_buffer.messages() {
+                    self.messages_cache = msgs;
+                    self.cached_message_count = self.messages_cache.len();
+                }
+            }
+
             terminal.draw(|f| self.draw(f))?;
 
-            // Fast poll: 10ms when streaming (responsive to scroll), 200ms when idle
-            let poll_ms = if self.turn_phase == TurnPhase::Idle { 200 } else { 10 };
-
-            if crossterm::event::poll(Duration::from_millis(poll_ms))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        self.handle_key(key).await;
-                        if !self.running {
-                            break;
-                        }
-                    }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
-                    }
-                    _ => {}
-                }
-            } else if self.turn_phase == TurnPhase::Idle {
+            // Build-mode idle watchdog + bookkeeping
+            if self.turn_phase == TurnPhase::Idle {
                 self.poll_for_updates();
             }
+
+            // Drain ALL pending input events before the next draw — avoids one-key-per-frame
+            // backlog. Uses non-blocking poll(0) so the loop exits immediately when the queue
+            // is empty, then sleeps briefly to yield to the Tokio scheduler.
+            'events: loop {
+                if crossterm::event::poll(Duration::ZERO)? {
+                    match event::read()? {
+                        Event::Key(key) => {
+                            self.handle_key(key).await;
+                            if !self.running {
+                                break 'events;
+                            }
+                        }
+                        Event::Mouse(mouse) => {
+                            self.handle_mouse(mouse);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    break 'events;
+                }
+            }
+
+            if !self.running {
+                break;
+            }
+
+            // Yield to the Tokio scheduler between frames. Using sleep().await (instead of the
+            // old blocking crossterm::event::poll(N ms)) lets other async tasks — the stream
+            // reader, gap queries, subagent channels — run during idle time.
+            let sleep_ms = if self.turn_phase == TurnPhase::Idle { 16 } else { 10 };
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
 
         Ok(())
@@ -1364,10 +1394,7 @@ impl App {
         let messages_area = chunks[1];
         let viewport_height = messages_area.height as i32;
         let area_width = messages_area.width;
-        let messages_list = self
-            .message_buffer
-            .messages()
-            .unwrap_or_default();
+        let messages_list = self.messages_cache.clone();
 
         // Pre-compute each message's formatted text, style, and estimated height
         struct RenderedMsg {
@@ -1654,6 +1681,24 @@ impl App {
             .style(box_style)
             .wrap(ratatui::widgets::Wrap { trim: false });
         f.render_widget(input, chunks[4]);
+
+        // Show hardware cursor at the end of typed text so the user can see where
+        // they're typing. Only shown when there's actual input (not the placeholder hint)
+        // and no overlays are open.
+        if !self.input_buffer.is_empty() && !self.model_picker_open {
+            let available_w = (chunks[4].width as usize).saturating_sub(2); // inside borders
+            if available_w > 0 {
+                // "> " prefix is 2 chars; cursor goes after the last typed character
+                let display_chars = 2 + self.input_buffer.chars().count();
+                let row_offset = (display_chars / available_w) as u16;
+                let col_in_row = (display_chars % available_w) as u16;
+                let cursor_x = (chunks[4].x + 1 + col_in_row)
+                    .min(chunks[4].x + chunks[4].width.saturating_sub(2));
+                let cursor_y = (chunks[4].y + 1 + row_offset)
+                    .min(chunks[4].y + chunks[4].height.saturating_sub(2));
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
 
         // Command palette overlay (above input box)
         if self.palette_open {
