@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use crate::sandbox;
 
 /// Split a string into shell-style arguments, respecting double and single quotes.
 /// Strips the outer quotes from quoted arguments.
@@ -64,6 +65,12 @@ impl Tool for RipgrepTool {
         if args.is_empty() {
             return Err(anyhow!("rg: empty arguments"));
         }
+        // Validate the search path is inside the project root
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let path = parts[1].trim_matches('"').trim_matches('\'');
+            sandbox::check_read(path)?;
+        }
         Ok(())
     }
 
@@ -79,27 +86,19 @@ impl Tool for RipgrepTool {
         let pattern = parts[0].trim_matches('"').trim_matches('\'');
         let path = parts[1].trim_matches('"').trim_matches('\'');
 
-        // Ensure path exists
+        // Ensure path exists (may be a symlink — follow it)
         if !Path::new(path).exists() {
             return Err(anyhow!("rg: path does not exist: {}", path));
         }
 
-        let output = Command::new("rg")
-            .arg("--type-list")  // Check if rg is available
-            .output()
-            .map_err(|_| anyhow!("rg: ripgrep not found in PATH"))?;
-
-        if !output.status.success() {
-            return Err(anyhow!("rg: ripgrep not available"));
-        }
-
-        // Execute search
+        // Execute search — always follow symlinks so .yggdra/knowledge is reachable
         let result = Command::new("rg")
+            .arg("--follow")
+            .arg("--color=never")
             .arg(pattern)
             .arg(path)
-            .arg("--color=never")
             .output()
-            .map_err(|e| anyhow!("rg: execution failed: {}", e))?;
+            .map_err(|e| anyhow!("rg: execution failed (is ripgrep installed?): {}", e))?;
 
         let stdout = String::from_utf8_lossy(&result.stdout).to_string();
         if stdout.is_empty() {
@@ -119,6 +118,12 @@ impl SpawnTool {
     fn is_absolute_dangerous_path(path: &str) -> bool {
         let dangerous_prefixes = ["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"];
         dangerous_prefixes.iter().any(|p| path.starts_with(p))
+    }
+
+    /// Shell interpreters that allow arbitrary code execution via `-c` flags.
+    /// Blocking these prevents `spawn bash -c "cd /other && ..."` escapes.
+    fn is_shell_interpreter(binary: &str) -> bool {
+        matches!(binary, "bash" | "sh" | "zsh" | "fish" | "dash" | "csh" | "tcsh" | "ksh")
     }
 
     /// Resolve a binary name via PATH, returning the full path if found.
@@ -159,6 +164,14 @@ impl Tool for SpawnTool {
         }
         let binary = parts[0];
 
+        if Self::is_shell_interpreter(binary) {
+            return Err(anyhow!(
+                "spawn: shell interpreter '{}' is blocked — use specific tools instead.\n\
+                 Allowed: git, cargo, ls, cat, etc.  Shell interpreters allow arbitrary escapes.",
+                binary
+            ));
+        }
+
         if Self::is_absolute_dangerous_path(binary) {
             return Err(anyhow!("spawn: dangerous system path blocked: {}", binary));
         }
@@ -180,8 +193,14 @@ impl Tool for SpawnTool {
         let resolved = Self::resolve_binary(binary)
             .ok_or_else(|| anyhow!("spawn: binary not found: {}", binary))?;
 
+        // Always run from project root so relative paths work correctly
+        let cwd = sandbox::project_root()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
         let output = Command::new(&resolved)
             .args(child_args)
+            .current_dir(&cwd)
             .output()
             .map_err(|e| anyhow!("spawn: execution failed: {}", e))?;
 
@@ -200,27 +219,6 @@ impl Tool for SpawnTool {
 
 pub struct ReadfileTool;
 
-impl ReadfileTool {
-    fn contains_escape_attempt(path: &str) -> bool {
-        path.contains("../") || path.contains("..\\")
-    }
-}
-
-/// Expand a leading `~/` to the user's home directory.
-fn expand_tilde(path: &str) -> std::borrow::Cow<str> {
-    if path.starts_with("~/") || path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            let expanded = if path == "~" {
-                home.to_string_lossy().into_owned()
-            } else {
-                format!("{}/{}", home.to_string_lossy(), &path[2..])
-            };
-            return std::borrow::Cow::Owned(expanded);
-        }
-    }
-    std::borrow::Cow::Borrowed(path)
-}
-
 impl Tool for ReadfileTool {
     fn name(&self) -> &str {
         "readfile"
@@ -232,13 +230,7 @@ impl Tool for ReadfileTool {
         }
         let path = args.split_whitespace().next().unwrap_or("")
             .trim_matches('"').trim_matches('\'');
-
-        if Self::contains_escape_attempt(path) {
-            return Err(anyhow!("readfile: path traversal attempt blocked: {}", path));
-        }
-        if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
-            return Err(anyhow!("readfile: system file blocked: {}", path));
-        }
+        sandbox::check_read(path)?;
         Ok(())
     }
 
@@ -251,14 +243,14 @@ impl Tool for ReadfileTool {
         let start_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
         let end_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
 
-        let file_path = expand_tilde(raw_path);
-        let path = Path::new(file_path.as_ref());
-        if !path.exists() {
-            return Ok(format!("📄 {} does not exist yet", file_path));
+        // Use sandbox-resolved path (handles relative + tilde)
+        let resolved = sandbox::resolve(raw_path);
+        if !resolved.exists() {
+            return Ok(format!("📄 {} does not exist yet", resolved.display()));
         }
 
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow!("readfile: failed to read {}: {}", file_path, e))?;
+        let content = fs::read_to_string(&resolved)
+            .map_err(|e| anyhow!("readfile: failed to read {}: {}", resolved.display(), e))?;
         let total_lines = content.lines().count();
 
         if let Some(start) = start_line {
@@ -271,7 +263,7 @@ impl Tool for ReadfileTool {
                 .collect();
             return Ok(format!(
                 "📄 {} (lines {}-{} of {}):\n{}",
-                file_path, start, end, total_lines, selected
+                resolved.display(), start, end, total_lines, selected
             ));
         }
 
@@ -280,7 +272,7 @@ impl Tool for ReadfileTool {
             .enumerate()
             .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
             .collect();
-        Ok(format!("📄 {} ({} lines):\n{}", file_path, total_lines, numbered))
+        Ok(format!("📄 {} ({} lines):\n{}", resolved.display(), total_lines, numbered))
     }
 }
 
@@ -289,14 +281,10 @@ impl Tool for ReadfileTool {
 pub struct EditfileTool;
 
 impl EditfileTool {
-    fn contains_escape_attempt(path: &str) -> bool {
-        path.contains("../") || path.contains("..\\")
-    }
-
     /// Parse args into (path, old_str, new_str).
     ///
-    /// Standard format (from <|tool_sep> → \x00):  `path\x00old\x00new`
-    /// Legacy bracket format:                       `path\nold\n---\nnew`
+    /// Standard format (from \x00 separator):  `path\x00old\x00new`
+    /// Legacy bracket format:                   `path\nold\n---\nnew`
     fn parse_args(args: &str) -> Option<(String, String, String)> {
         if args.contains('\x00') {
             let mut parts = args.splitn(3, '\x00');
@@ -326,12 +314,7 @@ impl Tool for EditfileTool {
         if path.is_empty() {
             return Err(anyhow!("editfile: empty file path"));
         }
-        if Self::contains_escape_attempt(&path) {
-            return Err(anyhow!("editfile: path traversal attempt blocked: {}", path));
-        }
-        if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
-            return Err(anyhow!("editfile: system file edit blocked: {}", path));
-        }
+        sandbox::check_write(&path)?;
         Ok(())
     }
 
@@ -345,46 +328,39 @@ impl Tool for EditfileTool {
             return Err(anyhow!("editfile: old_str is empty — cannot replace nothing"));
         }
 
-        let path_str = expand_tilde(&raw_path);
-        let path = Path::new(path_str.as_ref());
+        let path = sandbox::resolve(&raw_path);
 
         if !path.exists() {
-            return Err(anyhow!("editfile: {} does not exist (use writefile to create)", path_str));
+            return Err(anyhow!("editfile: {} does not exist (use writefile to create)", path.display()));
         }
 
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow!("editfile: failed to read {}: {}", path_str, e))?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| anyhow!("editfile: failed to read {}: {}", path.display(), e))?;
 
         let count = content.matches(old_str.as_str()).count();
         if count == 0 {
-            return Err(anyhow!("editfile: text not found in {} — read the file first to get exact text", path_str));
+            return Err(anyhow!("editfile: text not found in {} — read the file first to get exact text", path.display()));
         }
         if count > 1 {
-            return Err(anyhow!("editfile: ambiguous — {} occurrences found in {} — include more context to be specific", count, path_str));
+            return Err(anyhow!("editfile: ambiguous — {} occurrences found in {} — include more context to be specific", count, path.display()));
         }
 
         let old_lines = old_str.lines().count();
         let new_lines = new_str.lines().count();
         let patched = content.replacen(old_str.as_str(), new_str.as_str(), 1);
 
-        fs::write(path, &patched)
-            .map_err(|e| anyhow!("editfile: failed to write {}: {}", path_str, e))?;
+        fs::write(&path, &patched)
+            .map_err(|e| anyhow!("editfile: failed to write {}: {}", path.display(), e))?;
 
         let diff = new_lines as i64 - old_lines as i64;
         let sign = if diff >= 0 { "+" } else { "" };
-        Ok(format!("✅ edited {} ({}{}  lines)", path_str, sign, diff))
+        Ok(format!("✅ edited {} ({}{}  lines)", path.display(), sign, diff))
     }
 }
 
 // ===== Writefile Tool (writefile) =====
 
 pub struct WritefileTool;
-
-impl WritefileTool {
-    fn contains_escape_attempt(path: &str) -> bool {
-        path.contains("../") || path.contains("..\\")
-    }
-}
 
 impl Tool for WritefileTool {
     fn name(&self) -> &str {
@@ -396,12 +372,7 @@ impl Tool for WritefileTool {
         if path.is_empty() {
             return Err(anyhow!("writefile: empty file path"));
         }
-        if Self::contains_escape_attempt(path) {
-            return Err(anyhow!("writefile: path traversal attempt blocked: {}", path));
-        }
-        if path.starts_with("/bin") || path.starts_with("/usr/bin") || path.starts_with("/etc") {
-            return Err(anyhow!("writefile: system file edit blocked: {}", path));
-        }
+        sandbox::check_write(path)?;
         Ok(())
     }
 
@@ -412,20 +383,19 @@ impl Tool for WritefileTool {
         let raw_path = parts.next().unwrap_or("").trim();
         let content = parts.next().unwrap_or("");
 
-        let path_str = expand_tilde(raw_path);
-        let path = Path::new(path_str.as_ref());
+        let path = sandbox::resolve(raw_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
-                    .map_err(|e| anyhow!("writefile: failed to create dirs for {}: {}", path_str, e))?;
+                    .map_err(|e| anyhow!("writefile: failed to create dirs for {}: {}", path.display(), e))?;
             }
         }
 
-        fs::write(path, content)
-            .map_err(|e| anyhow!("writefile: failed to write {}: {}", path_str, e))?;
+        fs::write(&path, content)
+            .map_err(|e| anyhow!("writefile: failed to write {}: {}", path.display(), e))?;
 
         let line_count = content.lines().count();
-        Ok(format!("✅ wrote {} ({} lines)", path_str, line_count))
+        Ok(format!("✅ wrote {} ({} lines)", path.display(), line_count))
     }
 }
 
@@ -822,16 +792,11 @@ mod tests {
     fn test_readfile_validation() {
         let tool = ReadfileTool;
 
-        // Path traversal blocked
-        assert!(tool.validate_input("../../../etc/passwd").is_err());
+        // Empty path fails
+        assert!(tool.validate_input("").is_err());
 
-        // System files blocked
-        assert!(tool.validate_input("/etc/shadow").is_err());
-
-        // Valid paths
+        // Valid paths pass (sandbox containment is tested in sandbox::tests)
         assert!(tool.validate_input("./myfile.txt").is_ok());
-
-        // Line-range args parsed without error
         assert!(tool.validate_input("src/main.rs 10 50").is_ok());
     }
 
@@ -890,16 +855,10 @@ mod tests {
     fn test_writefile_validation() {
         let tool = WritefileTool;
 
-        // Path traversal blocked
-        assert!(tool.validate_input("../../../etc/passwd\x00content").is_err());
-
-        // System files blocked
-        assert!(tool.validate_input("/etc/shadow\x00content").is_err());
-
         // Empty path fails
         assert!(tool.validate_input("\x00content").is_err());
 
-        // Valid path passes
+        // Valid path passes (sandbox containment is tested in sandbox::tests)
         assert!(tool.validate_input("some/file.txt\x00hello").is_ok());
     }
 
@@ -1017,8 +976,9 @@ mod tests {
     #[test]
     fn test_editfile_validation() {
         let tool = EditfileTool;
-        assert!(tool.validate_input("../escape\x00old\x00new").is_err());
-        assert!(tool.validate_input("/etc/passwd\x00old\x00new").is_err());
+        // Bad format (missing separators) fails
+        assert!(tool.validate_input("no-separator-here").is_err());
+        // Valid format passes (sandbox containment is tested in sandbox::tests)
         assert!(tool.validate_input("valid/path.rs\x00old\x00new").is_ok());
     }
 }

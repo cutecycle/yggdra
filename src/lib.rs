@@ -8,6 +8,7 @@ pub mod msglog;
 pub mod message;
 pub mod notifications;
 pub mod ollama;
+pub mod sandbox;
 pub mod session;
 pub mod steering;
 pub mod theme;

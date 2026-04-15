@@ -1081,6 +1081,22 @@ impl App {
         // JSON format only — all production models (qwen3.5, gemma-4) support it
         base.push_str(agent::json_tool_descriptions());
         base.push('\n');
+
+        // Inject project root so the model always knows where to put files
+        let root_display = crate::sandbox::project_root()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "(current directory)".to_string()));
+        base.push_str(&format!(
+            "PROJECT ROOT: {root}\n\
+             All files you create or edit MUST be inside this directory.\n\
+             Use relative paths (e.g. src/foo.rs) — they resolve to the project root automatically.\n\
+             Never write to parent directories, home directories, or other repositories.\n\
+             \n",
+            root = root_display
+        ));
+
         base.push_str(
             "Never say \"I cannot access files.\" Use rg or spawn instead.\n\
              Use tools proactively to explore, analyze, and implement. Be concise.\n\

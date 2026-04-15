@@ -406,10 +406,19 @@ impl Agent {
 
     /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering() -> String {
+        let root_line = crate::sandbox::project_root()
+            .map(|p| format!("PROJECT ROOT: {}", p.display()))
+            .unwrap_or_else(|| "PROJECT ROOT: (current directory)".to_string());
+
         let prompt = format!(
             "You are an agentic assistant with access to tools and subagent spawning.\n\
              \n\
-             {}\n\
+             {root}\n\
+             All files you create or edit MUST be inside this directory.\n\
+             Use relative paths (e.g. src/foo.rs) — they resolve to the project root automatically.\n\
+             Never write to parent directories, home directories, or other repositories.\n\
+             \n\
+             {tools}\n\
              \n\
              OFFLINE KNOWLEDGE BASE:\n\
              The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories.\n\
@@ -419,9 +428,9 @@ impl Agent {
              - Tool output is capped at 3000 chars by default; full output stored in session.\n\
              - After calling a tool, include the result in your next response and continue reasoning.\n\
              - Subagents run in parallel; wait for all results before combining for final output.\n\
-             - Path traversal (../) and system files (/etc, /bin) are blocked by security layer.\n\
              - When task is fully complete, respond with summary of results — no special marker needed.",
-            json_tool_descriptions()
+            root  = root_line,
+            tools = json_tool_descriptions()
         );
         SteeringDirective::custom(&prompt).format_for_system_prompt()
     }

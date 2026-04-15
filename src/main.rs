@@ -8,6 +8,7 @@ mod msglog;
 mod message;
 mod notifications;
 mod ollama;
+mod sandbox;
 mod session;
 mod steering;
 mod theme;
@@ -51,6 +52,9 @@ async fn main() -> Result<()> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // Initialise sandbox — all file tools will be restricted to this root
+    sandbox::init(cwd.clone());
 
     // Terraform: ensure git repo exists
     if !cwd.join(".git").exists() {
