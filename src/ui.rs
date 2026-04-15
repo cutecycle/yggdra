@@ -232,10 +232,10 @@ pub struct App {
     agents_config: crate::config::AgentsConfig,
     /// Last time a build-mode kick was fired — for watchdog recovery
     last_build_kick: std::time::Instant,
+    /// Consecutive build-mode kicks without tool calls — stuck detection
+    consecutive_empty_kicks: u32,
     /// Whether gradient background is enabled in message area
     gradient_enabled: bool,
-    /// Adaptive detection: thinking model suppresses <|tool> content — use bracket format
-    thinking_suppresses_content: bool,
     /// Inference rate from last completed generation (tokens/second)
     last_infer_rate: Option<f64>,
     /// Cached battery power state (refreshed every 30s)
@@ -337,8 +337,8 @@ impl App {
             runtime_params: crate::config::ModelParams::default(),
             agents_config,
             last_build_kick: std::time::Instant::now(),
+            consecutive_empty_kicks: 0,
             gradient_enabled,
-            thinking_suppresses_content: false,
             last_infer_rate: None,
             on_battery: crate::battery::battery_state(),
             last_battery_check: std::time::Instant::now(),
@@ -484,7 +484,7 @@ impl App {
                         self.scroll_offset = 0;
                     }
                 }
-                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking, eval_duration_ns }) => {
+                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns }) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
                     self.total_tokens_used += prompt_tokens + gen_tokens;
                     // Compute inference rate (tok/s)
@@ -493,12 +493,6 @@ impl App {
                             Some(gen_tokens as f64 / (ns as f64 / 1_000_000_000.0)),
                         _ => None,
                     };
-                    // Adaptive detection: if model had thinking but no content, it suppresses content via <|tool>
-                    if had_thinking && self.streaming_text.trim().is_empty() && !self.thinking_suppresses_content {
-                        self.thinking_suppresses_content = true;
-                        self.refresh_steering();
-                        self.notify("🔀 Detected thinking model — switched to bracket tool format".to_string());
-                    }
                     self.complete_streaming_turn();
                     return;
                 }
@@ -687,12 +681,24 @@ impl App {
             if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
                 self.notify("⚠️ Max tool iterations reached — resetting");
                 self.tool_iteration_count = 0;
+                self.consecutive_empty_kicks = 0;
                 if self.mode == AppMode::Build {
                     self.inject_continue_kick();
                     return;
                 }
             } else if self.mode == AppMode::Build {
-                // Build mode: auto-continue
+                // Build mode: auto-continue — but detect if model is stuck
+                self.consecutive_empty_kicks += 1;
+                if self.consecutive_empty_kicks >= 3 {
+                    self.notify("⚠️ Model appears stuck (3 responses with no tool calls) — send a message to redirect".to_string());
+                    self.consecutive_empty_kicks = 0;
+                    self.status_message = "⏸ Paused — model stuck".to_string();
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
+                    self.streaming_text.clear();
+                    self.stream_rx = None;
+                    return;
+                }
                 self.inject_continue_kick();
                 return;
             } else {
@@ -980,6 +986,8 @@ impl App {
                 if result.tool_name != "think" {
                     self.tool_iteration_count += 1;
                 }
+                // Reset stuck detection — model is making progress
+                self.consecutive_empty_kicks = 0;
                 self.status_message = format!(
                     "⏳ Continuing after {} (step {}/{})...",
                     result.tool_name, self.tool_iteration_count, MAX_TOOL_ITERATIONS
@@ -1130,10 +1138,6 @@ impl App {
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
-
-    /// No-op: steering is computed dynamically on each call to steering_text().
-    /// Called after adaptive format detection or model switches for consistency.
-    fn refresh_steering(&mut self) {}
 
     /// Execute multiple tool calls in parallel (blocking) and return pre-formatted output.
     async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>) -> String {
@@ -1843,8 +1847,6 @@ impl App {
                         if let Err(e) = self.config.save() {
                             eprintln!("⚠️ Failed to save config: {}", e);
                         }
-                        self.thinking_suppresses_content = false;
-                        self.refresh_steering();
                         let endpoint = self.config.endpoint.clone();
                         match OllamaClient::new(&endpoint, &model_name).await {
                             Ok(client) => {
@@ -2186,6 +2188,7 @@ impl App {
         } else if !command.is_empty() {
             // Message validation: no excessive length, check for reasonable content
             self.inline_tool_results.clear(); // Clear inline results when user sends new message
+            self.consecutive_empty_kicks = 0; // Reset stuck detection on new user input
             self.handle_message(&command).await;
         }
 

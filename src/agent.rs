@@ -82,6 +82,10 @@ pub fn json_tool_descriptions() -> &'static str {
    Parameters: {"rust_file_path": "string"}
    Examples: {"name": "ruste", "parameters": {"rust_file_path": "main.rs"}}
 
+9. "think" — Reason out loud (no side effects)
+   Parameters: {"thought": "string"}
+   Examples: {"name": "think", "parameters": {"thought": "I need to check the config first"}}
+
 CRITICAL: These are the ONLY valid tools. Do NOT use: ls, cat, find, bash, shell, sh, cmd, etc.
 To list files, use: {"name": "spawn", "parameters": {"command": "ls -la directory/"}}
 
@@ -140,6 +144,10 @@ pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
 }
 
 /// Extract a JSON candidate from model output — handles code blocks and raw JSON.
+///
+/// Strategy: code blocks first (most reliable), then raw JSON.
+/// For raw JSON, we find `"tool_calls"` first and walk backwards to the enclosing `{`,
+/// avoiding false matches when the model writes prose with `{...}` before the JSON.
 fn extract_json_candidate(output: &str) -> Option<String> {
     // 1. Try ```json ... ``` code block
     if let Some(start) = output.find("```json") {
@@ -158,29 +166,72 @@ fn extract_json_candidate(output: &str) -> Option<String> {
             }
         }
     }
-    // 3. Try raw JSON: find first { that leads to "tool_calls"
-    if let Some(pos) = output.find('{') {
-        let remainder = &output[pos..];
-        if remainder.contains("\"tool_calls\"") {
-            // Find matching closing brace
-            let mut depth = 0;
-            let mut end = 0;
-            for (i, ch) in remainder.char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
+    // 3. Raw JSON: find "tool_calls" anchor, then locate enclosing { ... }
+    //    Walk backwards from "tool_calls" to find the nearest preceding '{',
+    //    then match braces forward to extract the complete JSON object.
+    let bytes = output.as_bytes();
+    if let Some(tc_pos) = output.find("\"tool_calls\"") {
+        // Walk backwards from tc_pos to find the nearest '{'
+        let mut brace_start = None;
+        for i in (0..tc_pos).rev() {
+            if bytes[i] == b'{' {
+                brace_start = Some(i);
+                break;
+            }
+        }
+        if let Some(start) = brace_start {
+            let remainder = &output[start..];
+            if let Some(json) = extract_balanced_braces(remainder) {
+                return Some(json);
+            }
+        }
+    }
+    // 4. Fallback: try each '{' position in case "tool_calls" key has unusual spacing
+    let mut search_from = 0;
+    while let Some(pos) = output[search_from..].find('{') {
+        let abs_pos = search_from + pos;
+        let remainder = &output[abs_pos..];
+        if let Some(json) = extract_balanced_braces(remainder) {
+            if json.contains("\"tool_calls\"") {
+                return Some(json);
+            }
+        }
+        search_from = abs_pos + 1;
+    }
+    None
+}
+
+/// Extract a balanced `{ ... }` substring from the start of `s`.
+fn extract_balanced_braces(s: &str) -> Option<String> {
+    if !s.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape_next = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[..i + 1].to_string());
                 }
             }
-            if end > 0 {
-                return Some(remainder[..end].to_string());
-            }
+            _ => {}
         }
     }
     None
@@ -191,7 +242,7 @@ fn is_valid_tool(name: &str) -> bool {
     matches!(
         name,
         "rg" | "spawn" | "readfile" | "writefile" | "editfile" | "commit" | "python"
-            | "ruste" | "spawn_agent" | "set_params"
+            | "ruste" | "spawn_agent" | "set_params" | "think"
     )
 }
 
@@ -282,6 +333,7 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
         "python" => get_str("script_path"),
         "ruste" => get_str("rust_file_path"),
         "set_params" => get_str("settings"),
+        "think" => get_str("thought"),
         "spawn_agent" => {
             let task_id = get_str("task_id");
             let desc = get_str("description");
@@ -899,5 +951,46 @@ mod tests {
         assert_eq!(calls[0].name, "spawn_agent");
         assert!(calls[0].args.contains("search-docs"));
         assert!(calls[0].args.contains("Search the docs"));
+    }
+
+    #[test]
+    fn test_parse_json_prose_with_braces_before_json() {
+        // Model writes {approach 1} before the actual JSON — old parser grabbed wrong braces
+        let output = r#"I'll try {approach 1}: {"tool_calls": [{"name": "rg", "parameters": {"pattern": "main", "directory": "src/"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1, "Should find tool call despite prose braces");
+        assert_eq!(calls[0].name, "rg");
+    }
+
+    #[test]
+    fn test_parse_json_multiple_brace_pairs_before_json() {
+        // Multiple {} pairs in prose before actual JSON
+        let output = r#"Step {1} then {2}: {"tool_calls": [{"name": "readfile", "parameters": {"path": "README.md"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1, "Should skip prose braces and find JSON");
+        assert_eq!(calls[0].name, "readfile");
+    }
+
+    #[test]
+    fn test_parse_json_with_escaped_quotes() {
+        // JSON with escaped quotes inside string values
+        let output = r#"{"tool_calls": [{"name": "writefile", "parameters": {"path": "test.rs", "content": "let s = \"hello\";"}}]}"#;
+        let calls = parse_json_tool_calls(output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "writefile");
+    }
+
+    #[test]
+    fn test_extract_balanced_braces_handles_strings() {
+        let input = r#"{"key": "value with } brace"}"#;
+        let result = extract_balanced_braces(input);
+        assert_eq!(result, Some(input.to_string()));
+    }
+
+    #[test]
+    fn test_extract_balanced_braces_nested() {
+        let input = r#"{"a": {"b": {"c": 1}}}"#;
+        let result = extract_balanced_braces(input);
+        assert_eq!(result, Some(input.to_string()));
     }
 }

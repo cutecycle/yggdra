@@ -702,7 +702,7 @@ mod tests {
     fn test_build_messages_maps_tool_to_user() {
         let msgs = vec![
             Message::new("user", "search for main"),
-            Message::new("assistant", "I'll search. [TOOL: rg main .]"),
+            Message::new("assistant", r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "main", "directory": "."}}]}"#),
             Message::new("tool", "[TOOL_OUTPUT: rg = found matches]"),
         ];
         let result = OllamaClient::build_messages(&msgs, None, None, None);
@@ -719,7 +719,7 @@ mod tests {
         let big_output = format!("[TOOL_OUTPUT: rg = {}]", "x".repeat(5000));
         let msgs = vec![
             Message::new("user", "search"),
-            Message::new("assistant", "<|tool>rg<|tool_sep>x<|end_tool>"),
+            Message::new("assistant", r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "x", "directory": "."}}]}"#),
             Message::new("tool", big_output),
         ];
         let result = OllamaClient::build_messages(&msgs, None, Some(3000), None);
