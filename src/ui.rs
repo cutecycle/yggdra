@@ -147,6 +147,7 @@ struct InlineToolResult {
     start_time: std::time::Instant,
     output: String,
     is_complete: bool,
+    exit_code: Option<i32>,  // None if still running, Some(code) if complete
 }
 
 /// Minimal TUI application
@@ -724,6 +725,27 @@ impl App {
         }
     }
 
+    /// Validate spawn command for potential issues (basic shell syntax checking)
+    fn _validate_spawn_command(cmd: &str) -> Option<String> {
+        // Check for common shell issues
+        
+        // Unclosed quotes
+        let single_quotes = cmd.matches('\'').count();
+        let double_quotes = cmd.matches('"').count();
+        if single_quotes % 2 != 0 || double_quotes % 2 != 0 {
+            return Some("⚠️  Unclosed quotes detected".to_string());
+        }
+        
+        // Unmatched brackets/parens
+        let opens = cmd.matches('(').count() + cmd.matches('[').count() + cmd.matches('{').count();
+        let closes = cmd.matches(')').count() + cmd.matches(']').count() + cmd.matches('}').count();
+        if opens != closes {
+            return Some("⚠️  Unmatched brackets/parens".to_string());
+        }
+        
+        None
+    }
+
     /// Spawn tool execution off the UI thread
     fn execute_tool_async(&mut self, tool_name: String, args: String) {
         // Block modifying tools in Ask-only mode
@@ -911,11 +933,35 @@ impl App {
                     Ok(output) => output.clone(),
                     Err(e) => format!("Error: {}", e),
                 };
+                
+                // Try to infer exit code: 0 for success, 1 for error
+                let inferred_exit_code = match &result.output {
+                    Err(_) => Some(1),  // Error variant = failed
+                    Ok(output) => {
+                        // Check for common error indicators in spawn output
+                        if result.tool_name == "spawn" {
+                            if output.to_lowercase().contains("error:")
+                                || output.contains("not found")
+                                || output.contains("No such file")
+                                || output.contains("failed")
+                                || output.contains("Permission denied")
+                            {
+                                Some(1)
+                            } else {
+                                Some(0) // Likely successful
+                            }
+                        } else {
+                            Some(0) // Other tools assume success
+                        }
+                    }
+                };
+                
                 self.inline_tool_results.push(InlineToolResult {
                     tool_name: result.tool_name.clone(),
                     start_time: std::time::Instant::now(),
                     output: output_for_display,
                     is_complete: true,
+                    exit_code: inferred_exit_code,
                 });
 
                 // Persist tool result
@@ -3074,13 +3120,34 @@ impl App {
 
         for (idx, result) in self.inline_tool_results.iter().enumerate() {
             let elapsed = result.start_time.elapsed().as_secs();
-            let status_icon = if result.is_complete { "✅" } else { "⏳" };
             
-            // Tool name line with elapsed time
+            // Animated spinner for running tools: cycles through ⏳ ⌛ ⏰ based on frame count
+            let spinner_frames = ['⏳', '⌛', '⏰'];
+            let spinner_idx = ((self.tick_count / 10) as usize) % spinner_frames.len();
+            let spinner = spinner_frames[spinner_idx];
+            
+            // Status based on exit code
+            let status_display = if !result.is_complete {
+                spinner.to_string() // Animated spinner for running
+            } else {
+                match result.exit_code {
+                    Some(0) => "✅".to_string(),     // Success
+                    Some(_) => "❌".to_string(),     // Error (non-zero exit)
+                    None => {
+                        if result.output.is_empty() {
+                            "⚪".to_string()  // No output
+                        } else {
+                            "✅".to_string()  // Default to success if unknown
+                        }
+                    }
+                }
+            };
+            
+            // Tool name line with elapsed time and status
             lines.push(Line::from(vec![
                 Span::raw(format!(
-                    "{} {} ({}s): ",
-                    status_icon,
+                    "{} {} ({}s)",
+                    status_display,
                     result.tool_name,
                     elapsed
                 )),
