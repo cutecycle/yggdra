@@ -69,6 +69,37 @@ impl Theme {
         }
         Self::light() // safe default — pastel reads well everywhere
     }
+
+    /// Safe background theme detection — no terminal manipulation.
+    /// Can be called at any time while the TUI is running.
+    /// Returns Some(is_light) or None if detection is unavailable.
+    pub fn detect_safe() -> Option<bool> {
+        // macOS: `defaults read -g AppleInterfaceStyle` returns "Dark" in dark mode,
+        // exits with code 1 and empty output in light mode. No terminal involvement.
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = std::process::Command::new("defaults")
+                .args(["read", "-g", "AppleInterfaceStyle"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                if output.status.success() && stdout.contains("dark") {
+                    return Some(false); // definitely dark mode
+                }
+                // Light mode: key doesn't exist → exit code 1, empty stdout.
+                // Only assert light if we see that exact signature; any other failure
+                // (process error, sandbox, etc.) returns None to avoid false positives.
+                if !output.status.success() && stdout.is_empty() {
+                    return Some(true); // definitely light mode
+                }
+                // Unexpected output — don't change the theme.
+                return None;
+            }
+        }
+        // Fallback: COLORFGBG env var (set once at shell startup; won't catch mid-session changes
+        // on most terminals, but better than nothing on non-macOS platforms)
+        detect_via_env()
+    }
 }
 
 // ── OSC 11 detection ─────────────────────────────────────────────────────────

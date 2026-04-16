@@ -243,9 +243,10 @@ impl OllamaClient {
 
             // Truncate tool output messages that exceed the cap
             let content = if msg.content.contains("[TOOL_OUTPUT:") && msg.content.len() > cap {
-                let truncated = &msg.content[..cap];
+                let safe_cap = floor_char_boundary(&msg.content, cap);
+                let truncated = &msg.content[..safe_cap];
                 // Find a clean line boundary to avoid cutting mid-line
-                let cut = truncated.rfind('\n').unwrap_or(cap);
+                let cut = truncated.rfind('\n').unwrap_or(safe_cap);
                 format!("{}\n[...{} chars truncated]", &msg.content[..cut], msg.content.len() - cut)
             } else {
                 msg.content.clone()
@@ -577,6 +578,14 @@ impl OllamaClient {
 
         Ok(data)
     }
+}
+
+/// Return the largest index ≤ `max` that is a valid UTF-8 char boundary in `s`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() { return s.len(); }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
 }
 
 #[cfg(test)]

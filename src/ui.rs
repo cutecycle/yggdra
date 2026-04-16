@@ -251,6 +251,8 @@ pub struct App {
     /// Cached message list — refreshed from SQLite only when cached_message_count changes.
     /// Avoids running a full SELECT on every draw frame during streaming.
     messages_cache: Vec<crate::message::Message>,
+    /// Tick counter used to periodically re-detect terminal theme without terminal queries.
+    theme_check_counter: u32,
 }
 
 impl App {
@@ -351,6 +353,7 @@ impl App {
             highlighter: Highlighter::new(),
             inline_tool_results: Vec::new(),
             messages_cache: Vec::new(),
+            theme_check_counter: 0,
         }
     }
 
@@ -495,6 +498,18 @@ impl App {
             // Graceful quit: exit once the current turn reaches Idle
             if self.pending_quit && self.turn_phase == TurnPhase::Idle {
                 break;
+            }
+
+            // Periodically re-detect terminal theme using safe (no-raw-mode) methods.
+            // ~60 s at 16 ms/tick. Catches macOS dark/light mode switches mid-session.
+            self.theme_check_counter = self.theme_check_counter.wrapping_add(1);
+            if self.theme_check_counter % 3750 == 0 {
+                if let Some(is_light) = Theme::detect_safe() {
+                    let new_kind = if is_light { crate::theme::ThemeKind::Light } else { crate::theme::ThemeKind::Dark };
+                    if new_kind != self.theme.kind {
+                        self.theme = if is_light { Theme::light() } else { Theme::dark() };
+                    }
+                }
             }
 
             // Yield to the Tokio scheduler between frames. Using sleep().await (instead of the
@@ -3122,7 +3137,7 @@ impl App {
         } else {
             // Generic fallback - show first 80 chars
             let truncated = if error.len() > 80 {
-                format!("{}...", &error[..80])
+                format!("{}...", &error[..floor_char_boundary(&error, 80)])
             } else {
                 error.to_string()
             };
@@ -3345,7 +3360,7 @@ impl App {
             
             for line in preview_lines {
                 let truncated = if line.len() > 100 {
-                    format!("{}…", &line[..97])
+                    format!("{}…", &line[..floor_char_boundary(line, 97)])
                 } else {
                     line.to_string()
                 };
@@ -3559,5 +3574,15 @@ impl App {
             }
         }
     }
+}
+
+/// Return the largest index ≤ `max` that is a valid UTF-8 char boundary in `s`.
+/// Prevents panics when slicing at an arbitrary byte offset into a string that
+/// may contain multibyte characters (emoji, curly quotes, etc.).
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() { return s.len(); }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
 }
 
