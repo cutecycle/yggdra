@@ -195,7 +195,10 @@ impl Highlighter {
         let palette = if dark { Palette::dark() } else { Palette::light() };
         let mut lines = Vec::new();
 
-        for source_line in code.lines() {
+        // Normalize: tabs → 4 spaces, then dedent (strip common leading whitespace)
+        let normalized = normalize_code(code);
+
+        for source_line in normalized.lines() {
             let tokens = tokenize(source_line, profile);
             let mut spans: Vec<Span<'static>> = vec![Span::styled(
                 "│   ".to_string(),
@@ -217,6 +220,38 @@ impl Highlighter {
 
         lines
     }
+}
+
+/// Normalize code for display: expand tabs to 4 spaces and strip common leading whitespace.
+fn normalize_code(code: &str) -> String {
+    // Step 1: expand tabs to 4 spaces
+    let expanded: String = code.chars()
+        .flat_map(|c| {
+            let s: &'static str = if c == '\t' { "    " } else { "" };
+            // Emit either the 4-space expansion or the original char
+            if c == '\t' {
+                s.chars().collect::<Vec<_>>().into_iter()
+            } else {
+                vec![c].into_iter()
+            }
+        })
+        .collect();
+
+    // Step 2: dedent — find the minimum leading-space count across non-empty lines
+    let min_indent = expanded.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+
+    if min_indent == 0 {
+        return expanded;
+    }
+
+    expanded.lines()
+        .map(|l| if l.len() >= min_indent { &l[min_indent..] } else { l.trim_start() })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Tokenize a single line of source code into (TokenKind, text) pairs
@@ -430,5 +465,53 @@ mod tests {
         let tokens = tokenize(r#"let s = "hello \"world\"";"#, &RUST);
         let strings: Vec<_> = tokens.iter().filter(|(k, _)| *k == TokenKind::String).collect();
         assert_eq!(strings.len(), 1);
+    }
+
+    #[test]
+    fn test_normalize_code_tabs() {
+        // Tabs expand to 4 spaces, then dedent strips the common indent.
+        // \tfoo\n\tbar → "    foo\n    bar" → dedented → "foo\nbar"
+        let result = normalize_code("\tfoo\n\tbar");
+        assert_eq!(result, "foo\nbar");
+
+        // Mixed indent: outer tab dedented, inner tab preserved as 4 spaces
+        let result2 = normalize_code("\tfn foo() {\n\t\tlet x = 1;\n\t}");
+        assert_eq!(result2, "fn foo() {\n    let x = 1;\n}");
+    }
+
+    #[test]
+    fn test_normalize_code_dedent() {
+        // Common 4-space indent stripped
+        let code = "    fn foo() {\n        let x = 1;\n    }";
+        let result = normalize_code(code);
+        assert_eq!(result, "fn foo() {\n    let x = 1;\n}");
+    }
+
+    #[test]
+    fn test_normalize_code_empty_lines_ignored_in_dedent() {
+        // Empty lines don't affect the min indent calculation
+        let code = "    fn foo() {\n\n    }";
+        let result = normalize_code(code);
+        assert_eq!(result, "fn foo() {\n\n}");
+    }
+
+    #[test]
+    fn test_normalize_code_no_common_indent() {
+        // No leading whitespace → unchanged (tabs still expanded)
+        let code = "fn foo() {\n    let x = 1;\n}";
+        let result = normalize_code(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn test_highlight_code_with_tabs() {
+        let h = Highlighter::new();
+        // Code with tabs should render without tab characters
+        let code = "\tfn main() {\n\t\tlet x = 1;\n\t}";
+        let lines = h.highlight_code(code, "rust", true);
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.contains('\t'), "Tab should be expanded, got: {:?}", text);
+        }
     }
 }

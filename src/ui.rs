@@ -157,6 +157,8 @@ pub struct App {
     input_buffer: String,
     status_message: String,
     running: bool,
+    /// Ctrl+Q sets this — app exits cleanly once the current turn reaches Idle
+    pending_quit: bool,
     message_buffer: MessageBuffer,
     task_manager: TaskManager,
     ollama_client: Option<OllamaClient>,
@@ -300,6 +302,7 @@ impl App {
             input_buffer: String::new(),
             status_message,
             running: true,
+            pending_quit: false,
             message_buffer,
             task_manager,
             ollama_client,
@@ -489,6 +492,11 @@ impl App {
                 break;
             }
 
+            // Graceful quit: exit once the current turn reaches Idle
+            if self.pending_quit && self.turn_phase == TurnPhase::Idle {
+                break;
+            }
+
             // Yield to the Tokio scheduler between frames. Using sleep().await (instead of the
             // old blocking crossterm::event::poll(N ms)) lets other async tasks — the stream
             // reader, gap queries, subagent channels — run during idle time.
@@ -601,7 +609,7 @@ impl App {
 
         if self.last_warned_ctx_pct < threshold {
             self.last_warned_ctx_pct = threshold;
-            self.push_system_event(msg);
+            self.push_agent_notice(msg);
         }
     }
 
@@ -821,7 +829,7 @@ impl App {
         if self.mode == AppMode::Ask {
             match tool_name.as_str() {
                 "writefile" | "commit" | "python" | "ruste" => {
-                    self.push_system_event(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
+                    self.push_agent_notice(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     self.turn_phase = TurnPhase::Idle;
                     return;
                 }
@@ -1116,7 +1124,7 @@ impl App {
                 if let Err(e) = crate::gaps::record_gap(&gap) {
                     eprintln!("Failed to record gap: {}", e);
                 } else {
-                    self.push_system_event(format!("ℹ️  I wish I knew: {}", gap.content));
+                    self.push_agent_notice(format!("ℹ️  I wish I knew: {}", gap.content));
                 }
             }
             Ok(None) => {
@@ -1157,8 +1165,8 @@ impl App {
              AVAILABLE TOOLS:\n\
              • rg — ripgrep search: find patterns in files/dirs\n\
              • readfile — read a file (optionally: readfile path start end for a line range)\n\
-             • editfile — patch a file: provide exact old text and new text; fails if not found exactly once\n\
-             • writefile — create or fully overwrite a file\n\
+             • editfile — modify existing files: exact old_text → new_text (PREFERRED for code changes)\n\
+             • writefile — create new files; avoid on existing files (rewrites everything)\n\
              • spawn — run commands: ls, git, cargo, python, etc.\n\
              • commit — git commit changes\n\
              • python — run Python code\n\
@@ -1204,7 +1212,7 @@ impl App {
              WORKFLOW:\n\
              1. Discover pending todos: rg TODO .yggdra/todo/\n\
              2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
-             3. Work on task (use all tools freely)\n\
+             3. Work on task — for code changes: readfile the target, then editfile with exact context\n\
              4. Update todo status to done\n\
              5. Commit: commit 'message'\n\
              6. Continue to the next task"
@@ -1320,6 +1328,15 @@ impl App {
             .map(|v| v.len()).unwrap_or(0);
     }
 
+    /// Push a notice that is both shown in the UI and forwarded to the model as
+    /// an inline system instruction (role "notice" → Ollama "system").
+    fn push_agent_notice(&mut self, text: impl Into<String>) {
+        let msg = Message::new("notice", text);
+        self.persist_message(msg);
+        self.cached_message_count = self.message_buffer.messages()
+            .map(|v| v.len()).unwrap_or(0);
+    }
+
     /// Show a message in both the status bar and the chat timeline.
     /// Use for errors, warnings, and significant state changes.
     fn notify(&mut self, text: impl Into<String>) {
@@ -1429,7 +1446,6 @@ impl App {
         let messages_area = chunks[1];
         let viewport_height = messages_area.height as i32;
         let area_width = messages_area.width;
-        let messages_list = self.messages_cache.clone();
 
         // Pre-compute each message's formatted text, style, and estimated height
         struct RenderedMsg {
@@ -1448,10 +1464,10 @@ impl App {
             (line_count + wrap_extra).max(1) as u16
         }
 
-        let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(messages_list.len() + 1);
+        let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(self.messages_cache.len() + 1);
         let mut exchange_idx: usize = 0;
 
-        for msg in messages_list.iter() {
+        for msg in self.messages_cache.iter() {
             // Skip internal kick messages — they're for the model, not the user
             if msg.role == "kick" { continue; }
 
@@ -1470,6 +1486,7 @@ impl App {
                 }
                 "tool"   => ("🔧", None, false),
                 "system" => ("⚙️", None, false),
+                "notice" => ("📋", None, false),
                 "clock"  => ("🕐", None, false),
                 "spawn"  => ("🤖", Some(self.theme.band_spawn), true),
                 _        => ("💬", None, false),
@@ -1974,6 +1991,13 @@ impl App {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if c == 'c' {
                     self.running = false;
+                } else if c == 'q' {
+                    if self.turn_phase == TurnPhase::Idle {
+                        self.running = false;
+                    } else {
+                        self.pending_quit = true;
+                        self.status_message = "⏳ Quitting after this turn… (Ctrl+C to force)".to_string();
+                    }
                 } else if c == 's' {
                     self.handle_command().await;
                 }
@@ -2336,7 +2360,7 @@ impl App {
              /gaps         - Show knowledge gaps\n\
              /tool CMD     - Execute tool\n\n\
              Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only)\n\n\
-             Keybindings: Enter-Submit | Esc-Clear | Ctrl+C-Exit".to_string();
+             Keybindings: Enter-Submit | Esc-Cancel/Clear | Ctrl+Q-Graceful exit | Ctrl+C-Force exit".to_string();
     }
 
     /// Render a vertical gradient background across the given area with interpolated colors
@@ -2402,6 +2426,7 @@ impl App {
                 let role = match m.role.as_str() {
                     "assistant" => "Assistant",
                     "tool" | "kick" => "ToolResult",
+                    "notice" => "SystemNotice",
                     _ => "User",
                 };
                 // Truncate long messages for the summarizer input

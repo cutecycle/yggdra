@@ -62,14 +62,15 @@ pub fn json_tool_descriptions() -> &'static str {
    Examples: {"name": "readfile", "parameters": {"path": "README.md"}}
    WRONG: {"path": "*.md"} ← INVALID: globs not supported, use spawn with ls instead
 
-4. "writefile" — Create or overwrite a file
+4. "writefile" — Create a NEW file (or overwrite only when rewriting the whole file makes sense)
    Parameters: {"path": "string", "content": "string"}
    Examples: {"name": "writefile", "parameters": {"path": "file.txt", "content": "hello"}}
+   NOTE: For existing files, prefer editfile — it targets only changed lines and avoids drift.
 
-5. "editfile" — Find-and-replace in a file
-   Parameters: {"path": "string", "old_text": "string (exact match)", "new_text": "string"}
-   Examples: {"name": "editfile", "parameters": {"path": "main.rs", "old_text": "fn main()", "new_text": "fn run()"}}
-
+5. "editfile" — Modify an existing file: exact find-and-replace one section at a time
+   Parameters: {"path": "string", "old_text": "string (exact match, include enough context)", "new_text": "string"}
+   Examples: {"name": "editfile", "parameters": {"path": "main.rs", "old_text": "fn main() {", "new_text": "fn run() {"}}
+   PREFERRED for code changes: use readfile first to get the exact text, then editfile to replace it.
 6. "commit" — Create a git commit
    Parameters: {"message": "string"}
    Examples: {"name": "commit", "parameters": {"message": "Fix: update docs"}}
@@ -492,6 +493,17 @@ impl Agent {
         output.contains("[DONE]")
     }
 
+    /// Trim an accumulated message history to a bounded size.
+    /// Always keeps: index 0 (system prompt) + index 1 (first user message) + the last `keep` messages.
+    fn trim_messages(messages: &mut Vec<OllamaMessage>, keep: usize) {
+        let head = 2; // system + first user always retained
+        if messages.len() <= head + keep { return; }
+        let tail_start = messages.len() - keep;
+        let mut trimmed = messages[..head].to_vec();
+        trimmed.extend_from_slice(&messages[tail_start..]);
+        *messages = trimmed;
+    }
+
     /// Simple execution loop: only tools, no subagent spawning (for subagents to prevent recursion)
     pub async fn execute_simple(&mut self, user_query: &str) -> Result<String> {
         let mut iteration = 0;
@@ -528,6 +540,9 @@ impl Agent {
             // Refresh model and base params; runtime current_params take precedence
             let fresh = crate::config::Config::reload_from_file();
             let effective_params = self.current_params.merge_over(&fresh.params);
+
+            // Trim history to keep the last 20 messages (prevents unbounded memory growth)
+            Self::trim_messages(&mut messages, 20);
 
             // Stream the response so tokens flow live to the UI via token_tx
             let mut stream_rx = self.client.stream_messages(
@@ -580,6 +595,12 @@ impl Agent {
                         Ok(output) => output,
                         Err(e) => format!("[ERROR]: {}", e),
                     }
+                };
+                // Cap to 4000 chars to prevent unbounded history growth
+                let result = if result.chars().count() > 4000 {
+                    format!("{}...(truncated)", result.chars().take(4000).collect::<String>())
+                } else {
+                    result
                 };
                 tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
             }
@@ -635,6 +656,10 @@ impl Agent {
             // Refresh model and base params; runtime current_params take precedence
             let fresh = crate::config::Config::reload_from_file();
             let effective_params = self.current_params.merge_over(&fresh.params);
+
+            // Trim history to keep the last 20 messages (prevents unbounded memory growth)
+            Self::trim_messages(&mut messages, 20);
+
             let response = self.client.generate_with_messages(
                 &fresh.model,
                 messages.clone(),
@@ -689,6 +714,12 @@ impl Agent {
                         Ok(output) => output,
                         Err(e) => format!("[ERROR]: {}", e),
                     }
+                };
+                // Cap to 4000 chars to prevent unbounded history growth
+                let result = if result.chars().count() > 4000 {
+                    format!("{}...(truncated)", result.chars().take(4000).collect::<String>())
+                } else {
+                    result
                 };
                 tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
             }

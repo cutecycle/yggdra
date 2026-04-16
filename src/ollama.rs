@@ -231,8 +231,15 @@ impl OllamaClient {
         for msg in messages {
             // Skip UI-only roles — not forwarded to the model.
             if msg.role == "system" || msg.role == "clock" { continue; }
-            // "kick" and "tool" are forwarded as "user" turns
-            let role = if msg.role == "tool" || msg.role == "kick" { "user" } else { &msg.role };
+            // "notice" is a system-level notice from the app (context warnings, gap reflections, etc.)
+            // Forward as an inline "system" role so the model treats it as an instruction, not user input.
+            let role = if msg.role == "notice" {
+                "system"
+            } else if msg.role == "tool" || msg.role == "kick" {
+                "user"
+            } else {
+                &msg.role
+            };
 
             // Truncate tool output messages that exceed the cap
             let content = if msg.content.contains("[TOOL_OUTPUT:") && msg.content.len() > cap {
