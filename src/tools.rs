@@ -180,19 +180,41 @@ impl Tool for SpawnTool {
         let binary = parts[0];
 
         if Self::is_shell_interpreter(binary) {
+            // Provide helpful recovery hint: show user what they likely tried vs. what to do instead
+            let recovery = if args.contains("-c") {
+                // They tried bash/sh -c 'command', suggest running directly
+                format!(
+                    "\nTo fix: run the command directly.\n\
+                     ✗ Wrong:  spawn \"bash -c 'git status'\"\n\
+                     ✓ Right:  spawn \"git status\"\n\
+                     Pipes, redirects, and chains work directly: spawn \"git log | head -5\""
+                )
+            } else {
+                "All commands, pipes, redirects, and chains work directly in spawn without bash/sh.".to_string()
+            };
+            
             return Err(anyhow!(
-                "spawn: shell interpreter '{}' is blocked — use specific tools instead.\n\
-                 Allowed: git, cargo, ls, cat, etc.  Shell interpreters allow arbitrary escapes.",
-                binary
+                "❌ spawn: shell interpreter '{}' is blocked — run commands directly instead.\n{}",
+                binary, recovery
             ));
         }
 
         if Self::is_absolute_dangerous_path(binary) {
-            return Err(anyhow!("spawn: dangerous system path blocked: {}", binary));
+            return Err(anyhow!(
+                "❌ spawn: absolute path '{}' is blocked for safety.\n\
+                 Use the command name instead (binary resolves via PATH).\n\
+                 ✗ Wrong:  spawn \"/usr/bin/python3 script.py\"\n\
+                 ✓ Right:  spawn \"python3 script.py\"",
+                binary
+            ));
         }
 
         if Self::resolve_binary(binary).is_none() {
-            return Err(anyhow!("spawn: binary not found: {}", binary));
+            return Err(anyhow!(
+                "❌ spawn: binary '{}' not found in PATH.\n\
+                 Try: spawn \"which {}\" to debug, or check if the binary is installed.",
+                binary, binary
+            ));
         }
 
         Ok(())

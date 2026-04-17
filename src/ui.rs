@@ -1327,11 +1327,19 @@ impl App {
              • readfile — read a file (optionally: readfile path start end for a line range)\n\
              • editfile — modify existing files: exact old_text → new_text (PREFERRED for code changes)\n\
              • writefile — create new files; avoid on existing files (rewrites everything)\n\
-             • spawn — run commands: ls, git, cargo, python, etc.\n\
+             • spawn — run ANY command/tool (git, cargo, make, find, jq, node, python, etc.)\n\
              • commit — git commit changes\n\
-             • python — run Python code\n\
+             • python — run Python code or complex shell logic\n\
              • ruste — compile & run Rust code\n\
              • think — reasoning block (use freely)\n\
+             \n\
+             SHELL COMMANDS (spawn tool):\n\
+             spawn executes commands directly (no shell wrapper). Use for: git, cargo, make, find, jq, node, python, etc.\n\
+             • Works: spawn \"cargo test\", spawn \"find . -name '*.rs'\", spawn \"git log --oneline\"\n\
+             • With args: spawn \"find . -maxdepth 2 -type f -name '*.rs'\"\n\
+             ⚠️ Does NOT work (no shell): pipes |, redirects >, chains &&, OR || — use python tool for complex pipelines\n\
+             Blocked: bash/sh/zsh interpreters (for safety — run commands directly instead)\n\
+             \n\
              TOOL FORMAT:\n"
         );
         // JSON format only — all production models (qwen3.5, gemma-4) support it

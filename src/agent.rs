@@ -52,13 +52,14 @@ pub fn json_tool_descriptions() -> &'static str {
    Examples: {"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}
    Note: directory must be a path, NOT a glob
 
-2. "spawn" — Execute a shell command (git, cargo, ls, cat, find, make, etc.)
-   Parameters: {"command": "string (shell command)"}
-   Examples: {"name": "spawn", "parameters": {"command": "ls -la src/"}}
-             {"name": "spawn", "parameters": {"command": "cargo test --lib"}}
-             {"name": "spawn", "parameters": {"command": "cat Cargo.toml"}}
-   BLOCKED: shell interpreters (bash, sh, zsh) and absolute paths (/bin/bash, /usr/bin/python3)
-   USE spawn for: listing files, running tests, reading file contents, git operations, etc.
+2. "spawn" — Execute ANY command: git, cargo, make, find, jq, node, python, ls, etc.
+   Parameters: {"command": "string (command name + arguments)"}
+   Examples: {"name": "spawn", "parameters": {"command": "cargo test --lib"}}
+             {"name": "spawn", "parameters": {"command": "git log --oneline"}}
+             {"name": "spawn", "parameters": {"command": "find . -name '*.rs' -type f"}}
+   NOTE: spawn executes directly without shell — no pipes |, redirects >, or chains && allowed
+   For complex pipelines, use python tool or call spawn multiple times
+   BLOCKED: shell interpreters (bash, sh, zsh) and absolute paths (/bin/*, /usr/bin/*) — for safety
 
 3. "readfile" — Read a SINGLE file (NOT globs)
    Parameters: {"path": "string (exact file path)", "start_line": "number (optional)", "end_line": "number (optional)", "search": "string (optional — filter to matching lines only)"}
