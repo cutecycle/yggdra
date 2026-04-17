@@ -57,6 +57,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "temperature", description: "Set sampling temperature (0.0–2.0)", keywords: "temperature heat creativity sampling randomness", fill: "/temperature " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "toolcap", description: "Set tool output cap (chars, or 'off')", keywords: "tool output truncate cap compress context", fill: "/toolcap " },
+    PaletteCommand { name: "stats",   description: "Show cumulative session stats",       keywords: "stats metrics tokens usage tools sessions uptime", fill: "/stats" },
     PaletteCommand { name: "compress", description: "Summarize session and reset context", keywords: "compress summarize archive context reset memory", fill: "/compress" },
     PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
@@ -76,6 +77,8 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "tool commit",   description: "Git commit with message",     keywords: "git save version commit history",   fill: "/tool commit " },
     PaletteCommand { name: "tool python",   description: "Run a Python script",         keywords: "python py script run execute",      fill: "/tool python " },
     PaletteCommand { name: "tool ruste",    description: "Compile and run Rust code",   keywords: "rust compile execute cargo rustc",  fill: "/tool ruste " },
+    PaletteCommand { name: "view",          description: "Open file viewer (tabs, scroll)", keywords: "view file open read tab viewer",  fill: "/view " },
+    PaletteCommand { name: "diff",          description: "View git diff in file viewer",   keywords: "diff git changes patch hunk",      fill: "/diff" },
 ];
 
 /// Fuzzy match: returns a score > 0 if all query chars appear in target in order.
@@ -148,6 +151,14 @@ struct InlineToolResult {
     output: String,
     is_complete: bool,
     exit_code: Option<i32>,  // None if still running, Some(code) if complete
+}
+
+/// A single tab in the file viewer overlay
+struct FileTab {
+    label: String,
+    lines: Vec<String>,
+    scroll: usize,
+    is_diff: bool,
 }
 
 /// Minimal TUI application
@@ -253,6 +264,27 @@ pub struct App {
     messages_cache: Vec<crate::message::Message>,
     /// Tick counter used to periodically re-detect terminal theme without terminal queries.
     theme_check_counter: u32,
+    /// File viewer overlay: open tabs and active tab index
+    file_viewer_open: bool,
+    file_viewer_tabs: Vec<FileTab>,
+    file_viewer_active: usize,
+    /// Persistent project stats — written to .yggdra/stats.json on exit.
+    stats: crate::stats::Stats,
+    /// Time this App was created — used to compute uptime on exit.
+    session_start: std::time::Instant,
+
+    // ── Loop-prevention state ────────────────────────────────────────────
+    /// Rolling window of recent (tool_name, args_hash) dispatches — cap 20.
+    /// Used to detect the agent calling the same tool with the same args repeatedly.
+    recent_tool_calls: std::collections::VecDeque<(String, u64)>,
+    /// How many consecutive "identical call" spin notices have been injected this turn.
+    spin_notice_count: u32,
+    /// Per-turn error frequency: (tool_name, error_hash) → consecutive count.
+    recent_tool_errors: std::collections::HashMap<(String, u64), u32>,
+    /// Timestamp of the last tool call that mutated the filesystem (edit/write/patch/commit).
+    last_mutating_action: std::time::Instant,
+    /// True once we've sent the "no files changed in N calls" stall notice this session.
+    stall_notice_sent: bool,
 }
 
 impl App {
@@ -297,6 +329,11 @@ impl App {
         // Parse AGENTS.md into structured config for model + param defaults
         let cwd = std::env::current_dir().unwrap_or_default();
         let agents_config = crate::config::AgentsConfig::parse_from_file(&cwd.join("AGENTS.md"));
+
+        // Load persistent stats and record this session start
+        let mut stats = crate::stats::Stats::load(&cwd);
+        stats.on_session_start();
+        stats.save(&cwd);
 
         Self {
             config,
@@ -354,6 +391,16 @@ impl App {
             inline_tool_results: Vec::new(),
             messages_cache: Vec::new(),
             theme_check_counter: 0,
+            file_viewer_open: false,
+            file_viewer_tabs: Vec::new(),
+            file_viewer_active: 0,
+            stats,
+            session_start: std::time::Instant::now(),
+            recent_tool_calls: std::collections::VecDeque::new(),
+            spin_notice_count: 0,
+            recent_tool_errors: std::collections::HashMap::new(),
+            last_mutating_action: std::time::Instant::now(),
+            stall_notice_sent: false,
         }
     }
 
@@ -519,6 +566,14 @@ impl App {
             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
 
+        // Save stats and epoch summary on clean exit
+        let cwd = std::env::current_dir().unwrap_or_default();
+        self.stats.add_uptime(self.session_start.elapsed().as_secs());
+        self.stats.save(&cwd);
+
+        let messages = self.message_buffer.messages().unwrap_or_default();
+        crate::epoch::save_summary(&cwd, &messages);
+
         Ok(())
     }
 
@@ -537,7 +592,7 @@ impl App {
                         self.scroll_offset = 0;
                     }
                 }
-                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns }) => {
+                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns, context_trimmed }) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
                     self.total_tokens_used += prompt_tokens + gen_tokens;
                     // Compute inference rate (tok/s)
@@ -546,6 +601,8 @@ impl App {
                             Some(gen_tokens as f64 / (ns as f64 / 1_000_000_000.0)),
                         _ => None,
                     };
+                    self.stats.record_llm(prompt_tokens, gen_tokens, self.last_infer_rate);
+                    if context_trimmed { self.stats.context_trims += 1; }
                     self.complete_streaming_turn();
                     return;
                 }
@@ -852,6 +909,43 @@ impl App {
             }
         }
 
+        // ── Repeated-identical-call detection (DISABLED) ──────────────────────
+        // NOTE: This detection was triggering false positives on legitimate reads
+        // (e.g., agent reading the same file twice to double-check). Disabled for now.
+        // Error-loop detection (lines 1144-1186) remains to catch pathological retries.
+        //
+        // To re-enable: uncomment block below and tune repeat_count >= threshold.
+        //
+        // {
+        //     use std::hash::{Hash, Hasher};
+        //     let mut h = std::collections::hash_map::DefaultHasher::new();
+        //     tool_name.hash(&mut h);
+        //     args.hash(&mut h);
+        //     let call_hash = h.finish();
+        //
+        //     self.recent_tool_calls.push_back((tool_name.clone(), call_hash));
+        //     if self.recent_tool_calls.len() > 20 {
+        //         self.recent_tool_calls.pop_front();
+        //     }
+        //
+        //     let window = self.recent_tool_calls.iter().rev().take(6);
+        //     let repeat_count = window.filter(|(n, h)| n == &tool_name && *h == call_hash).count();
+        //     if repeat_count >= 5 {  // Higher threshold to allow legitimate re-reads
+        //         self.push_agent_notice(format!(
+        //             "⚠️ Loop detected: '{}' called with identical arguments {} times in the last 6 steps.",
+        //             tool_name, repeat_count
+        //         ));
+        //         self.spin_notice_count += 1;
+        //         if self.spin_notice_count >= 2 {
+        //             self.notify("⏸ Paused — agent stuck in a repeat loop. Send a message to redirect.");
+        //             self.turn_phase = TurnPhase::Idle;
+        //             self.spin_notice_count = 0;
+        //             return;
+        //         }
+        //     }
+        // }
+        // ────────────────────────────────────────────────────────────────────
+
         let (tx, rx) = oneshot::channel();
 
         // Wrap in tokio timeout as a safety net — spawn's own timeout handles the
@@ -1042,6 +1136,57 @@ impl App {
                     Ok(output) => output.clone(),
                     Err(e) => format!("Error: {}", e),
                 };
+
+                // Record persistent stats for this tool call
+                match &result.output {
+                    Ok(output) => self.stats.record_tool(&result.tool_name, true, output.len()),
+                    Err(_)     => self.stats.record_tool(&result.tool_name, false, 0),
+                }
+
+                // ── Error-loop detection ─────────────────────────────────────
+                // If the same tool keeps returning the same error, stop retrying.
+                match &result.output {
+                    Err(e) => {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        result.tool_name.hash(&mut h);
+                        // Hash just the first 80 chars so minor variation doesn't dodge detection
+                        e.chars().take(80).collect::<String>().hash(&mut h);
+                        let err_hash = h.finish();
+                        let key = (result.tool_name.clone(), err_hash);
+                        let count = {
+                            let c = self.recent_tool_errors.entry(key).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        if count >= 3 {
+                            let tool = result.tool_name.clone();
+                            self.push_agent_notice(format!(
+                                "⚠️ Error loop: '{}' has failed with the same error {} times. \
+                                 Stop retrying — read the error carefully and try a different approach.",
+                                tool, count
+                            ));
+                            self.notify(format!("⏸ Paused — '{}' error loop", tool));
+                            self.turn_phase = TurnPhase::Idle;
+                            self.tool_iteration_count = 0;
+                            self.recent_tool_errors.clear();
+                            return;
+                        }
+                    }
+                    Ok(output) => {
+                        // Successful mutation: update progress tracker and clear error counts
+                        match result.tool_name.as_str() {
+                            "editfile" | "writefile" | "patchfile" | "commit" => {
+                                self.last_mutating_action = std::time::Instant::now();
+                                self.stall_notice_sent = false;
+                                self.recent_tool_errors.clear();
+                            }
+                            _ => {}
+                        }
+                        let _ = output;
+                    }
+                }
+                // ─────────────────────────────────────────────────────────────
                 
                 // Try to infer exit code: 0 for success, 1 for error
                 let inferred_exit_code = match &result.output {
@@ -1227,10 +1372,18 @@ impl App {
              WORKFLOW:\n\
              1. Discover pending todos: rg TODO .yggdra/todo/\n\
              2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
-             3. Work on task — for code changes: readfile the target, then editfile with exact context\n\
+             3. Work on task — for code changes:\n\
+                a. readfile the target (note line numbers)\n\
+                b. patchfile (preferred) or editfile to make the change\n\
+                c. commit immediately with a message: WHAT changed + WHY\n\
+                d. repeat steps a-c for each logical change\n\
              4. Update todo status to done\n\
-             5. Commit: commit 'message'\n\
-             6. Continue to the next task"
+             5. Commit the todo status update\n\
+             6. Continue to the next task\n\
+             \n\
+             COMMIT RULE: every file write is followed immediately by a commit.\n\
+             Never batch multiple unrelated changes into one commit.\n\
+             Commit messages explain the change (e.g. 'fix(agent): add patchfile to is_valid_tool')."
         );
         if let Some(ctx) = &self.agents_context {
             base.push_str("\n\n--- AGENTS.md ---\n");
@@ -1905,12 +2058,23 @@ impl App {
             Some(r) => format!("⚡ {:.1} tok/s", r),
             None => String::new(),
         };
-        let power_segment = match (battery_icon.is_empty(), rate_text.is_empty()) {
-            (false, false) => format!("{} {}", battery_icon, rate_text),
-            (false, true)  => battery_icon.to_string(),
-            (true, false)  => rate_text,
-            (true, true)   => String::new(),
+        // Countdown to next auto-request: shown when on battery, build mode, idle
+        let countdown_text = if self.on_battery == BatteryState::OnBattery
+            && self.mode == AppMode::Build
+            && self.turn_phase == TurnPhase::Idle
+        {
+            const KICK_SECS: u64 = 5;
+            let elapsed = self.last_build_kick.elapsed().as_secs();
+            let remaining = KICK_SECS.saturating_sub(elapsed);
+            format!("⏱ {}s", remaining)
+        } else {
+            String::new()
         };
+        let mut parts: Vec<&str> = Vec::new();
+        if !battery_icon.is_empty() { parts.push(battery_icon); }
+        if !rate_text.is_empty()    { parts.push(&rate_text); }
+        if !countdown_text.is_empty() { parts.push(&countdown_text); }
+        let power_segment = parts.join(" ");
 
         let width = chunks[5].width as usize;
         let status = if width >= 60 && !power_segment.is_empty() {
@@ -1939,6 +2103,93 @@ impl App {
         };
         let status_bar = Paragraph::new(status);
         f.render_widget(status_bar, chunks[5]);
+
+        // File viewer overlay — covers the messages area
+        if self.file_viewer_open && !self.file_viewer_tabs.is_empty() {
+            self.draw_file_viewer(f, chunks[1]);
+        }
+    }
+
+    /// Render the file viewer overlay into `area`
+    fn draw_file_viewer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::widgets::{Clear, Tabs};
+        use ratatui::text::{Line as RLine, Span as RSpan};
+        use ratatui::style::{Modifier};
+
+        // Clear the background
+        f.render_widget(Clear, area);
+
+        // Split: 1-line tab bar + rest for content
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+
+        // Tab bar
+        let tab_titles: Vec<RLine> = self.file_viewer_tabs.iter()
+            .map(|t| RLine::from(RSpan::raw(format!(" {} ", t.label))))
+            .collect();
+        let tabs_widget = Tabs::new(tab_titles)
+            .select(self.file_viewer_active)
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD))
+            .divider(RSpan::raw("│"));
+        f.render_widget(tabs_widget, panes[0]);
+
+        // Content area with border
+        let tab = &self.file_viewer_tabs[self.file_viewer_active];
+        let content_area = panes[1];
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(format!(" 📄 {} — ↑↓/PgUp/PgDn scroll · Tab switch · q/Esc close ", tab.label));
+        let inner_area = inner.inner(content_area);
+        f.render_widget(inner, content_area);
+
+        let visible_h = inner_area.height as usize;
+        let scroll = tab.scroll;
+
+        if tab.is_diff {
+            // Diff: colour by first char
+            let lines: Vec<RLine> = tab.lines.iter().skip(scroll).take(visible_h)
+                .map(|l| {
+                    let color = if l.starts_with('+') && !l.starts_with("+++") {
+                        Color::Green
+                    } else if l.starts_with('-') && !l.starts_with("---") {
+                        Color::Red
+                    } else if l.starts_with("@@") {
+                        Color::Cyan
+                    } else if l.starts_with("diff ") || l.starts_with("index ") || l.starts_with("---") || l.starts_with("+++") {
+                        Color::Yellow
+                    } else {
+                        Color::Reset
+                    };
+                    RLine::from(RSpan::styled(l.clone(), Style::default().fg(color)))
+                })
+                .collect();
+            let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+            f.render_widget(paragraph, inner_area);
+        } else {
+            // Regular file: use the highlighter on each line
+            let is_dark = self.theme.kind == crate::theme::ThemeKind::Dark;
+            let lang = crate::highlight::lang_from_path(&tab.label);
+            let mut out_lines: Vec<RLine> = Vec::with_capacity(visible_h);
+            let total = tab.lines.len();
+            let gutter_w = if total > 999 { 5 } else if total > 99 { 4 } else { 3 };
+            for (idx, raw) in tab.lines.iter().enumerate().skip(scroll).take(visible_h) {
+                let lineno = idx + 1;
+                let num_span = RSpan::styled(
+                    format!("{:width$} ", lineno, width = gutter_w),
+                    Style::default().fg(Color::DarkGray),
+                );
+                let mut spans = vec![num_span];
+                let highlighted = self.highlighter.highlight_line(raw, lang, is_dark);
+                spans.extend(highlighted);
+                out_lines.push(RLine::from(spans));
+            }
+            let paragraph = Paragraph::new(out_lines).wrap(ratatui::widgets::Wrap { trim: false });
+            f.render_widget(paragraph, inner_area);
+        }
     }
 
     /// Handle keyboard input
@@ -1999,6 +2250,12 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // File viewer takes over most input when open
+        if self.file_viewer_open {
+            self.handle_file_viewer_key(key);
             return;
         }
 
@@ -2236,6 +2493,8 @@ impl App {
             self.handle_tasks_command();
         } else if command == "/gaps" {
             self.handle_gaps_command();
+        } else if command == "/stats" {
+            self.handle_stats_command();
         } else if command == "/save" {
             self.save_plan_as_todo();
             self.notify("📋 Plan saved as todo".to_string());
@@ -2341,12 +2600,23 @@ impl App {
         } else if command.starts_with("/openlink") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_link_command(true, n).await;
+        } else if command.starts_with("/view") {
+            let path = command.strip_prefix("/view").unwrap_or("").trim();
+            self.handle_view_command(path);
+        } else if command.starts_with("/diff") {
+            let path = command.strip_prefix("/diff").unwrap_or("").trim();
+            self.handle_diff_command(path);
         } else if command.starts_with('/') {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
             // Message validation: no excessive length, check for reasonable content
             self.inline_tool_results.clear(); // Clear inline results when user sends new message
             self.consecutive_empty_kicks = 0; // Reset stuck detection on new user input
+            // Reset loop-prevention state on new user input
+            self.recent_tool_calls.clear();
+            self.spin_notice_count = 0;
+            self.recent_tool_errors.clear();
+            self.stall_notice_sent = false;
             self.handle_message(&command).await;
         }
 
@@ -2373,6 +2643,7 @@ impl App {
              /clear        - Archive conversation to scrollback\n\
              /tasks        - Show task dependency graph\n\
              /gaps         - Show knowledge gaps\n\
+             /stats        - Show cumulative session statistics\n\
              /tool CMD     - Execute tool\n\n\
              Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only)\n\n\
              Keybindings: Enter-Submit | Esc-Cancel/Clear | Ctrl+Q-Graceful exit | Ctrl+C-Force exit".to_string();
@@ -2495,6 +2766,7 @@ impl App {
         }
 
         self.cached_message_count = self.message_buffer.count().unwrap_or(0);
+        self.stats.compressions += 1;
         self.notify(format!("✅ Compressed: {} messages → summary injected", archived));
     }
 
@@ -2853,6 +3125,134 @@ impl App {
         }
     }
 
+    /// Handle /view <path> — open a file in the file viewer overlay
+    fn handle_view_command(&mut self, path: &str) {
+        if path.is_empty() {
+            self.notify("Usage: /view <path>  (e.g. /view src/main.rs)");
+            return;
+        }
+        let resolved = crate::sandbox::resolve(path);
+        match std::fs::read_to_string(&resolved) {
+            Ok(content) => {
+                let label = resolved.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string();
+                // If a tab for this path already exists, just focus it
+                if let Some(pos) = self.file_viewer_tabs.iter().position(|t| t.label == label) {
+                    self.file_viewer_active = pos;
+                } else {
+                    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                    self.file_viewer_tabs.push(FileTab { label, lines, scroll: 0, is_diff: false });
+                    self.file_viewer_active = self.file_viewer_tabs.len() - 1;
+                }
+                self.file_viewer_open = true;
+            }
+            Err(e) => {
+                self.notify(format!("❌ Cannot open {}: {}", path, e));
+            }
+        }
+    }
+
+    /// Handle /diff [path] — open git diff in the file viewer overlay
+    fn handle_diff_command(&mut self, path: &str) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("diff").arg("--color=never");
+        if !path.is_empty() {
+            cmd.arg("--").arg(path);
+        }
+        match cmd.output() {
+            Ok(out) => {
+                let raw = String::from_utf8_lossy(&out.stdout).to_string();
+                if raw.trim().is_empty() {
+                    // Fall back to HEAD diff
+                    let head_out = std::process::Command::new("git")
+                        .args(["diff", "HEAD", "--color=never"])
+                        .output();
+                    let content = head_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                        .unwrap_or_default();
+                    if content.trim().is_empty() {
+                        self.notify("ℹ️  No changes (working tree and HEAD are clean)");
+                        return;
+                    }
+                    let lines = content.lines().map(|l| l.to_string()).collect();
+                    self.file_viewer_tabs.push(FileTab { label: "diff HEAD".to_string(), lines, scroll: 0, is_diff: true });
+                } else {
+                    let label = if path.is_empty() { "diff".to_string() } else { format!("diff {}", path) };
+                    let lines = raw.lines().map(|l| l.to_string()).collect();
+                    // Replace existing diff tab for same label if present
+                    if let Some(pos) = self.file_viewer_tabs.iter().position(|t| t.label == label) {
+                        self.file_viewer_tabs[pos] = FileTab { label, lines, scroll: 0, is_diff: true };
+                        self.file_viewer_active = pos;
+                    } else {
+                        self.file_viewer_tabs.push(FileTab { label, lines, scroll: 0, is_diff: true });
+                        self.file_viewer_active = self.file_viewer_tabs.len() - 1;
+                    }
+                }
+                self.file_viewer_open = true;
+            }
+            Err(e) => {
+                self.notify(format!("❌ git diff failed: {}", e));
+            }
+        }
+    }
+
+    /// Handle keys when the file viewer overlay is open
+    fn handle_file_viewer_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        if self.file_viewer_tabs.is_empty() {
+            self.file_viewer_open = false;
+            return;
+        }
+        let tab_count = self.file_viewer_tabs.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.file_viewer_open = false;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+W closes current tab
+                self.file_viewer_tabs.remove(self.file_viewer_active);
+                if self.file_viewer_tabs.is_empty() {
+                    self.file_viewer_open = false;
+                } else {
+                    self.file_viewer_active = self.file_viewer_active.min(self.file_viewer_tabs.len() - 1);
+                }
+            }
+            KeyCode::Tab => {
+                self.file_viewer_active = (self.file_viewer_active + 1) % tab_count;
+            }
+            KeyCode::BackTab => {
+                self.file_viewer_active = self.file_viewer_active.checked_sub(1).unwrap_or(tab_count - 1);
+            }
+            KeyCode::Up => {
+                let tab = &mut self.file_viewer_tabs[self.file_viewer_active];
+                tab.scroll = tab.scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let tab = &mut self.file_viewer_tabs[self.file_viewer_active];
+                let max_scroll = tab.lines.len().saturating_sub(1);
+                tab.scroll = (tab.scroll + 1).min(max_scroll);
+            }
+            KeyCode::PageUp => {
+                let tab = &mut self.file_viewer_tabs[self.file_viewer_active];
+                tab.scroll = tab.scroll.saturating_sub(20);
+            }
+            KeyCode::PageDown => {
+                let tab = &mut self.file_viewer_tabs[self.file_viewer_active];
+                let max_scroll = tab.lines.len().saturating_sub(1);
+                tab.scroll = (tab.scroll + 20).min(max_scroll);
+            }
+            KeyCode::Char('g') => {
+                self.file_viewer_tabs[self.file_viewer_active].scroll = 0;
+            }
+            KeyCode::Char('G') => {
+                let tab = &mut self.file_viewer_tabs[self.file_viewer_active];
+                tab.scroll = tab.lines.len().saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
     /// Handle /models command — fetch model list and open interactive picker
     async fn handle_models_command(&mut self) {
         // Always re-read config.toml to pick up endpoint changes without restart
@@ -3151,6 +3551,24 @@ impl App {
             if count != self.cached_message_count {
                 self.cached_message_count = count;
             }
+        }
+
+        // No-progress stall detection: in build mode, if many tool calls have fired
+        // but no file has been mutated for a while, the agent is over-planning.
+        if self.mode == AppMode::Build
+            && self.turn_phase == TurnPhase::Idle
+            && !self.stall_notice_sent
+            && self.tool_iteration_count > 10
+            && self.last_mutating_action.elapsed() > std::time::Duration::from_secs(60)
+        {
+            self.push_agent_notice(format!(
+                "⚠️ No files have been modified in the last {} tool calls ({}s elapsed). \
+                 You appear to be reading/planning without acting. \
+                 Stop planning and make a concrete file edit now.",
+                self.tool_iteration_count,
+                self.last_mutating_action.elapsed().as_secs()
+            ));
+            self.stall_notice_sent = true;
         }
 
         // Watchdog: if Build mode has been idle for 5+ seconds, re-kick
@@ -3572,6 +3990,48 @@ impl App {
             Err(e) => {
                 self.status_message = format!("❌ Failed to load gaps: {}", e);
             }
+        }
+    }
+
+    /// Handle /stats command — display cumulative project statistics from stats.json
+    fn handle_stats_command(&mut self) {
+        let s = &self.stats;
+
+        // Format uptime as Xh Ym
+        let uptime_secs = s.uptime_seconds;
+        let uptime_str = if uptime_secs >= 3600 {
+            format!("{}h {}m", uptime_secs / 3600, (uptime_secs % 3600) / 60)
+        } else {
+            format!("{}m {}s", uptime_secs / 60, uptime_secs % 60)
+        };
+
+        let mut output = format!(
+            "📊 Project Stats\n\n\
+             Sessions: {}  Uptime: {}\n\
+             LLM: {} requests  |  {} prompt + {} gen tokens  |  avg {:.1} tok/s\n\
+             Context trims: {}  |  Compressions: {}\n",
+            s.sessions, uptime_str,
+            s.llm_requests, s.prompt_tokens, s.gen_tokens, s.avg_tok_per_s(),
+            s.context_trims, s.compressions,
+        );
+
+        if !s.tools.is_empty() {
+            output.push_str("\nTools:\n");
+            let mut tools: Vec<_> = s.tools.iter().collect();
+            tools.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
+            for (name, t) in &tools {
+                let fail_str = if t.failures > 0 { format!("  {} failures", t.failures) } else { String::new() };
+                output.push_str(&format!("  {:12}  {:4} calls  {:6} KB out{}\n",
+                    name, t.calls, t.output_bytes / 1024, fail_str));
+            }
+        }
+
+        let msg = crate::message::Message::new("tool", output);
+        if let Err(e) = self.message_buffer.add_and_persist(msg) {
+            self.status_message = format!("❌ Failed to display stats: {}", e);
+        } else {
+            self.cached_message_count = self.message_buffer.messages()
+                .map(|v| v.len()).unwrap_or(0);
         }
     }
 }

@@ -52,43 +52,58 @@ pub fn json_tool_descriptions() -> &'static str {
    Examples: {"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}
    Note: directory must be a path, NOT a glob
 
-2. "spawn" — Execute a shell command
+2. "spawn" — Execute a shell command (git, cargo, ls, cat, find, make, etc.)
    Parameters: {"command": "string (shell command)"}
-   Examples: {"name": "spawn", "parameters": {"command": "npm test"}}
-   Note: Commands run in current directory; NO glob expansion needed
+   Examples: {"name": "spawn", "parameters": {"command": "ls -la src/"}}
+             {"name": "spawn", "parameters": {"command": "cargo test --lib"}}
+             {"name": "spawn", "parameters": {"command": "cat Cargo.toml"}}
+   BLOCKED: shell interpreters (bash, sh, zsh) and absolute paths (/bin/bash, /usr/bin/python3)
+   USE spawn for: listing files, running tests, reading file contents, git operations, etc.
 
 3. "readfile" — Read a SINGLE file (NOT globs)
-   Parameters: {"path": "string (exact file path)", "start_line": "number (optional)", "end_line": "number (optional)"}
+   Parameters: {"path": "string (exact file path)", "start_line": "number (optional)", "end_line": "number (optional)", "search": "string (optional — filter to matching lines only)"}
    Examples: {"name": "readfile", "parameters": {"path": "README.md"}}
-   WRONG: {"path": "*.md"} ← INVALID: globs not supported, use spawn with ls instead
+             {"name": "readfile", "parameters": {"path": "src/main.rs", "start_line": 10, "end_line": 50}}
+             {"name": "readfile", "parameters": {"path": "src/main.rs", "search": "fn main"}}
+   WRONG: {"path": "*.md"} ← INVALID: globs not supported, use spawn with ls or find instead
 
 4. "writefile" — Create a NEW file (or overwrite only when rewriting the whole file makes sense)
    Parameters: {"path": "string", "content": "string"}
    Examples: {"name": "writefile", "parameters": {"path": "file.txt", "content": "hello"}}
-   NOTE: For existing files, prefer editfile — it targets only changed lines and avoids drift.
+   NOTE: For existing files, use patchfile (preferred) or editfile — never rewrite a whole file just to change a few lines.
 
-5. "editfile" — Modify an existing file: exact find-and-replace one section at a time
+5. "patchfile" — **PREFERRED** way to modify existing files: replace a line range by number
+   Parameters: {"path": "string", "start_line": number, "end_line": number, "new_text": "string"}
+   Examples: {"name": "patchfile", "parameters": {"path": "src/main.rs", "start_line": 42, "end_line": 47, "new_text": "fn run() {\n    todo!()\n}"}}
+   WORKFLOW: readfile (note line numbers) → patchfile (replace that exact range). No need to reproduce the old text.
+   PREFER over editfile: no risk of old_text mismatch, works even if content has special chars.
+
+6. "editfile" — Fallback modifier: exact find-and-replace one section at a time
    Parameters: {"path": "string", "old_text": "string (exact match, include enough context)", "new_text": "string"}
    Examples: {"name": "editfile", "parameters": {"path": "main.rs", "old_text": "fn main() {", "new_text": "fn run() {"}}
-   PREFERRED for code changes: use readfile first to get the exact text, then editfile to replace it.
-6. "commit" — Create a git commit
-   Parameters: {"message": "string"}
-   Examples: {"name": "commit", "parameters": {"message": "Fix: update docs"}}
+   Use when you don't have line numbers. old_text MUST match exactly — include enough context to be unique.
 
-7. "python" — Run a Python script
+7. "commit" — Create a git commit (REQUIRED after every file change)
+   Parameters: {"message": "string"}
+   Examples: {"name": "commit", "parameters": {"message": "feat(ui): add /stats command to display session metrics"}}
+   RULE: After EVERY writefile / patchfile / editfile call, immediately follow with a commit.
+   Commit message must explain WHAT changed and WHY (not just "update file").
+   One logical change per commit — do not batch multiple unrelated file edits into one commit.
+
+8. "python" — Run a Python script
    Parameters: {"script_path": "string"}
    Examples: {"name": "python", "parameters": {"script_path": "script.py"}}
 
-8. "ruste" — Compile and run Rust code
+9. "ruste" — Compile and run Rust code
    Parameters: {"rust_file_path": "string"}
    Examples: {"name": "ruste", "parameters": {"rust_file_path": "main.rs"}}
 
-9. "think" — Reason out loud (no side effects)
-   Parameters: {"thought": "string"}
-   Examples: {"name": "think", "parameters": {"thought": "I need to check the config first"}}
+10. "think" — Reason out loud (no side effects)
+    Parameters: {"thought": "string"}
+    Examples: {"name": "think", "parameters": {"thought": "I need to check the config first"}}
 
-CRITICAL: These are the ONLY valid tools. Do NOT use: ls, cat, find, bash, shell, sh, cmd, etc.
-To list files, use: {"name": "spawn", "parameters": {"command": "ls -la directory/"}}
+BLOCKED tools — these will error: bash, sh, zsh, /bin/bash, /usr/bin/python3, and other shell interpreters or absolute system paths.
+All other commands (ls, cat, find, git, cargo, make, jq, etc.) work fine via "spawn".
 
 Return tool calls as VALID JSON only:
 {"tool_calls": [{"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}]}
@@ -242,7 +257,7 @@ fn extract_balanced_braces(s: &str) -> Option<String> {
 fn is_valid_tool(name: &str) -> bool {
     matches!(
         name,
-        "rg" | "spawn" | "readfile" | "writefile" | "editfile" | "commit" | "python"
+        "rg" | "spawn" | "readfile" | "writefile" | "editfile" | "patchfile" | "commit" | "python"
             | "ruste" | "spawn_agent" | "set_params" | "think"
     )
 }
@@ -302,16 +317,25 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
         "rg" => {
             let pattern = get_str("pattern");
             let dir = get_str("directory");
-            format!("{} {}", pattern, dir)
+            // Use \x00 separator so patterns with spaces survive intact
+            format!("{}\x00{}", pattern, dir)
         }
         "readfile" => {
             let path = get_str("path");
             let start = params.get("start_line").and_then(|v| v.as_u64());
             let end = params.get("end_line").and_then(|v| v.as_u64());
-            match (start, end) {
-                (Some(s), Some(e)) => format!("{} {} {}", path, s, e),
-                (Some(s), None) => format!("{} {}", path, s),
-                _ => path,
+            let search = params.get("search").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !search.is_empty() {
+                // Null-separated format with search term
+                let start_s = start.map(|n| n.to_string()).unwrap_or_default();
+                let end_s = end.map(|n| n.to_string()).unwrap_or_default();
+                format!("{}\x00{}\x00{}\x00{}", path, start_s, end_s, search)
+            } else {
+                match (start, end) {
+                    (Some(s), Some(e)) => format!("{} {} {}", path, s, e),
+                    (Some(s), None) => format!("{} {}", path, s),
+                    _ => path,
+                }
             }
         }
         "writefile" => {
@@ -481,6 +505,8 @@ impl Agent {
              - Tool output is capped at 3000 chars by default; full output stored in session.\n\
              - After calling a tool, include the result in your next response and continue reasoning.\n\
              - Subagents run in parallel; wait for all results before combining for final output.\n\
+             - COMMIT RULE: after every writefile/patchfile/editfile, immediately call commit with a\n\
+               message explaining what changed and why. One commit per logical change.\n\
              - When task is fully complete, respond with summary of results — no special marker needed.",
             root  = root_line,
             tools = json_tool_descriptions()
@@ -929,7 +955,8 @@ mod tests {
         let output = r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "fn main", "directory": "src/"}}]}"#;
         let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].args, "fn main src/");
+        // rg now uses \x00 separator so multi-word patterns survive
+        assert_eq!(calls[0].args, "fn main\x00src/");
     }
 
     #[test]

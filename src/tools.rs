@@ -65,10 +65,15 @@ impl Tool for RipgrepTool {
         if args.is_empty() {
             return Err(anyhow!("rg: empty arguments"));
         }
-        // Validate the search path is inside the project root
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let path = parts[1].trim_matches('"').trim_matches('\'');
+        // Validate the search path is inside the project root.
+        // Support both \x00-separated (new) and space-separated (legacy) wire formats.
+        let path = if args.contains('\x00') {
+            args.splitn(2, '\x00').nth(1).unwrap_or("").trim()
+        } else {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.len() >= 2 { parts[1].trim_matches('"').trim_matches('\'') } else { "" }
+        };
+        if !path.is_empty() {
             sandbox::check_read(path)?;
         }
         Ok(())
@@ -77,17 +82,27 @@ impl Tool for RipgrepTool {
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        // Parse arguments respecting quoted strings (e.g. "hello world" path/)
-        let parts = shell_split(args);
-        if parts.len() < 2 {
-            return Err(anyhow!("rg: usage: rg PATTERN PATH"));
+        // Parse arguments: prefer \x00 separator so multi-word patterns survive.
+        // Legacy fallback: shell-quoted "pattern" path/ style.
+        let (pattern, path) = if args.contains('\x00') {
+            let mut parts = args.splitn(2, '\x00');
+            let p = parts.next().unwrap_or("").to_string();
+            let d = parts.next().unwrap_or("").trim().to_string();
+            (p, d)
+        } else {
+            let parts = shell_split(args);
+            if parts.len() < 2 {
+                return Err(anyhow!("rg: usage: rg PATTERN PATH"));
+            }
+            (parts[0].clone(), parts[1].clone())
+        };
+
+        if pattern.is_empty() {
+            return Err(anyhow!("rg: empty pattern"));
         }
 
-        let pattern = &parts[0];
-        let path = &parts[1];
-
         // Ensure path exists (may be a symlink — follow it)
-        if !Path::new(path).exists() {
+        if !Path::new(&path).exists() {
             return Err(anyhow!("rg: path does not exist: {}", path));
         }
 
@@ -252,8 +267,13 @@ impl Tool for ReadfileTool {
         if args.is_empty() {
             return Err(anyhow!("readfile: empty file path"));
         }
-        let path = args.split_whitespace().next().unwrap_or("")
-            .trim_matches('"').trim_matches('\'');
+        // Handle both wire formats: null-separated and space-separated
+        let path = if args.contains('\x00') {
+            args.splitn(2, '\x00').next().unwrap_or("")
+        } else {
+            args.split_whitespace().next().unwrap_or("")
+        };
+        let path = path.trim_matches('"').trim_matches('\'');
         sandbox::check_read(path)?;
         Ok(())
     }
@@ -261,14 +281,26 @@ impl Tool for ReadfileTool {
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        // Parse: "path [start_line [end_line]]"
-        let mut parts = args.splitn(3, char::is_whitespace);
-        let raw_path = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'');
-        let start_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
-        let end_line: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+        // Two wire formats:
+        // 1. Legacy space-separated:  "path [start_line [end_line]]"
+        // 2. Null-separated:          "path\x00start_or_empty\x00end_or_empty\x00search_term"
+        let (raw_path, start_line, end_line, search_term) = if args.contains('\x00') {
+            let mut parts = args.splitn(4, '\x00');
+            let path  = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'').to_string();
+            let start: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            let end:   Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            let search = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            (path, start, end, search)
+        } else {
+            let mut parts = args.splitn(3, char::is_whitespace);
+            let path  = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'').to_string();
+            let start: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            let end:   Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            (path, start, end, None)
+        };
 
         // Use sandbox-resolved path (handles relative + tilde)
-        let resolved = sandbox::resolve(raw_path);
+        let resolved = sandbox::resolve(&raw_path);
         if !resolved.exists() {
             return Ok(format!("📄 {} does not exist yet", resolved.display()));
         }
@@ -276,6 +308,24 @@ impl Tool for ReadfileTool {
         let content = fs::read_to_string(&resolved)
             .map_err(|e| anyhow!("readfile: failed to read {}: {}", resolved.display(), e))?;
         let total_lines = content.lines().count();
+
+        // Search mode: filter to lines matching the term, include line numbers
+        if let Some(ref term) = search_term {
+            let lower_term = term.to_lowercase();
+            let matches: String = content.lines()
+                .enumerate()
+                .filter(|(_, l)| l.to_lowercase().contains(lower_term.as_str()))
+                .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
+                .collect();
+            let match_count = matches.lines().count();
+            if matches.is_empty() {
+                return Ok(format!("📄 {} ({} lines): no matches for {:?}", resolved.display(), total_lines, term));
+            }
+            return Ok(format!(
+                "📄 {} — {} match(es) for {:?} (of {} lines):\n{}",
+                resolved.display(), match_count, term, total_lines, matches
+            ));
+        }
 
         if let Some(start) = start_line {
             let start = start.max(1);
@@ -420,6 +470,86 @@ impl Tool for WritefileTool {
 
         let line_count = content.lines().count();
         Ok(format!("✅ wrote {} ({} lines)", path.display(), line_count))
+    }
+}
+
+// ===== Patchfile Tool (patchfile) — line-range replacement =====
+
+pub struct PatchfileTool;
+
+impl Tool for PatchfileTool {
+    fn name(&self) -> &str {
+        "patchfile"
+    }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        let path = args.split('\x00').next().unwrap_or("").trim();
+        if path.is_empty() {
+            return Err(anyhow!("patchfile: empty file path"));
+        }
+        sandbox::check_write(path)?;
+        Ok(())
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        self.validate_input(args)?;
+
+        let mut parts = args.splitn(4, '\x00');
+        let raw_path = parts.next().unwrap_or("").trim();
+        let start_line: usize = parts.next().unwrap_or("").trim().parse()
+            .map_err(|_| anyhow!("patchfile: start_line must be a positive integer"))?;
+        let end_line: usize = parts.next().unwrap_or("").trim().parse()
+            .map_err(|_| anyhow!("patchfile: end_line must be a positive integer"))?;
+        let new_text = parts.next().unwrap_or("");
+
+        if start_line == 0 {
+            return Err(anyhow!("patchfile: start_line is 1-based, got 0"));
+        }
+        if end_line < start_line {
+            return Err(anyhow!("patchfile: end_line ({}) < start_line ({})", end_line, start_line));
+        }
+
+        let path = sandbox::resolve(raw_path);
+        if !path.exists() {
+            return Err(anyhow!("patchfile: {} does not exist (use writefile to create)", path.display()));
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| anyhow!("patchfile: failed to read {}: {}", path.display(), e))?;
+
+        let mut lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+
+        if start_line > total + 1 {
+            return Err(anyhow!("patchfile: start_line {} exceeds file length {} in {}", start_line, total, path.display()));
+        }
+
+        let end_clamped = end_line.min(total);
+        let old_count = end_clamped.saturating_sub(start_line - 1);
+
+        // Build replacement: split new_text into lines
+        let replacement: Vec<&str> = new_text.lines().collect();
+        let new_count = replacement.len();
+
+        // Splice: remove [start_line-1 .. end_clamped], insert replacement
+        let tail: Vec<&str> = lines.drain(start_line - 1..).collect();
+        let kept_tail = &tail[old_count.min(tail.len())..];
+        lines.extend_from_slice(&replacement);
+        lines.extend_from_slice(kept_tail);
+
+        // Preserve trailing newline if original had one
+        let mut out = lines.join("\n");
+        if content.ends_with('\n') {
+            out.push('\n');
+        }
+
+        fs::write(&path, &out)
+            .map_err(|e| anyhow!("patchfile: failed to write {}: {}", path.display(), e))?;
+
+        Ok(format!(
+            "✅ patched {} (lines {}-{} → {} lines)",
+            path.display(), start_line, end_clamped, new_count
+        ))
     }
 }
 
@@ -672,6 +802,7 @@ impl ToolRegistry {
         tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
         tools.insert("editfile".to_string(), Box::new(EditfileTool) as Box<dyn Tool>);
         tools.insert("writefile".to_string(), Box::new(WritefileTool) as Box<dyn Tool>);
+        tools.insert("patchfile".to_string(), Box::new(PatchfileTool) as Box<dyn Tool>);
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
         tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
@@ -709,10 +840,14 @@ mod tests {
     fn test_ripgrep_validation() {
         let tool = RipgrepTool;
 
-        // Valid inputs — plain patterns
+        // Valid inputs — plain patterns (legacy space-separated)
         assert!(tool.validate_input(r#""pattern" "/path""#).is_ok());
         assert!(tool.validate_input("python .").is_ok());
         assert!(tool.validate_input("bash_script test/").is_ok());
+
+        // Null-separated format (new canonical format from json_params_to_args)
+        assert!(tool.validate_input("pub enum.*Item\x00src/").is_ok());
+        assert!(tool.validate_input("hello world\x00.").is_ok());
 
         // Shell metacharacters are fine: rg runs via Command::new, not a shell
         assert!(tool.validate_input("pattern | other").is_ok());
@@ -722,6 +857,16 @@ mod tests {
 
         // Only truly empty input is rejected
         assert!(tool.validate_input("").is_err());
+    }
+
+    #[test]
+    fn test_ripgrep_multiword_pattern_null_separated() {
+        // The old wire format `pub enum.*Item src/` splits on space → wrong.
+        // The new format `pub enum.*Item\x00src/` keeps pattern intact.
+        let tool = RipgrepTool;
+        // validate_input should parse path correctly from null-separated format
+        let result = tool.validate_input("pub enum.*Item\x00.");
+        assert!(result.is_ok(), "null-separated multi-word pattern must be valid: {:?}", result);
     }
 
     #[test]
@@ -846,6 +991,14 @@ mod tests {
     }
 
     #[test]
+    fn test_readfile_search_wire_format() {
+        // Null-separated format: path\x00\x00\x00search_term
+        // Verify validate_input accepts it (path component extracted correctly)
+        let tool = ReadfileTool;
+        assert!(tool.validate_input("Cargo.toml\x00\x00\x00edition").is_ok());
+    }
+
+    #[test]
     fn test_commit_validation() {
         let tool = CommitTool;
         
@@ -892,8 +1045,9 @@ mod tests {
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
+        assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"think"));
-        assert_eq!(tools.len(), 9); // rg spawn readfile editfile writefile commit python ruste think
+        assert_eq!(tools.len(), 10); // rg spawn readfile editfile writefile patchfile commit python ruste think
     }
 
     #[test]
@@ -1025,5 +1179,73 @@ mod tests {
         assert!(tool.validate_input("no-separator-here").is_err());
         // Valid format passes (sandbox containment is tested in sandbox::tests)
         assert!(tool.validate_input("valid/path.rs\x00old\x00new").is_ok());
+    }
+
+    // ===== Patchfile tests =====
+
+    #[test]
+    fn test_patchfile_roundtrip() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_patchfile.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
+
+        let tool = PatchfileTool;
+        // Replace lines 2-3 with two new lines
+        let args = format!("{}\x002\x003\x00NEW2\nNEW3", path_str);
+        let result = tool.execute(&args).expect("patchfile should succeed");
+        assert!(result.contains("✅"), "result: {}", result);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nNEW2\nNEW3\nline4\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_shrink() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_patchfile_shrink.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "a\nb\nc\nd\n").unwrap();
+
+        let tool = PatchfileTool;
+        // Replace lines 2-3 with a single line
+        let args = format!("{}\x002\x003\x00ONLY", path_str);
+        let result = tool.execute(&args).expect("patchfile shrink should succeed");
+        assert!(result.contains("✅"), "result: {}", result);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "a\nONLY\nd\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_out_of_bounds() {
+        use std::env;
+        let path = env::temp_dir().join("yggdra_test_patchfile_oob.txt");
+        let path_str = path.to_str().unwrap();
+        fs::write(&path, "only one line\n").unwrap();
+
+        let tool = PatchfileTool;
+        let args = format!("{}\x0099\x00100\x00replacement", path_str);
+        let err = tool.execute(&args).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "error: {}", err);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_end_less_than_start() {
+        let tool = PatchfileTool;
+        let args = "some/file.txt\x005\x003\x00content";
+        let err = tool.execute(args).unwrap_err().to_string();
+        assert!(err.contains("end_line") || err.contains("start_line"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_tool_registry_includes_patchfile() {
+        let registry = ToolRegistry::new();
+        let tools = registry.list_tools();
+        assert!(tools.contains(&"patchfile"), "patchfile should be registered");
+        assert_eq!(tools.len(), 10); // rg spawn readfile editfile writefile patchfile commit python ruste think
     }
 }

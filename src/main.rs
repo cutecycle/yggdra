@@ -1,6 +1,7 @@
 mod battery;
 mod config;
 mod dlog;
+mod epoch;
 mod gaps;
 mod highlight;
 mod knowledge_index;
@@ -10,6 +11,7 @@ mod notifications;
 mod ollama;
 mod sandbox;
 mod session;
+mod stats;
 mod steering;
 mod theme;
 mod tools;

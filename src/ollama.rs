@@ -55,6 +55,11 @@ struct OllamaOptions {
     num_predict: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<u32>,
+    /// Pin the first N tokens in the KV cache (Ollama prefix caching).
+    /// Set to the estimated token length of the static system prompt so
+    /// Ollama reuses the cached prefix across turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_keep: Option<i32>,
 }
 
 impl OllamaOptions {
@@ -69,7 +74,13 @@ impl OllamaOptions {
             repeat_penalty: p.repeat_penalty,
             num_predict: p.num_predict,
             num_ctx: p.num_ctx,
+            num_keep: None,
         })
+    }
+
+    fn with_num_keep(mut self, n: i32) -> Self {
+        self.num_keep = Some(n);
+        self
     }
 }
 
@@ -117,6 +128,8 @@ pub enum StreamEvent {
         had_thinking: bool,
         /// Time spent generating tokens (nanoseconds), for tok/s computation
         eval_duration_ns: Option<u64>,
+        /// Whether the sliding-window context trim fired for this request
+        context_trimmed: bool,
     },
     Error(String),
 }
@@ -211,14 +224,18 @@ impl OllamaClient {
     /// `context_window`: if Some(n), apply a sliding window budget of 80% of n
     /// tokens (estimated as chars/4), dropping oldest full turns first while
     /// always keeping the system prompt and the first user message.
+    ///
+    /// Returns `(messages, steering_token_estimate)`.
     fn build_messages(
         messages: &[Message],
         steering: Option<&str>,
         tool_output_cap: Option<usize>,
         context_window: Option<u32>,
-    ) -> Vec<OllamaMessage> {
+    ) -> (Vec<OllamaMessage>, usize, bool) {
         let mut ollama_messages = Vec::new();
 
+        // --- System prompt (pinned prefix for KV-cache) ---
+        let steering_chars = steering.map(|s| s.len()).unwrap_or(0);
         if let Some(steer) = steering {
             ollama_messages.push(OllamaMessage {
                 role: "system".to_string(),
@@ -228,11 +245,18 @@ impl OllamaClient {
 
         let cap = tool_output_cap.unwrap_or(3000);
 
+        // How many recent assistant turns to keep verbatim (older ones get trimmed).
+        const KEEP_RECENT_ASSISTANT: usize = 6;
+
+        // --- First pass: collect all messages with role mapping + cap ---
+        let mut raw: Vec<OllamaMessage> = Vec::new();
         for msg in messages {
             // Skip UI-only roles — not forwarded to the model.
             if msg.role == "system" || msg.role == "clock" { continue; }
+            // Strip `think` scratchpad results — the model doesn't need to re-read its own reasoning.
+            if msg.role == "tool" && msg.content.contains("[TOOL_OUTPUT: think =") { continue; }
+
             // "notice" is a system-level notice from the app (context warnings, gap reflections, etc.)
-            // Forward as an inline "system" role so the model treats it as an instruction, not user input.
             let role = if msg.role == "notice" {
                 "system"
             } else if msg.role == "tool" || msg.role == "kick" {
@@ -245,39 +269,106 @@ impl OllamaClient {
             let content = if msg.content.contains("[TOOL_OUTPUT:") && msg.content.len() > cap {
                 let safe_cap = floor_char_boundary(&msg.content, cap);
                 let truncated = &msg.content[..safe_cap];
-                // Find a clean line boundary to avoid cutting mid-line
                 let cut = truncated.rfind('\n').unwrap_or(safe_cap);
                 format!("{}\n[...{} chars truncated]", &msg.content[..cut], msg.content.len() - cut)
             } else {
                 msg.content.clone()
             };
 
-            ollama_messages.push(OllamaMessage {
+            raw.push(OllamaMessage {
                 role: role.to_string(),
                 content,
             });
         }
 
+        // --- Tool output deduplication ---
+        // Walk newest→oldest. For each [TOOL_OUTPUT: name path_or_args = ...] message,
+        // record the first-seen key and replace earlier duplicates with a stub.
+        {
+            use std::collections::HashSet;
+            let mut seen_keys: HashSet<String> = HashSet::new();
+            for msg in raw.iter_mut().rev() {
+                if !msg.content.contains("[TOOL_OUTPUT:") { continue; }
+                // Extract the key: everything from "[TOOL_OUTPUT:" up to (but not including) the value after "="
+                if let Some(start) = msg.content.find("[TOOL_OUTPUT:") {
+                    let fragment = &msg.content[start..];
+                    // Key = "TOOL_OUTPUT: name first_arg" (stop before the actual value)
+                    let key: String = fragment
+                        .splitn(2, '=')
+                        .next()
+                        .unwrap_or(fragment)
+                        .trim()
+                        .to_string();
+                    if seen_keys.contains(&key) {
+                        msg.content = format!("{} (superseded by later call)]", key);
+                    } else {
+                        seen_keys.insert(key);
+                    }
+                }
+            }
+        }
+
+        // --- Rolling assistant trim ---
+        // Count assistant messages from newest to oldest; keep KEEP_RECENT verbatim.
+        // Pure tool-call messages (content starts with '{') are dropped entirely when
+        // outside the keep window — they carry no natural-language value and the
+        // tool results already provide the context.
+        {
+            let total_assistant = raw.iter().filter(|m| m.role == "assistant").count();
+            let trim_threshold = total_assistant.saturating_sub(KEEP_RECENT_ASSISTANT);
+
+            let mut seen_assistant = 0usize;
+            for msg in raw.iter_mut() {
+                if msg.role != "assistant" { continue; }
+                if seen_assistant < trim_threshold {
+                    let trimmed = msg.content.trim();
+                    // Pure tool-call JSON → drop entirely (signal with empty string; filtered below)
+                    if trimmed.starts_with('{') || trimmed.starts_with("[{") {
+                        msg.content = String::new();
+                    } else {
+                        // Prose response → keep a short preview
+                        let preview: String = msg.content.chars().take(120).collect();
+                        let had_more = msg.content.chars().count() > 120;
+                        msg.content = if had_more {
+                            format!("[assistant: {}…]", preview)
+                        } else {
+                            format!("[assistant: {}]", preview)
+                        };
+                    }
+                }
+                seen_assistant += 1;
+            }
+            // Remove messages blanked out above
+            raw.retain(|m| !m.content.is_empty());
+            if trim_threshold > 0 {
+                dlog!("build_messages: trimmed {} old assistant turns (kept {} verbatim)",
+                    trim_threshold, total_assistant - trim_threshold);
+            }
+        }
+
+        ollama_messages.extend(raw);
+
         // Sliding window: if we have a context window budget, drop oldest turns
         // until the estimated token count fits in 80% of the window.
+        let mut context_trimmed = false;
         if let Some(window) = context_window {
             let budget_chars = (window as usize * 4 * 8) / 10; // 80% of window, chars = tokens*4
             let total_chars: usize = ollama_messages.iter().map(|m| m.content.len()).sum();
             if total_chars > budget_chars {
                 let before = ollama_messages.len();
                 // Always keep index 0 (system prompt if present, else first user message).
-                // Find the first user message index so we can preserve the task framing.
                 let first_user_idx = ollama_messages.iter().position(|m| m.role == "user");
                 let keep_until = first_user_idx.map(|i| i + 1).unwrap_or(1);
 
-                // Drop turns from position `keep_until` onward until we fit
                 while ollama_messages.len() > keep_until + 1 {
                     let chars: usize = ollama_messages.iter().map(|m| m.content.len()).sum();
                     if chars <= budget_chars { break; }
-                    // Drop a pair (assistant + following user/tool-result) or single message
                     ollama_messages.remove(keep_until);
                 }
                 let after = ollama_messages.len();
+                if after < before {
+                    context_trimmed = true;
+                }
                 dlog!("build_messages: sliding-window dropped {} msgs — total_chars={} budget={} window={}",
                     before - after, total_chars, budget_chars, window);
             }
@@ -286,7 +377,7 @@ impl OllamaClient {
         let total_est_tokens: usize = ollama_messages.iter().map(|m| m.content.len() / 4).sum();
         dlog!("build_messages: out={} msgs est_tokens={}", ollama_messages.len(), total_est_tokens);
 
-        ollama_messages
+        (ollama_messages, steering_chars, context_trimmed)
     }
 
     /// Start a streaming generation. Returns a receiver that yields tokens as they arrive.
@@ -300,18 +391,29 @@ impl OllamaClient {
     ) -> mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let ollama_messages = Self::build_messages(&messages, steering, tool_output_cap, context_window);
-        dlog!("generate_streaming: model={} num_ctx={:?} in_msgs={} out_msgs={} est_tokens={}",
+        let (ollama_messages, steering_chars, context_trimmed) = Self::build_messages(&messages, steering, tool_output_cap, context_window);
+        dlog!("generate_streaming: model={} num_ctx={:?} in_msgs={} out_msgs={} est_tokens={} ctx_trimmed={}",
             self.model,
             params.num_ctx,
             messages.len(),
             ollama_messages.len(),
-            ollama_messages.iter().map(|m| m.content.len() / 4).sum::<usize>());
+            ollama_messages.iter().map(|m| m.content.len() / 4).sum::<usize>(),
+            context_trimmed);
+
+        // Apply prefix caching: pin the steering prefix in Ollama's KV cache.
+        let options = if steering_chars > 0 {
+            let steering_tokens = (steering_chars / 4).max(1) as i32;
+            let base = OllamaOptions::from_params(&params).unwrap_or_default();
+            Some(base.with_num_keep(steering_tokens))
+        } else {
+            OllamaOptions::from_params(&params)
+        };
+
         let request = GenerateRequest {
             model: self.model.clone(),
             messages: ollama_messages,
             stream: true,
-            options: OllamaOptions::from_params(&params),
+            options,
         };
         let url = format!("{}/api/chat", self.endpoint);
         let client = self.client.clone();
@@ -375,6 +477,7 @@ impl OllamaClient {
                                             gen_tokens,
                                             had_thinking,
                                             eval_duration_ns: chunk.eval_duration,
+                                            context_trimmed,
                                         });
                                         return;
                                     }
@@ -398,6 +501,7 @@ impl OllamaClient {
                 gen_tokens: 0,
                 had_thinking,
                 eval_duration_ns: None,
+                context_trimmed,
             });
         });
 
@@ -470,6 +574,7 @@ impl OllamaClient {
                                             gen_tokens: g,
                                             had_thinking,
                                             eval_duration_ns: chunk.eval_duration,
+                                            context_trimmed: false,
                                         });
                                         return;
                                     }
@@ -489,6 +594,7 @@ impl OllamaClient {
                 gen_tokens: 0,
                 had_thinking,
                 eval_duration_ns: None,
+                context_trimmed: false,
             });
         });
 
@@ -504,13 +610,21 @@ impl OllamaClient {
         tool_output_cap: Option<usize>,
         context_window: Option<u32>,
     ) -> Result<String> {
-        let ollama_messages = Self::build_messages(&messages, steering, tool_output_cap, context_window);
+        let (ollama_messages, steering_chars, _context_trimmed) = Self::build_messages(&messages, steering, tool_output_cap, context_window);
+
+        let options = if steering_chars > 0 {
+            let steering_tokens = (steering_chars / 4).max(1) as i32;
+            let base = OllamaOptions::from_params(params).unwrap_or_default();
+            Some(base.with_num_keep(steering_tokens))
+        } else {
+            OllamaOptions::from_params(params)
+        };
 
         let request = GenerateRequest {
             model: self.model.clone(),
             messages: ollama_messages,
             stream: false,
-            options: OllamaOptions::from_params(params),
+            options,
         };
 
         let url = format!("{}/api/chat", self.endpoint);
@@ -699,19 +813,21 @@ mod tests {
     #[test]
     fn test_build_messages_with_steering() {
         let msgs = vec![Message::new("user", "hi")];
-        let result = OllamaClient::build_messages(&msgs, Some("[STEERING: be nice]"), None, None);
+        let (result, steering_chars, _) = OllamaClient::build_messages(&msgs, Some("[STEERING: be nice]"), None, None);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].role, "system");
         assert!(result[0].content.contains("be nice"));
         assert_eq!(result[1].role, "user");
+        assert!(steering_chars > 0);
     }
 
     #[test]
     fn test_build_messages_no_steering() {
         let msgs = vec![Message::new("user", "hi")];
-        let result = OllamaClient::build_messages(&msgs, None, None, None);
+        let (result, steering_chars, _) = OllamaClient::build_messages(&msgs, None, None, None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
+        assert_eq!(steering_chars, 0);
     }
 
     #[test]
@@ -721,7 +837,7 @@ mod tests {
             Message::new("assistant", r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "main", "directory": "."}}]}"#),
             Message::new("tool", "[TOOL_OUTPUT: rg = found matches]"),
         ];
-        let result = OllamaClient::build_messages(&msgs, None, None, None);
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, None);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].role, "user");
         assert_eq!(result[1].role, "assistant");
@@ -738,7 +854,7 @@ mod tests {
             Message::new("assistant", r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "x", "directory": "."}}]}"#),
             Message::new("tool", big_output),
         ];
-        let result = OllamaClient::build_messages(&msgs, None, Some(3000), None);
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, Some(3000), None);
         // The tool output message should be truncated
         let tool_msg = &result[2];
         assert!(tool_msg.content.len() < 5000 + 50);
@@ -751,7 +867,7 @@ mod tests {
         let msgs = vec![
             Message::new("tool", "[TOOL_OUTPUT: rg = found 3 lines]"),
         ];
-        let result = OllamaClient::build_messages(&msgs, None, Some(3000), None);
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, Some(3000), None);
         assert_eq!(result[0].content, "[TOOL_OUTPUT: rg = found 3 lines]");
     }
 
@@ -767,11 +883,91 @@ mod tests {
             Message::new("user", big_content.clone()),
         ];
         // context_window=100 → budget = 100*4*80% = 320 chars
-        let result = OllamaClient::build_messages(&msgs, None, None, Some(100));
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, Some(100));
         // Some old turns should have been dropped
         assert!(result.len() < msgs.len());
         // First user message must always be preserved
         assert_eq!(result[0].content, "first user message");
+    }
+
+    #[test]
+    fn test_build_messages_strips_think_output() {
+        let msgs = vec![
+            Message::new("user", "plan something"),
+            Message::new("assistant", "let me think"),
+            Message::new("tool", "[TOOL_OUTPUT: think = I should do X then Y]"),
+            Message::new("assistant", "ok I'll do X"),
+        ];
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, None);
+        // think output must not appear in the sent messages
+        for msg in &result {
+            assert!(!msg.content.contains("[TOOL_OUTPUT: think ="),
+                "think output must be stripped from context: {}", msg.content);
+        }
+        assert_eq!(result.len(), 3); // user + 2 assistant, no think
+    }
+
+    #[test]
+    fn test_build_messages_deduplicates_tool_outputs() {
+        // Same readfile call twice — only the latest should be verbatim
+        let msgs = vec![
+            Message::new("user", "help"),
+            Message::new("tool", "[TOOL_OUTPUT: readfile src/main.rs = first read]"),
+            Message::new("assistant", "let me check again"),
+            Message::new("tool", "[TOOL_OUTPUT: readfile src/main.rs = second read (updated)]"),
+        ];
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, None);
+        // Latest readfile should be intact
+        let has_second = result.iter().any(|m| m.content.contains("second read (updated)"));
+        assert!(has_second, "latest tool output must be preserved");
+        // First readfile should be stubbed out
+        let has_first_verbatim = result.iter().any(|m| m.content.contains("first read") && !m.content.contains("superseded"));
+        assert!(!has_first_verbatim, "earlier duplicate must be replaced with stub");
+    }
+
+    #[test]
+    fn test_build_messages_rolling_assistant_trim() {
+        // Generate 8 prose assistant turns — oldest 2 should be abbreviated
+        let mut msgs = vec![Message::new("user", "go")];
+        for i in 0..8 {
+            msgs.push(Message::new("assistant", &format!("step {} with lots of text here: {}", i, "x".repeat(200))));
+            msgs.push(Message::new("user", "continue"));
+        }
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, None);
+        // The oldest assistant messages (first 2) should be abbreviated
+        let first_assistant = result.iter().find(|m| m.role == "assistant").unwrap();
+        assert!(first_assistant.content.starts_with("[assistant:"),
+            "old assistant turns should be summarised: {}", first_assistant.content);
+        // The most recent assistant message should be verbatim
+        let last_assistant = result.iter().rfind(|m| m.role == "assistant").unwrap();
+        assert!(!last_assistant.content.starts_with("[assistant:"),
+            "recent assistant turns must be verbatim: {}", last_assistant.content);
+    }
+
+    #[test]
+    fn test_build_messages_trims_old_tool_call_json() {
+        // Pure JSON tool-call messages outside the keep window should be dropped entirely
+        let tool_call = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/a.rs"}}]}"#;
+        let mut msgs = vec![Message::new("user", "go")];
+        for _ in 0..8 {
+            msgs.push(Message::new("assistant", tool_call));
+            msgs.push(Message::new("user", "continue"));
+        }
+        let (result, _, _) = OllamaClient::build_messages(&msgs, None, None, None);
+        // Old tool-call-only assistant turns must be dropped (not summarised as [assistant: {…}])
+        let old_tool_call_visible = result.iter().any(|m| m.role == "assistant"
+            && m.content.contains("tool_calls")
+            && m.content.starts_with("[assistant:"));
+        assert!(!old_tool_call_visible,
+            "old JSON tool-call messages must be dropped not summarised");
+    }
+
+    #[test]
+    fn test_num_keep_in_options() {
+        // Verify num_keep is serialised correctly
+        let opts = OllamaOptions::default().with_num_keep(42);
+        let json = serde_json::to_string(&opts).unwrap();
+        assert!(json.contains("\"num_keep\":42"), "num_keep must appear in JSON: {json}");
     }
 
     #[test]

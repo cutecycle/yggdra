@@ -1,6 +1,7 @@
 pub mod battery;
 pub mod config;
 pub mod dlog;
+pub mod epoch;
 pub mod gaps;
 pub mod highlight;
 pub mod knowledge_index;
@@ -10,6 +11,7 @@ pub mod notifications;
 pub mod ollama;
 pub mod sandbox;
 pub mod session;
+pub mod stats;
 pub mod steering;
 pub mod theme;
 pub mod ui;

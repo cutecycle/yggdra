@@ -220,6 +220,41 @@ impl Highlighter {
 
         lines
     }
+
+    /// Highlight a single line (no prefix), returning a list of Spans.
+    /// Used by the file viewer for per-line rendering.
+    pub fn highlight_line(&self, line: &str, language: &str, dark: bool) -> Vec<Span<'static>> {
+        let profile = Self::profile_for(language);
+        let palette = if dark { Palette::dark() } else { Palette::light() };
+        let tokens = tokenize(line, profile);
+        tokens.into_iter()
+            .map(|(kind, text)| Span::styled(text, Style::default().fg(palette.color_for(kind))))
+            .collect()
+    }
+}
+
+/// Infer language from a file path extension (used by file viewer).
+pub fn lang_from_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" | "jsx" => "typescript",
+        "go" => "go",
+        "sh" | "bash" | "zsh" | "fish" => "bash",
+        "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" => "toml",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "java" => "java",
+        "kt" => "kotlin",
+        "swift" => "swift",
+        "zig" => "zig",
+        _ => "rust", // best default for unknown
+    }
 }
 
 /// Normalize code for display: expand tabs to 4 spaces and strip common leading whitespace.
@@ -259,21 +294,34 @@ fn tokenize(line: &str, profile: &LangProfile) -> Vec<(TokenKind, String)> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = line.chars().collect();
     let len = chars.len();
+    // Precompute byte offsets so we can safely index into `line` (a &str)
+    // using char positions without hitting non-char-boundary panics on
+    // multi-byte characters (e.g. box-drawing chars like ├, └, …).
+    let byte_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(len + 1);
+        let mut pos = 0;
+        for c in &chars {
+            offsets.push(pos);
+            pos += c.len_utf8();
+        }
+        offsets.push(pos); // sentinel: byte offset of one-past-end
+        offsets
+    };
     let mut i = 0;
 
     while i < len {
         // Line comments
         if !profile.comment_prefix.is_empty()
-            && line[i..].starts_with(profile.comment_prefix)
+            && line[byte_offsets[i]..].starts_with(profile.comment_prefix)
         {
-            tokens.push((TokenKind::Comment, line[i..].to_string()));
+            tokens.push((TokenKind::Comment, line[byte_offsets[i]..].to_string()));
             return tokens;
         }
 
         // Block comment start
         if let Some((start, _end)) = profile.block_comment {
-            if line[i..].starts_with(start) {
-                tokens.push((TokenKind::Comment, line[i..].to_string()));
+            if line[byte_offsets[i]..].starts_with(start) {
+                tokens.push((TokenKind::Comment, line[byte_offsets[i]..].to_string()));
                 return tokens;
             }
         }
