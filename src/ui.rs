@@ -1706,6 +1706,9 @@ impl App {
                 Style::default()
             };
 
+            // Blank line above message for visual separation
+            rendered.push(RenderedMsg { content: ratatui::text::Text::from("\n".to_string()), style: Style::default(), height: 1 });
+            
             rendered.push(RenderedMsg { content, style, height: height + 1 });
             // Spacer line inherits the message band color so there's no color gap
             rendered.push(RenderedMsg { content: ratatui::text::Text::from("\n".to_string()), style, height: 1 });
