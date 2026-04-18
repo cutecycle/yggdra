@@ -140,6 +140,10 @@ impl OllamaClient {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(1800))
+            // TCP keepalive: 1 hour to maintain connection to Ollama across idle periods
+            .tcp_keepalive(Duration::from_secs(3600))
+            // Connection pool idle timeout: 1 hour
+            .pool_idle_timeout(Duration::from_secs(3600))
             .build()?;
 
         let ollama_client = Self {
