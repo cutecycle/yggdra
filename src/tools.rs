@@ -173,6 +173,34 @@ impl Tool for SpawnTool {
         if args.is_empty() {
             return Err(anyhow!("spawn: empty arguments"));
         }
+        
+        // Detect shell-only patterns and provide recovery hints
+        if args.contains('>') || args.contains('<') || args.contains('|') || args.contains("&&") || args.contains("||") {
+            let pattern = if args.contains('>') {
+                "stdout redirect (>)"
+            } else if args.contains('<') {
+                "stdin redirect (<)"
+            } else if args.contains('|') {
+                "pipe (|)"
+            } else if args.contains("&&") {
+                "AND chain (&&)"
+            } else {
+                "OR chain (||)"
+            };
+            
+            return Err(anyhow!(
+                "❌ spawn: cannot handle {} — spawn executes directly without a shell.\n\
+                 These patterns require shell interpretation:\n\
+                 • Redirects: spawn \"cmd > file\" ✗ (spawn doesn't support)\n\
+                 • Pipes: spawn \"cmd1 | cmd2\" ✗ (spawn doesn't support)\n\
+                 • Chains: spawn \"cmd1 && cmd2\" ✗ (spawn doesn't support)\n\
+                 \n\
+                 To fix: Use the python tool for shell pipelines, or call spawn multiple times.\n\
+                 Example: python -c \"import subprocess; subprocess.run('cmd1 | cmd2', shell=True)\"",
+                pattern
+            ));
+        }
+        
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.is_empty() {
             return Err(anyhow!("spawn: no binary specified"));
@@ -184,17 +212,19 @@ impl Tool for SpawnTool {
             let recovery = if args.contains("-c") {
                 // They tried bash/sh -c 'command', suggest running directly
                 format!(
-                    "\nTo fix: run the command directly.\n\
+                    "\nTo fix: run the command directly (or use python for shell patterns).\n\
                      ✗ Wrong:  spawn \"bash -c 'git status'\"\n\
                      ✓ Right:  spawn \"git status\"\n\
-                     Pipes, redirects, and chains work directly: spawn \"git log | head -5\""
+                     \n\
+                     For pipes/redirects/chains, use python instead:\n\
+                     python -c \"import subprocess; subprocess.run('cmd1 | cmd2', shell=True)\""
                 )
             } else {
-                "All commands, pipes, redirects, and chains work directly in spawn without bash/sh.".to_string()
+                "Shell interpreter is blocked for security. Run commands directly with spawn.".to_string()
             };
             
             return Err(anyhow!(
-                "❌ spawn: shell interpreter '{}' is blocked — run commands directly instead.\n{}",
+                "❌ spawn: shell interpreter '{}' is blocked — use specific commands instead.\n{}",
                 binary, recovery
             ));
         }

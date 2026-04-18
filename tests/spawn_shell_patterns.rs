@@ -182,4 +182,54 @@ mod spawn_shell_patterns {
         let result = run_spawn("   ");
         assert!(result.is_err(), "Whitespace-only args should error");
     }
+
+    #[test]
+    fn test_spawn_blocked_stdout_redirect() {
+        // Stdout redirect (>) should be blocked with helpful error
+        let result = run_spawn("echo test > output.txt");
+        assert!(result.is_err(), "Stdout redirect should be blocked");
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("redirect") || error.to_lowercase().contains("shell"), 
+            "Error should mention shell patterns, got: {}", error);
+    }
+
+    #[test]
+    fn test_spawn_blocked_stderr_redirect() {
+        // Stderr redirect (2>) should be blocked with helpful error
+        let result = run_spawn("git status 2> errors.txt");
+        assert!(result.is_err(), "Stderr redirect should be blocked");
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("redirect") || error.to_lowercase().contains("shell"),
+            "Error should mention shell patterns");
+    }
+
+    #[test]
+    fn test_spawn_blocked_stdin_redirect() {
+        // Stdin redirect (<) should be blocked with helpful error
+        let result = run_spawn("cat < input.txt");
+        assert!(result.is_err(), "Stdin redirect should be blocked");
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("redirect") || error.to_lowercase().contains("shell"));
+    }
+
+    #[test]
+    fn test_spawn_blocked_pipe_pattern() {
+        // Pipe pattern should be blocked with helpful error
+        let result = run_spawn("cat file.txt | grep TODO");
+        assert!(result.is_err(), "Pipe should be blocked");
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("pipe") || error.to_lowercase().contains("shell"));
+    }
+
+    #[test]
+    fn test_spawn_error_suggests_python_for_redirects() {
+        // Error message should suggest python tool for shell patterns
+        let result = run_spawn("echo test > file.txt");
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        // Should mention using python as alternative
+        assert!(error.to_lowercase().contains("python") || error.to_lowercase().contains("shell"),
+            "Error should suggest using python tool");
+    }
 }
+
