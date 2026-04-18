@@ -897,6 +897,14 @@ impl App {
 
     /// Spawn tool execution off the UI thread
     fn execute_tool_async(&mut self, tool_name: String, args: String) {
+        // Announce action
+        let truncated_args = if args.len() > 100 { 
+            format!("{}...", &args[..100]) 
+        } else { 
+            args.clone() 
+        };
+        self.push_system_event(format!("🎯 EXECUTING: {} ({})", tool_name, truncated_args));
+        
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name.as_str() {
@@ -980,6 +988,14 @@ impl App {
 
     /// Spawn a subagent off the UI thread; result arrives via subagent_result_rx
     fn execute_subagent_async(&mut self, task_id: String, task_desc: String) {
+        // Announce action
+        let truncated_desc = if task_desc.len() > 100 { 
+            format!("{}...", &task_desc[..100]) 
+        } else { 
+            task_desc.clone() 
+        };
+        self.push_system_event(format!("🎯 SPAWNING SUBAGENT: {} | {}", task_id, truncated_desc));
+        
         let (tx, rx) = oneshot::channel();
         let endpoint = self.config.endpoint.clone();
         let model = self.config.model.clone();
@@ -1059,6 +1075,7 @@ impl App {
 
         // Kick next stream turn with the injected result
         if let Some(client) = self.ollama_client.clone() {
+            self.push_system_event("🎯 QUERYING LLM".to_string());
             let messages: Vec<Message> = self.message_buffer.messages().unwrap_or_default();
             let steering = self.steering_text();
             let (tool_cap, ctx_win) = self.compression_params();
@@ -3503,6 +3520,14 @@ impl App {
             self.run_autocompact();
         }
 
+        // Announce action
+        let msg_preview = if message.len() > 60 {
+            format!("{}...", &message[..60])
+        } else {
+            message.to_string()
+        };
+        self.push_system_event(format!("🎯 USER QUERY: {}", msg_preview));
+
         if self.ollama_client.is_none() {
             self.push_system_event("🦙 Ollama offline: message saved but not sent");
             self.notify("⚠️ Ollama offline — message queued locally");
@@ -3519,6 +3544,9 @@ impl App {
             .message_buffer
             .messages()
             .unwrap_or_default();
+
+        // Announce action before starting inference
+        self.push_system_event("🎯 QUERYING LLM".to_string());
 
         // Start streaming — returns immediately, tokens arrive via channel
         if let Some(client) = &self.ollama_client {

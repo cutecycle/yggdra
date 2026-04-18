@@ -630,6 +630,9 @@ impl Agent {
             // Execute tools — set_params is handled locally, others via registry
             let mut tool_results = String::new();
             for call in tool_calls {
+                // Announce action before execution
+                tool_results.push_str(&format!("[ACTION: executing {} with args: {}]\n", call.name, &call.args[..call.args.len().min(60)]));
+                
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
@@ -751,6 +754,9 @@ impl Agent {
             // Execute tools — set_params handled locally, others via registry
             let mut tool_results = String::new();
             for call in tool_calls {
+                // Announce action before execution
+                tool_results.push_str(&format!("[ACTION: executing {} with args: {}]\n", call.name, &call.args[..call.args.len().min(60)]));
+                
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
@@ -772,6 +778,9 @@ impl Agent {
 
             // Spawn subagents (in parallel, but we'll await them sequentially for simplicity)
             for (task_id, task_desc) in &spawn_calls {
+                // Announce subagent spawning
+                tool_results.push_str(&format!("[ACTION: spawning subagent '{}' for task: {}]\n", task_id, &task_desc[..task_desc.len().min(60)]));
+                
                 let mut child_config = self.config.clone();
                 child_config.current_depth += 1;
                 
