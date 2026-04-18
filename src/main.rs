@@ -13,6 +13,7 @@ mod sandbox;
 mod session;
 mod stats;
 mod steering;
+mod sysinfo;
 mod theme;
 mod tools;
 mod agent;

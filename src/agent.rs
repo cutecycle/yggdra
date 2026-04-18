@@ -5,6 +5,7 @@ use crate::tools::ToolRegistry;
 use crate::steering::SteeringDirective;
 use crate::ollama::{OllamaClient, OllamaMessage, StreamEvent};
 use crate::config::AppMode;
+use crate::sysinfo::SystemInfo;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
@@ -460,6 +461,11 @@ impl Agent {
         parse_tool_calls(output)
     }
 
+    /// Get current tool output truncation limit
+    fn get_tool_output_limit(&self) -> usize {
+        self.current_params.tool_output_cap.unwrap_or(4000)
+    }
+
     /// Execute a tool and return result, respecting ask-mode restrictions
     fn execute_tool(&self, call: &ToolCall) -> Result<String> {
         if self.config.app_mode == AppMode::Ask {
@@ -488,8 +494,15 @@ impl Agent {
             .map(|p| format!("PROJECT ROOT: {}", p.display()))
             .unwrap_or_else(|| "PROJECT ROOT: (current directory)".to_string());
 
+        // Collect and format system metadata
+        let sysinfo = SystemInfo::collect()
+            .map(|s| s.format_for_agent())
+            .unwrap_or_else(|_| "SYSTEM INFO: (unavailable)".to_string());
+
         let prompt = format!(
             "You are an agentic assistant with access to tools and subagent spawning.\n\
+             \n\
+             {sysinfo}\n\
              \n\
              {root}\n\
              All files you create or edit MUST be inside this directory.\n\
@@ -503,12 +516,14 @@ impl Agent {
              STRATEGY: Search .yggdra/knowledge/ with rg first, then readfile the best matches.\n\
              \n\
              IMPORTANT NOTES:\n\
-             - Tool output is capped at 3000 chars by default; full output stored in session.\n\
+             - Tool output is capped at 4000 chars by default; you can adjust with: set_params tool_output_cap=5000\n\
+             - Full output is always stored in session even if truncated in context.\n\
              - After calling a tool, include the result in your next response and continue reasoning.\n\
              - Subagents run in parallel; wait for all results before combining for final output.\n\
              - COMMIT RULE: after every writefile/patchfile/editfile, immediately call commit with a\n\
                message explaining what changed and why. One commit per logical change.\n\
              - When task is fully complete, respond with summary of results — no special marker needed.",
+            sysinfo = sysinfo,
             root  = root_line,
             tools = json_tool_descriptions()
         );
@@ -623,9 +638,11 @@ impl Agent {
                         Err(e) => format!("[ERROR]: {}", e),
                     }
                 };
-                // Cap to 4000 chars to prevent unbounded history growth
-                let result = if result.chars().count() > 4000 {
-                    format!("{}...(truncated)", result.chars().take(4000).collect::<String>())
+                // Apply configured truncation limit to prevent unbounded context growth
+                let limit = self.get_tool_output_limit();
+                let result = if result.chars().count() > limit {
+                    let truncated: String = result.chars().take(limit).collect();
+                    format!("{}...(output truncated: full output in session)", truncated)
                 } else {
                     result
                 };
@@ -742,9 +759,11 @@ impl Agent {
                         Err(e) => format!("[ERROR]: {}", e),
                     }
                 };
-                // Cap to 4000 chars to prevent unbounded history growth
-                let result = if result.chars().count() > 4000 {
-                    format!("{}...(truncated)", result.chars().take(4000).collect::<String>())
+                // Apply configured truncation limit to prevent unbounded context growth
+                let limit = self.get_tool_output_limit();
+                let result = if result.chars().count() > limit {
+                    let truncated: String = result.chars().take(limit).collect();
+                    format!("{}...(output truncated: full output in session)", truncated)
                 } else {
                     result
                 };

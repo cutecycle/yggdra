@@ -134,6 +134,10 @@ pub struct ModelParams {
     /// Context window size forwarded to Ollama as num_ctx
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+    /// Max chars per tool output injected into context (None = 4000).
+    /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output_cap: Option<usize>,
 }
 
 impl ModelParams {
@@ -145,6 +149,7 @@ impl ModelParams {
             && self.repeat_penalty.is_none()
             && self.num_predict.is_none()
             && self.num_ctx.is_none()
+            && self.tool_output_cap.is_none()
     }
 
     /// Merge: self wins for any field set; base fills the rest.
@@ -156,6 +161,7 @@ impl ModelParams {
             repeat_penalty: self.repeat_penalty.or(base.repeat_penalty),
             num_predict: self.num_predict.or(base.num_predict),
             num_ctx: self.num_ctx.or(base.num_ctx),
+            tool_output_cap: self.tool_output_cap.or(base.tool_output_cap),
         }
     }
 
@@ -207,7 +213,16 @@ impl ModelParams {
                 self.num_predict = Some(v);
                 Ok(format!("num_predict = {}", v))
             }
-            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, reset", other)),
+            "tool_output_cap" => {
+                let v: usize = value.trim().parse()
+                    .map_err(|_| format!("tool_output_cap: expected unsigned int, got '{}'", value))?;
+                if v < 100 {
+                    return Err(format!("tool_output_cap must be >= 100 chars, got {}", v));
+                }
+                self.tool_output_cap = Some(v);
+                Ok(format!("tool_output_cap = {} chars", v))
+            }
+            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, reset", other)),
         }
     }
 
@@ -239,6 +254,7 @@ impl ModelParams {
         if let Some(v) = self.repeat_penalty { parts.push(format!("repeat_penalty={}", v)); }
         if let Some(v) = self.num_predict  { parts.push(format!("num_predict={}", v)); }
         if let Some(v) = self.num_ctx      { parts.push(format!("num_ctx={}", v)); }
+        if let Some(v) = self.tool_output_cap { parts.push(format!("tool_output_cap={}", v)); }
         if parts.is_empty() { "defaults".to_string() } else { parts.join(" ") }
     }
 }

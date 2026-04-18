@@ -13,6 +13,7 @@ pub mod sandbox;
 pub mod session;
 pub mod stats;
 pub mod steering;
+pub mod sysinfo;
 pub mod theme;
 pub mod ui;
 pub mod tools;
