@@ -1150,7 +1150,6 @@ impl App {
                         }
                     }
                     self.last_stream_token_time = Some(std::time::Instant::now());
-                    self.render_cache_dirty = true;  // Force re-render for live streaming
                     if !self.user_scrolled {
                         self.scroll_offset = 0;
                     }
@@ -1158,7 +1157,6 @@ impl App {
                 Ok(StreamEvent::ThinkToken(chunk)) => {
                     self.thinking_text.push_str(&chunk);
                     self.last_stream_token_time = Some(std::time::Instant::now());
-                    self.render_cache_dirty = true;  // Force re-render to show thinking growth
                     if !self.user_scrolled { self.scroll_offset = 0; }
                 }
                 Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns, context_trimmed, msgs_dropped }) => {
@@ -1462,6 +1460,17 @@ impl App {
                 self.stream_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
+                return;
+            }
+            // Ask-mode: [DONE] signals completion of autonomous tool execution — stop looping.
+            if self.mode == AppMode::Ask {
+                self.streaming_text.clear();
+                self.thinking_text.clear();
+                self.in_think_block = false;
+                self.stream_rx = None;
+                self.turn_phase = TurnPhase::Idle;
+                self.tool_iteration_count = 0;
+                self.push_agent_notice("✅ Agent completed autonomous exploration ([DONE] received)");
                 return;
             }
         }
@@ -1878,7 +1887,7 @@ impl App {
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name.as_str() {
-                "setfile" | "commit" | "python" | "ruste" => {
+                "setfile" | "patchfile" | "commit" | "python" | "ruste" => {
                     self.push_agent_notice(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     self.turn_phase = TurnPhase::Idle;
                     return;
@@ -4611,7 +4620,7 @@ impl App {
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name {
-                "setfile" | "commit" | "python" | "ruste" => {
+                "setfile" | "patchfile" | "commit" | "python" | "ruste" => {
                     self.notify(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     return;
                 }
