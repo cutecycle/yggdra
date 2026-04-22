@@ -648,7 +648,11 @@ impl Tool for SetfileTool {
             .map_err(|e| anyhow!("setfile: failed to write {}: {}", path.display(), e))?;
 
         let line_count = content.lines().count();
-        let write_summary = format!("✅ wrote {} ({} lines)", path.display(), line_count);
+        let display_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| path.clone());
+        let write_summary = format!("✅ wrote {} ({} lines)", display_path.display(), line_count);
 
         // Auto-commit: stage and commit the file. Capture diff before commit.
         let (commit_note, diff_output) = match self.git_add_and_commit(&path) {
