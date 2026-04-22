@@ -666,8 +666,22 @@ impl OllamaClient {
                 Ok(data.data.into_iter().map(|m| ModelInfo { name: m.id, modified_at: None, size: None }).collect())
             }
             Backend::LlamaCpp { endpoint } => {
-                // llama.cpp doesn't expose a models list endpoint, return placeholder
-                Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }])
+                // Try the OpenAI-compatible /v1/models endpoint; fall back to placeholder
+                let base = endpoint.trim_end_matches('/');
+                let url = format!("{}/v1/models", base);
+                match self.http_client.get(&url).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        #[derive(Deserialize)] struct LCModelsResp { data: Vec<LCModelEntry> }
+                        #[derive(Deserialize)] struct LCModelEntry { id: String }
+                        match response.json::<LCModelsResp>().await {
+                            Ok(data) => Ok(data.data.into_iter()
+                                .map(|m| ModelInfo { name: m.id, modified_at: None, size: None })
+                                .collect()),
+                            Err(_) => Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }]),
+                        }
+                    }
+                    _ => Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }]),
+                }
             }
         }
     }
