@@ -1,5 +1,6 @@
 //! Ollama client: interface to Ollama API for model inference.
 //! Handles model discovery and streaming message generation with steering directives.
+//! Supports both Ollama NDJSON protocol and OpenAI-compatible SSE protocol.
 
 use crate::dlog;
 use crate::message::Message;
@@ -9,12 +10,50 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Ollama client for communicating with Ollama API
+/// Detect API format from endpoint URL.
+/// Public so config.rs / ui.rs can use it for display hints.
+pub fn detect_api_format(endpoint: &str) -> ApiFormat {
+    let lower = endpoint.to_lowercase();
+    if lower.contains("openai.com")
+        || lower.contains("openrouter.ai")
+        || lower.contains("groq.com")
+        || lower.contains("together.ai")
+        || lower.contains("api.mistral.ai")
+        || lower.contains("/v1")
+    {
+        ApiFormat::OpenAI
+    } else {
+        ApiFormat::Ollama
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ApiFormat { Ollama, OpenAI }
+
+#[derive(Clone)]
+enum Backend {
+    Ollama { endpoint: String },
+    OpenAI { endpoint: String, api_key: String },
+}
+
+impl Backend {
+    fn endpoint(&self) -> &str {
+        match self { Backend::Ollama { endpoint } | Backend::OpenAI { endpoint, .. } => endpoint }
+    }
+    fn api_key(&self) -> Option<&str> {
+        match self { Backend::OpenAI { api_key, .. } => Some(api_key), _ => None }
+    }
+    fn format(&self) -> ApiFormat {
+        match self { Backend::Ollama { .. } => ApiFormat::Ollama, Backend::OpenAI { .. } => ApiFormat::OpenAI }
+    }
+}
+
+/// Ollama client for communicating with Ollama or OpenAI-compatible API
 #[derive(Clone)]
 pub struct OllamaClient {
-    endpoint: String,
+    backend: Backend,
+    http_client: reqwest::Client,
     model: String,
-    client: reqwest::Client,
     /// Native context length reported by /api/show for the current model.
     /// None until fetch_native_ctx() is called.
     native_ctx: Arc<Mutex<Option<u32>>>,
@@ -149,44 +188,249 @@ pub enum StreamEvent {
     Error(String),
 }
 
+// ---- OpenAI API structs ----
+
+#[derive(Debug, Serialize)]
+struct OAIRequest {
+    model: String,
+    messages: Vec<OllamaMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OAIStreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct OAIStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIStreamChunk {
+    choices: Vec<OAIStreamChoice>,
+    #[serde(default)]
+    usage: Option<OAIUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIStreamChoice {
+    delta: OAIStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OAIStreamDelta {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    reasoning_content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAINonStreamResponse {
+    choices: Vec<OAINonStreamChoice>,
+    #[serde(default)]
+    usage: Option<OAIUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAINonStreamChoice {
+    message: OAINonStreamMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAINonStreamMessage {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+fn build_openai_request(model: &str, messages: Vec<OllamaMessage>, params: &crate::config::ModelParams) -> OAIRequest {
+    OAIRequest {
+        model: model.to_string(),
+        messages,
+        stream: true,
+        temperature: params.temperature,
+        max_tokens: params.num_predict,
+        top_p: params.top_p,
+        stream_options: Some(OAIStreamOptions { include_usage: true }),
+    }
+}
+
+async fn stream_openai(
+    client: reqwest::Client,
+    url: String,
+    api_key: String,
+    mut request: OAIRequest,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    context_trimmed: bool,
+    msgs_dropped: usize,
+) {
+    request.stream = true;
+    let response = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
+            return;
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let _ = tx.send(StreamEvent::Error(format!("OpenAI error {}: {}", status, body)));
+        return;
+    }
+
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut had_thinking = false;
+    let mut prompt_tokens = 0u32;
+    let mut gen_tokens = 0u32;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(bytes) => {
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    if line.is_empty() || line.starts_with(':') { continue; }
+
+                    let data = if let Some(rest) = line.strip_prefix("data: ") {
+                        rest
+                    } else {
+                        continue;
+                    };
+
+                    if data == "[DONE]" {
+                        let _ = tx.send(StreamEvent::Done {
+                            prompt_tokens,
+                            gen_tokens,
+                            had_thinking,
+                            eval_duration_ns: None,
+                            context_trimmed,
+                            msgs_dropped,
+                        });
+                        return;
+                    }
+
+                    match serde_json::from_str::<OAIStreamChunk>(data) {
+                        Ok(chunk) => {
+                            if let Some(usage) = &chunk.usage {
+                                prompt_tokens = usage.prompt_tokens;
+                                gen_tokens = usage.completion_tokens;
+                            }
+                            for choice in &chunk.choices {
+                                if !choice.delta.reasoning_content.is_empty() {
+                                    had_thinking = true;
+                                    let _ = tx.send(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
+                                }
+                                if !choice.delta.content.is_empty() {
+                                    if tx.send(StreamEvent::Token(choice.delta.content.clone())).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                return;
+            }
+        }
+    }
+
+    let _ = tx.send(StreamEvent::Done {
+        prompt_tokens,
+        gen_tokens,
+        had_thinking,
+        eval_duration_ns: None,
+        context_trimmed,
+        msgs_dropped,
+    });
+}
+
 impl OllamaClient {
-    /// Create a new Ollama client and validate connection
+    /// Create a new client and validate connection
     pub async fn new(endpoint: &str, model: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        Self::new_with_key(endpoint, model, None).await
+    }
+
+    /// Create a new client with an optional API key (required for OpenAI-compatible endpoints).
+    pub async fn new_with_key(endpoint: &str, model: &str, api_key: Option<&str>) -> Result<Self> {
+        let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            // TCP keepalive: 1 hour to maintain connection to Ollama across idle periods
+            // TCP keepalive: 1 hour to maintain connection across idle periods
             .tcp_keepalive(Duration::from_secs(3600))
             // Connection pool idle timeout: 1 hour
             .pool_idle_timeout(Duration::from_secs(3600))
             .build()?;
 
+        let backend = match detect_api_format(endpoint) {
+            ApiFormat::OpenAI => Backend::OpenAI {
+                endpoint: endpoint.to_string(),
+                api_key: api_key.unwrap_or("").to_string(),
+            },
+            ApiFormat::Ollama => Backend::Ollama {
+                endpoint: endpoint.to_string(),
+            },
+        };
+
         let ollama_client = Self {
-            endpoint: endpoint.to_string(),
+            backend,
+            http_client,
             model: model.to_string(),
-            client,
             native_ctx: Arc::new(Mutex::new(None)),
         };
 
         match ollama_client.list_models().await {
             Ok(_) => {
-                crate::dlog!("✅ Ollama connection validated: {}", endpoint);
+                crate::dlog!("✅ Connection validated: {}", endpoint);
                 Ok(ollama_client)
             }
             Err(e) => {
                 let friendly_msg = if e.to_string().contains("connection refused") {
-                    format!("Ollama is not running at {}", endpoint)
+                    format!("Service is not running at {}", endpoint)
                 } else if e.to_string().contains("timeout") {
-                    format!("Ollama at {} is not responding", endpoint)
+                    format!("Service at {} is not responding", endpoint)
                 } else {
                     e.to_string()
                 };
-                crate::dlog!("❌ Ollama connection failed: {}", friendly_msg);
+                crate::dlog!("❌ Connection failed: {}", friendly_msg);
                 Err(e)
             }
         }
     }
 
-    pub fn endpoint(&self) -> &str { &self.endpoint }
+    pub fn endpoint(&self) -> &str { self.backend.endpoint() }
+    pub fn api_format(&self) -> ApiFormat { self.backend.format() }
     pub fn model(&self) -> &str { &self.model }
 
     /// Reuse an existing validated client but switch to a different model name.
@@ -200,40 +444,62 @@ impl OllamaClient {
         }
     }
 
-    /// Fetch list of available models from Ollama
+    /// Fetch list of available models
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let url = format!("{}/api/tags", self.endpoint);
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to connect to Ollama at {}: {}", self.endpoint, e))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Ollama returned error: {}", response.status()));
+        match &self.backend {
+            Backend::Ollama { endpoint } => {
+                let url = format!("{}/api/tags", endpoint);
+                let response = self.http_client.get(&url).send().await
+                    .map_err(|e| anyhow!("Failed to connect to Ollama at {}: {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    return Err(anyhow!("Ollama returned error: {}", response.status()));
+                }
+                let data: ModelsResponse = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse models response: {}", e))?;
+                Ok(data.models)
+            }
+            Backend::OpenAI { endpoint, api_key } => {
+                let base = endpoint.trim_end_matches('/');
+                let url = if base.ends_with("/v1") {
+                    format!("{}/models", base)
+                } else {
+                    format!("{}/v1/models", base)
+                };
+                let response = self.http_client.get(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .send().await
+                    .map_err(|e| anyhow!("Failed to connect to {} : {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(anyhow!("OpenAI endpoint returned {}: {}", status, body));
+                }
+                #[derive(Deserialize)] struct OAIModelsResp { data: Vec<OAIModelEntry> }
+                #[derive(Deserialize)] struct OAIModelEntry { id: String }
+                let data: OAIModelsResp = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse models response: {}", e))?;
+                Ok(data.data.into_iter().map(|m| ModelInfo { name: m.id, modified_at: None, size: None }).collect())
+            }
         }
-
-        let data: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse models response: {}", e))?;
-
-        Ok(data.models)
     }
 
     /// Fetch the native context length for the current model from Ollama's /api/show endpoint.
     /// Looks for any key ending in `.context_length` in `model_info` (e.g. `qwen35.context_length`).
     /// Stores the result internally so get_native_ctx() can return it without another network call.
+    /// Returns None immediately for OpenAI-compatible backends.
     pub async fn fetch_native_ctx(&self) -> Option<u32> {
+        let (endpoint, client) = match &self.backend {
+            Backend::Ollama { endpoint } => (endpoint.as_str(), &self.http_client),
+            Backend::OpenAI { .. } => return None,
+        };
         #[derive(Deserialize)]
         struct ShowResponse {
             model_info: Option<std::collections::HashMap<String, serde_json::Value>>,
         }
-        let url = format!("{}/api/show", self.endpoint);
+        let url = format!("{}/api/show", endpoint);
         let body = serde_json::json!({"model": self.model});
-        let resp = self.client.post(&url).json(&body).send().await.ok()?;
+        let resp = client.post(&url).json(&body).send().await.ok()?;
         let show: ShowResponse = resp.json().await.ok()?;
         let info = show.model_info?;
         let ctx = info.iter()
@@ -249,6 +515,7 @@ impl OllamaClient {
     pub fn get_native_ctx(&self) -> Option<u32> {
         *self.native_ctx.lock().unwrap()
     }
+
     pub async fn get_last_loaded_model(&self) -> Result<String> {
         let models = self.list_models().await?;
 
@@ -472,11 +739,12 @@ impl OllamaClient {
         tool_output_cap: Option<usize>,
         context_window: Option<u32>,
     ) -> mpsc::UnboundedReceiver<StreamEvent> {
+        let model = self.model.clone();
         let (tx, rx) = mpsc::unbounded_channel();
 
         let (ollama_messages, steering_chars, context_trimmed, msgs_dropped) = Self::build_messages(&messages, steering, tool_output_cap, context_window);
         dlog!("generate_streaming: model={} num_ctx={:?} in_msgs={} out_msgs={} est_tokens={} ctx_trimmed={}",
-            self.model,
+            model,
             params.num_ctx,
             messages.len(),
             ollama_messages.len(),
@@ -492,108 +760,109 @@ impl OllamaClient {
             OllamaOptions::from_params(&params, self.get_native_ctx())
         };
 
-        let request = GenerateRequest {
-            model: self.model.clone(),
-            messages: ollama_messages,
-            stream: true,
-            options,
-            think: params.think,
-        };
-        let url = format!("{}/api/chat", self.endpoint);
-        let client = self.client.clone();
-
-        tokio::spawn(async move {
-            let response = match client.post(&url).json(&request).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    dlog!("generate_streaming: request failed: {e}");
-                    let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
-                    return;
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                dlog!("generate_streaming: HTTP error {status}: {body}");
-                let _ = tx.send(StreamEvent::Error(format!("Ollama error {}: {}", status, body)));
-                return;
-            }
-
-            dlog!("generate_streaming: HTTP OK — reading stream");
-
-            // Read streaming NDJSON response
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut had_thinking = false;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                        // Process complete lines
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() { continue; }
-
-                            match serde_json::from_str::<StreamChunk>(&line) {
-                                Ok(chunk) => {
-                                    if let Some(msg) = &chunk.message {
-                                        if !msg.thinking.is_empty() {
-                                            had_thinking = true;
-                                            let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
-                                        }
-                                        if !msg.content.is_empty() {
-                                            if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
-                                                return; // receiver dropped
+        match &self.backend {
+            Backend::Ollama { endpoint } => {
+                let request = GenerateRequest {
+                    model,
+                    messages: ollama_messages,
+                    stream: true,
+                    options,
+                    think: params.think,
+                };
+                let url = format!("{}/api/chat", endpoint);
+                let client = self.http_client.clone();
+                tokio::spawn(async move {
+                    let response = match client.post(&url).json(&request).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            dlog!("generate_streaming: request failed: {e}");
+                            let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
+                            return;
+                        }
+                    };
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        dlog!("generate_streaming: HTTP error {status}: {body}");
+                        let _ = tx.send(StreamEvent::Error(format!("Ollama error {}: {}", status, body)));
+                        return;
+                    }
+                    dlog!("generate_streaming: HTTP OK — reading stream");
+                    use futures_util::StreamExt;
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut had_thinking = false;
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(bytes) => {
+                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                while let Some(newline_pos) = buffer.find('\n') {
+                                    let line = buffer[..newline_pos].trim().to_string();
+                                    buffer = buffer[newline_pos + 1..].to_string();
+                                    if line.is_empty() { continue; }
+                                    match serde_json::from_str::<StreamChunk>(&line) {
+                                        Ok(chunk) => {
+                                            if let Some(msg) = &chunk.message {
+                                                if !msg.thinking.is_empty() {
+                                                    had_thinking = true;
+                                                    let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
+                                                }
+                                                if !msg.content.is_empty() {
+                                                    if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            if chunk.done {
+                                                let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
+                                                let gen_tokens = chunk.eval_count.unwrap_or(0);
+                                                dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
+                                                let _ = tx.send(StreamEvent::Done {
+                                                    prompt_tokens,
+                                                    gen_tokens,
+                                                    had_thinking,
+                                                    eval_duration_ns: chunk.eval_duration,
+                                                    context_trimmed,
+                                                    msgs_dropped,
+                                                });
+                                                return;
                                             }
                                         }
-                                    }
-                                    if chunk.done {
-                                        let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
-                                        let gen_tokens = chunk.eval_count.unwrap_or(0);
-                                        dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
-                                        let _ = tx.send(StreamEvent::Done {
-                                            prompt_tokens,
-                                            gen_tokens,
-                                            had_thinking,
-                                            eval_duration_ns: chunk.eval_duration,
-                                            context_trimmed,
-                                            msgs_dropped,
-                                        });
-                                        return;
+                                        Err(_) => {}
                                     }
                                 }
-                                Err(_) => {
-                                    // Skip unparseable lines (e.g. partial JSON)
-                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                                return;
                             }
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
-                        return;
-                    }
-                }
+                    let _ = tx.send(StreamEvent::Done {
+                        prompt_tokens: 0,
+                        gen_tokens: 0,
+                        had_thinking,
+                        eval_duration_ns: None,
+                        context_trimmed,
+                        msgs_dropped,
+                    });
+                });
             }
-
-            // Stream ended without done signal
-            let _ = tx.send(StreamEvent::Done {
-                prompt_tokens: 0,
-                gen_tokens: 0,
-                had_thinking,
-                eval_duration_ns: None,
-                context_trimmed,
-                msgs_dropped,
-            });
-        });
+            Backend::OpenAI { endpoint, api_key } => {
+                let request = build_openai_request(&model, ollama_messages, &params);
+                let url = format!("{}/v1/chat/completions", endpoint);
+                let client = self.http_client.clone();
+                let api_key = api_key.clone();
+                tokio::spawn(async move {
+                    stream_openai(client, url, api_key, request, tx, context_trimmed, msgs_dropped).await;
+                });
+            }
+        }
 
         rx
-    }    /// Streaming variant that takes pre-built OllamaMessages (used by agent subloops).
+    }
+
+    /// Streaming variant that takes pre-built OllamaMessages (used by agent subloops).
     pub fn stream_messages(
         &self,
         model: &str,
@@ -601,91 +870,101 @@ impl OllamaClient {
         params: &crate::config::ModelParams,
     ) -> mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let request = GenerateRequest {
-            model: model.to_string(),
-            messages,
-            stream: true,
-            options: OllamaOptions::from_params(params, self.get_native_ctx()),
-            think: params.think,
-        };
-        let url = format!("{}/api/chat", self.endpoint);
-        let client = self.client.clone();
 
-        tokio::spawn(async move {
-            let response = match client.post(&url).json(&request).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
-                    return;
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(StreamEvent::Error(format!("Ollama error {}: {}", status, body)));
-                return;
-            }
-
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut had_thinking = false;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-                            if line.is_empty() { continue; }
-                            match serde_json::from_str::<StreamChunk>(&line) {
-                                Ok(chunk) => {
-                                    if let Some(msg) = &chunk.message {
-                                        if !msg.thinking.is_empty() {
-                                            had_thinking = true;
-                                            let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
-                                        }
-                                        if !msg.content.is_empty() {
-                                            if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
+        match &self.backend {
+            Backend::Ollama { endpoint } => {
+                let request = GenerateRequest {
+                    model: model.to_string(),
+                    messages,
+                    stream: true,
+                    options: OllamaOptions::from_params(params, self.get_native_ctx()),
+                    think: params.think,
+                };
+                let url = format!("{}/api/chat", endpoint);
+                let client = self.http_client.clone();
+                tokio::spawn(async move {
+                    let response = match client.post(&url).json(&request).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
+                            return;
+                        }
+                    };
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        let _ = tx.send(StreamEvent::Error(format!("Ollama error {}: {}", status, body)));
+                        return;
+                    }
+                    use futures_util::StreamExt;
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut had_thinking = false;
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(bytes) => {
+                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                while let Some(newline_pos) = buffer.find('\n') {
+                                    let line = buffer[..newline_pos].trim().to_string();
+                                    buffer = buffer[newline_pos + 1..].to_string();
+                                    if line.is_empty() { continue; }
+                                    match serde_json::from_str::<StreamChunk>(&line) {
+                                        Ok(chunk) => {
+                                            if let Some(msg) = &chunk.message {
+                                                if !msg.thinking.is_empty() {
+                                                    had_thinking = true;
+                                                    let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
+                                                }
+                                                if !msg.content.is_empty() {
+                                                    if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            if chunk.done {
+                                                let p = chunk.prompt_eval_count.unwrap_or(0);
+                                                let g = chunk.eval_count.unwrap_or(0);
+                                                let _ = tx.send(StreamEvent::Done {
+                                                    prompt_tokens: p,
+                                                    gen_tokens: g,
+                                                    had_thinking,
+                                                    eval_duration_ns: chunk.eval_duration,
+                                                    context_trimmed: false,
+                                                    msgs_dropped: 0,
+                                                });
                                                 return;
                                             }
                                         }
-                                    }
-                                    if chunk.done {
-                                        let p = chunk.prompt_eval_count.unwrap_or(0);
-                                        let g = chunk.eval_count.unwrap_or(0);
-                                        let _ = tx.send(StreamEvent::Done {
-                                            prompt_tokens: p,
-                                            gen_tokens: g,
-                                            had_thinking,
-                                            eval_duration_ns: chunk.eval_duration,
-                                            context_trimmed: false,
-                                            msgs_dropped: 0,
-                                        });
-                                        return;
+                                        Err(_) => {}
                                     }
                                 }
-                                Err(_) => {}
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                                return;
                             }
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
-                        return;
-                    }
-                }
+                    let _ = tx.send(StreamEvent::Done {
+                        prompt_tokens: 0,
+                        gen_tokens: 0,
+                        had_thinking,
+                        eval_duration_ns: None,
+                        context_trimmed: false,
+                        msgs_dropped: 0,
+                    });
+                });
             }
-            let _ = tx.send(StreamEvent::Done {
-                prompt_tokens: 0,
-                gen_tokens: 0,
-                had_thinking,
-                eval_duration_ns: None,
-                context_trimmed: false,
-                msgs_dropped: 0,
-            });
-        });
+            Backend::OpenAI { endpoint, api_key } => {
+                let request = build_openai_request(model, messages, params);
+                let url = format!("{}/v1/chat/completions", endpoint);
+                let client = self.http_client.clone();
+                let api_key = api_key.clone();
+                tokio::spawn(async move {
+                    stream_openai(client, url, api_key, request, tx, false, 0).await;
+                });
+            }
+        }
 
         rx
     }
@@ -701,87 +980,129 @@ impl OllamaClient {
     ) -> Result<String> {
         let (ollama_messages, steering_chars, _context_trimmed, _msgs_dropped) = Self::build_messages(&messages, steering, tool_output_cap, context_window);
 
-        let options = if steering_chars > 0 {
-            let steering_tokens = (steering_chars / 4).max(1) as i32;
-            let base = OllamaOptions::from_params(params, self.get_native_ctx()).unwrap_or_default();
-            Some(base.with_num_keep(steering_tokens))
-        } else {
-            OllamaOptions::from_params(params, self.get_native_ctx())
-        };
-
-        let request = GenerateRequest {
-            model: self.model.clone(),
-            messages: ollama_messages,
-            stream: false,
-            options,
-            think: params.think,
-        };
-
-        let url = format!("{}/api/chat", self.endpoint);
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to send request to Ollama at {}: {}", self.endpoint, e))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Ollama returned error: {} - {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            ));
+        match &self.backend {
+            Backend::Ollama { endpoint } => {
+                let options = if steering_chars > 0 {
+                    let steering_tokens = (steering_chars / 4).max(1) as i32;
+                    let base = OllamaOptions::from_params(params, self.get_native_ctx()).unwrap_or_default();
+                    Some(base.with_num_keep(steering_tokens))
+                } else {
+                    OllamaOptions::from_params(params, self.get_native_ctx())
+                };
+                let request = GenerateRequest {
+                    model: self.model.clone(),
+                    messages: ollama_messages,
+                    stream: false,
+                    options,
+                    think: params.think,
+                };
+                let url = format!("{}/api/chat", endpoint);
+                let response = self.http_client.post(&url).json(&request).send().await
+                    .map_err(|e| anyhow!("Failed to send request to Ollama at {}: {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "Ollama returned error: {} - {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+                let data: GenerateResponse = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
+                Ok(data.message.content)
+            }
+            Backend::OpenAI { endpoint, api_key } => {
+                let mut request = build_openai_request(&self.model, ollama_messages, params);
+                request.stream = false;
+                request.stream_options = None;
+                let url = format!("{}/v1/chat/completions", endpoint);
+                let response = self.http_client.post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&request)
+                    .send().await
+                    .map_err(|e| anyhow!("Failed to send request to OpenAI at {}: {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "OpenAI returned error: {} - {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+                let data: OAINonStreamResponse = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse OpenAI response: {}", e))?;
+                let choice = data.choices.into_iter().next()
+                    .ok_or_else(|| anyhow!("OpenAI returned no choices"))?;
+                Ok(choice.message.content)
+            }
         }
-
-        let data: GenerateResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
-
-        Ok(data.message.content)
     }
 
-    /// Send messages directly to Ollama (raw OllamaMessage format)
+    /// Send messages directly (raw OllamaMessage format)
     pub async fn generate_with_messages(
         &self,
         model: &str,
         messages: Vec<OllamaMessage>,
         params: &crate::config::ModelParams,
     ) -> Result<GenerateResponse> {
-        let request = GenerateRequest {
-            model: model.to_string(),
-            messages,
-            stream: false,
-            options: OllamaOptions::from_params(params, self.get_native_ctx()),
-            think: params.think,
-        };
-
-        let url = format!("{}/api/chat", self.endpoint);
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to send request to Ollama at {}: {}", self.endpoint, e))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Ollama returned error: {} - {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            ));
+        match &self.backend {
+            Backend::Ollama { endpoint } => {
+                let request = GenerateRequest {
+                    model: model.to_string(),
+                    messages,
+                    stream: false,
+                    options: OllamaOptions::from_params(params, self.get_native_ctx()),
+                    think: params.think,
+                };
+                let url = format!("{}/api/chat", endpoint);
+                let response = self.http_client.post(&url).json(&request).send().await
+                    .map_err(|e| anyhow!("Failed to send request to Ollama at {}: {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "Ollama returned error: {} - {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+                let data: GenerateResponse = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
+                Ok(data)
+            }
+            Backend::OpenAI { endpoint, api_key } => {
+                let mut request = build_openai_request(model, messages, params);
+                request.stream = false;
+                request.stream_options = None;
+                let url = format!("{}/v1/chat/completions", endpoint);
+                let response = self.http_client.post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&request)
+                    .send().await
+                    .map_err(|e| anyhow!("Failed to send request to OpenAI at {}: {}", endpoint, e))?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "OpenAI returned error: {} - {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+                let data: OAINonStreamResponse = response.json().await
+                    .map_err(|e| anyhow!("Failed to parse OpenAI response: {}", e))?;
+                let choice = data.choices.into_iter().next()
+                    .ok_or_else(|| anyhow!("OpenAI returned no choices"))?;
+                let content = choice.message.content;
+                let thinking = choice.message.reasoning_content.unwrap_or_default();
+                Ok(GenerateResponse {
+                    message: OllamaMessage {
+                        role: "assistant".to_string(),
+                        content: if thinking.is_empty() {
+                            content
+                        } else {
+                            format!("<think>{}</think>{}", thinking, content)
+                        },
+                    },
+                })
+            }
         }
-
-        let data: GenerateResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
-
-        Ok(data)
     }
 }
 
@@ -1129,5 +1450,53 @@ mod tests {
         let response: ModelsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.models.len(), 2);
         assert_eq!(response.models[0].name, "llama2");
+    }
+
+    #[test]
+    fn test_detect_api_format_openrouter() {
+        assert_eq!(detect_api_format("https://openrouter.ai/api"), ApiFormat::OpenAI);
+    }
+    #[test]
+    fn test_detect_api_format_openai() {
+        assert_eq!(detect_api_format("https://api.openai.com/v1"), ApiFormat::OpenAI);
+    }
+    #[test]
+    fn test_detect_api_format_groq() {
+        assert_eq!(detect_api_format("https://api.groq.com/openai/v1"), ApiFormat::OpenAI);
+    }
+    #[test]
+    fn test_detect_api_format_localhost() {
+        assert_eq!(detect_api_format("http://localhost:11434"), ApiFormat::Ollama);
+    }
+    #[test]
+    fn test_detect_api_format_custom() {
+        assert_eq!(detect_api_format("http://192.168.1.5:11434"), ApiFormat::Ollama);
+    }
+    #[test]
+    fn test_openai_sse_parse_content_token() {
+        let line = r#"{"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello","role":"assistant"},"finish_reason":null}]}"#;
+        let chunk: OAIStreamChunk = serde_json::from_str(line).unwrap();
+        assert_eq!(chunk.choices[0].delta.content, "Hello");
+        assert!(chunk.choices[0].delta.reasoning_content.is_empty());
+    }
+    #[test]
+    fn test_openai_sse_parse_reasoning_token() {
+        let line = r#"{"id":"gen-2","object":"chat.completion.chunk","created":1,"model":"deepseek-r1","choices":[{"index":0,"delta":{"reasoning_content":"thinking...","content":""},"finish_reason":null}]}"#;
+        let chunk: OAIStreamChunk = serde_json::from_str(line).unwrap();
+        assert_eq!(chunk.choices[0].delta.reasoning_content, "thinking...");
+    }
+    #[test]
+    fn test_openai_sse_parse_finish_reason() {
+        let line = r#"{"id":"gen-3","object":"chat.completion.chunk","created":1,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk: OAIStreamChunk = serde_json::from_str(line).unwrap();
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+    #[test]
+    fn test_openai_sse_parse_usage() {
+        let line = r#"{"id":"gen-4","object":"chat.completion.chunk","created":1,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":14,"completion_tokens":10}}"#;
+        let chunk: OAIStreamChunk = serde_json::from_str(line).unwrap();
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 14);
+        assert_eq!(usage.completion_tokens, 10);
     }
 }

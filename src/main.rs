@@ -119,16 +119,31 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(yggdra_dir.join("log"));
     let _ = std::fs::create_dir_all(yggdra_dir.join("todo"));
 
-    // Create .yggdra/knowledge symlink → ~/source/repos/offlinebase if missing
+    // Ensure .yggdra/knowledge → ~/source/repos/offlinebase on every startup.
+    // Always re-points a stale/broken symlink; leaves real directories alone.
     let knowledge_link = yggdra_dir.join("knowledge");
-    if !knowledge_link.exists() && !knowledge_link.is_symlink() {
-        if let Some(home) = dirs::home_dir() {
-            let offlinebase = home.join("source").join("repos").join("offlinebase");
-            if offlinebase.exists() {
-                #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&offlinebase, &knowledge_link);
-                #[cfg(not(unix))]
-                let _ = std::fs::create_dir_all(&knowledge_link); // fallback on non-unix
+    if let Some(home) = dirs::home_dir() {
+        let offlinebase = home.join("source").join("repos").join("offlinebase");
+        if offlinebase.exists() {
+            #[cfg(unix)]
+            {
+                let needs_create = if knowledge_link.is_symlink() {
+                    // Re-point if wrong target or broken
+                    std::fs::read_link(&knowledge_link)
+                        .map(|t| t != offlinebase)
+                        .unwrap_or(true)
+                } else {
+                    // Create only if nothing is there (don't overwrite a real directory)
+                    !knowledge_link.exists()
+                };
+                if needs_create {
+                    let _ = std::fs::remove_file(&knowledge_link); // no-op if absent
+                    let _ = std::os::unix::fs::symlink(&offlinebase, &knowledge_link);
+                }
+            }
+            #[cfg(not(unix))]
+            if !knowledge_link.exists() {
+                let _ = std::fs::create_dir_all(&knowledge_link);
             }
         }
     }
