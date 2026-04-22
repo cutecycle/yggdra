@@ -5,6 +5,7 @@ pub mod epoch;
 pub mod gaps;
 pub mod highlight;
 pub mod knowledge_index;
+pub mod markdown;
 pub mod msglog;
 pub mod message;
 pub mod notifications;

@@ -6,9 +6,9 @@
       "output_bytes": 7701
     },
     "shell": {
-      "calls": 330,
+      "calls": 331,
       "failures": 2,
-      "output_bytes": 48874317
+      "output_bytes": 48876725
     },
     "think": {
       "calls": 2,
@@ -26,13 +26,13 @@
       "output_bytes": 676169
     }
   },
-  "llm_requests": 467,
-  "prompt_tokens": 10647739,
-  "gen_tokens": 137510,
+  "llm_requests": 471,
+  "prompt_tokens": 10679444,
+  "gen_tokens": 138571,
   "avg_tok_per_s_x100": 0,
   "sessions": 16,
   "last_active_unix": 1776889501,
-  "uptime_seconds": 9951,
+  "uptime_seconds": 10683,
   "context_trims": 0,
   "compressions": 0
 }

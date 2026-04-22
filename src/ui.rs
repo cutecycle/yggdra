@@ -2354,10 +2354,26 @@ impl App {
                 );
 
                 if self.mode == AppMode::Ask {
-                    // Ask mode: store tool result for context but do not kick a new stream.
-                    // Stay Idle until the user sends their next message.
-                    self.turn_phase = TurnPhase::Idle;
-                    self.tool_iteration_count = 0;
+                    // Ask mode: autonomously execute read-only tools and loop until [DONE].
+                    // Kick a new stream to let the agent continue processing the tool result.
+                    if let Some(client) = &self.ollama_client {
+                        let steering_text = self.steering_text();
+                        let messages = self.message_buffer.messages().unwrap_or_default();
+                        let (tool_cap, ctx_win) = self.compression_params();
+                        let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
+                        self.stream_rx = Some(rx);
+                        self.streaming_text.clear();
+                        self.thinking_text.clear();
+                        self.in_think_block = false;
+                        self.turn_phase = TurnPhase::Streaming;
+                        self.stream_start_time = Some(std::time::Instant::now());
+                        self.last_stream_token_time = None;
+                        self.tool_iteration_count += 1;
+                    } else {
+                        self.notify("⚠️ Ollama offline — cannot continue autonomous exploration");
+                        self.turn_phase = TurnPhase::Idle;
+                        self.tool_iteration_count = 0;
+                    }
                 } else if let Some(client) = &self.ollama_client {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
@@ -5500,7 +5516,12 @@ impl App {
             "proto","graphql","nix","vim","assembly","asm","wgsl","glsl","hlsl",
         ];
 
-        for line in content.lines() {
+        let content_lines: Vec<&str> = content.lines().collect();
+        let mut line_idx = 0;
+
+        while line_idx < content_lines.len() {
+            let line = content_lines[line_idx];
+            
             if line.trim_start().starts_with("```") {
                 if !in_code_block {
                     let lang_part = line.trim_start().strip_prefix("```").unwrap_or("").trim();
@@ -5530,6 +5551,7 @@ impl App {
                     code_language.clear();
                     code_buffer.clear();
                 }
+                line_idx += 1;
                 continue;
             }
 
@@ -5538,17 +5560,41 @@ impl App {
                     code_buffer.push('\n');
                 }
                 code_buffer.push_str(line);
+                line_idx += 1;
             } else {
-                let text = if line.starts_with("    ") || line.starts_with('\t') {
-                    format!("    {}", line)
+                // Try to detect and render tables
+                if let Some((table_lines, lines_consumed)) = self.detect_and_render_table(&content_lines, line_idx, is_dark) {
+                    // Prepend emoji to first table line if needed
+                    if first_line && !table_lines.is_empty() {
+                        let mut first_table_line = table_lines[0].clone();
+                        if let Some(first_span) = first_table_line.spans.first() {
+                            let mut new_spans = vec![Span::raw(format!("{} ", content_emoji))];
+                            new_spans.extend(first_table_line.spans.iter().cloned());
+                            first_table_line = RLine::from(new_spans);
+                        }
+                        lines.push(first_table_line);
+                        lines.extend(table_lines.into_iter().skip(1));
+                        first_line = false;
+                    } else {
+                        lines.extend(table_lines);
+                        first_line = false;
+                    }
+                    line_idx += lines_consumed;
                 } else {
-                    line.to_string()
-                };
-                if first_line {
-                    lines.push(RLine::from(format!("{} {}", content_emoji, text)));
-                    first_line = false;
-                } else {
-                    lines.push(RLine::from(text));
+                    // Regular text line with markdown formatting
+                    let md_lines = self.render_markdown_line(line, is_dark);
+                    for md_line in md_lines {
+                        if first_line {
+                            // Prepend emoji to first line
+                            let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+                            spans.extend(md_line.spans.into_iter());
+                            lines.push(RLine::from(spans));
+                            first_line = false;
+                        } else {
+                            lines.push(md_line);
+                        }
+                    }
+                    line_idx += 1;
                 }
             }
         }
@@ -5565,6 +5611,71 @@ impl App {
         }
 
         RText::from(lines)
+    }
+
+    /// Render a single line with markdown formatting (headers, lists, inline formatting)
+    fn render_markdown_line(&self, line: &str, is_dark: bool) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line as RLine, Span};
+
+        let text_color = if is_dark {
+            Color::Rgb(220, 230, 240)
+        } else {
+            Color::Rgb(40, 42, 46)
+        };
+
+        // Check for headers
+        if let Some((level, content)) = crate::markdown::detect_header(line) {
+            return vec![crate::markdown::format_header(level, &content, text_color)];
+        }
+
+        // Check for list items
+        if let Some((indent, content)) = crate::markdown::detect_list_item(line) {
+            let bullet = if line.contains('*') { '•' } else if line.contains('+') { '◦' } else { '·' };
+            return vec![crate::markdown::format_list_item(indent, &content, text_color, bullet)];
+        }
+
+        // Regular text line with inline markdown formatting
+        let spans = crate::markdown::format_inline_to_spans(line, text_color);
+        vec![RLine::from(spans)]
+    }
+
+    /// Check if content looks like a table (has | separators on consecutive lines)
+    fn detect_and_render_table(&self, lines_vec: &[&str], start_idx: usize, is_dark: bool) -> Option<(Vec<ratatui::text::Line<'static>>, usize)> {
+        use ratatui::style::Color;
+
+        if start_idx >= lines_vec.len() || start_idx + 2 > lines_vec.len() {
+            return None;
+        }
+
+        // Look for table: check current line + next line (separator)
+        if !lines_vec[start_idx].contains('|') || !lines_vec[start_idx + 1].contains('|') {
+            return None;
+        }
+
+        // Check if next line is a separator
+        if !crate::markdown::is_table_separator(lines_vec[start_idx + 1]) {
+            return None;
+        }
+
+        // Find the end of the table (where | separators stop appearing)
+        let mut end_idx = start_idx + 2;
+        while end_idx < lines_vec.len() && lines_vec[end_idx].contains('|') {
+            end_idx += 1;
+        }
+
+        let table_lines = lines_vec[start_idx..end_idx].to_vec();
+        if let Some(table) = crate::markdown::parse_table(&table_lines) {
+            let text_color = if is_dark {
+                Color::Rgb(220, 230, 240)
+            } else {
+                Color::Rgb(40, 42, 46)
+            };
+            let rendered = crate::markdown::format_table(&table, text_color);
+            return Some((rendered, end_idx - start_idx));
+        }
+
+        None
     }
 
     /// Format message content with nice code block indentation and language detection
