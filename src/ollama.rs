@@ -27,6 +27,17 @@ pub fn detect_api_format(endpoint: &str) -> ApiFormat {
     }
 }
 
+/// Build an OpenAI-compatible chat completions URL from a base endpoint.
+/// Handles both `https://host/v1` and `https://host` forms.
+fn openai_chat_url(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ApiFormat { Ollama, OpenAI }
 
@@ -850,7 +861,7 @@ impl OllamaClient {
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let request = build_openai_request(&model, ollama_messages, &params);
-                let url = format!("{}/v1/chat/completions", endpoint);
+                let url = openai_chat_url(endpoint);
                 let client = self.http_client.clone();
                 let api_key = api_key.clone();
                 tokio::spawn(async move {
@@ -957,7 +968,7 @@ impl OllamaClient {
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let request = build_openai_request(model, messages, params);
-                let url = format!("{}/v1/chat/completions", endpoint);
+                let url = openai_chat_url(endpoint);
                 let client = self.http_client.clone();
                 let api_key = api_key.clone();
                 tokio::spawn(async move {
@@ -1014,7 +1025,7 @@ impl OllamaClient {
                 let mut request = build_openai_request(&self.model, ollama_messages, params);
                 request.stream = false;
                 request.stream_options = None;
-                let url = format!("{}/v1/chat/completions", endpoint);
+                let url = openai_chat_url(endpoint);
                 let response = self.http_client.post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
@@ -1071,7 +1082,7 @@ impl OllamaClient {
                 let mut request = build_openai_request(model, messages, params);
                 request.stream = false;
                 request.stream_options = None;
-                let url = format!("{}/v1/chat/completions", endpoint);
+                let url = openai_chat_url(endpoint);
                 let response = self.http_client.post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
@@ -1471,6 +1482,19 @@ mod tests {
     #[test]
     fn test_detect_api_format_custom() {
         assert_eq!(detect_api_format("http://192.168.1.5:11434"), ApiFormat::Ollama);
+    }
+
+    #[test]
+    fn test_openai_chat_url_with_v1_suffix() {
+        assert_eq!(openai_chat_url("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1/chat/completions");
+    }
+    #[test]
+    fn test_openai_chat_url_with_v1_suffix_trailing_slash() {
+        assert_eq!(openai_chat_url("https://openrouter.ai/api/v1/"), "https://openrouter.ai/api/v1/chat/completions");
+    }
+    #[test]
+    fn test_openai_chat_url_without_v1() {
+        assert_eq!(openai_chat_url("https://api.openai.com"), "https://api.openai.com/v1/chat/completions");
     }
     #[test]
     fn test_openai_sse_parse_content_token() {
