@@ -47,6 +47,8 @@ pub(crate) enum StreamEndAction {
     Kick,
     /// One mode: the task is considered complete.
     CompleteOne(&'static str),
+    /// Stop auto-loop but stay in current mode. User must send a message to resume.
+    Halt(&'static str),
 }
 
 /// Decide what to do when a streaming turn ends with no tool calls.
@@ -65,7 +67,13 @@ pub(crate) fn decide_stream_end(
     let kicks_after = consecutive_empty_kicks + 1;
     match mode {
         AppMode::Plan | AppMode::Ask => StreamEndAction::Persist,
-        AppMode::Build => StreamEndAction::Kick,
+        AppMode::Build => {
+            if kicks_after >= 5 {
+                StreamEndAction::Halt("model stuck")
+            } else {
+                StreamEndAction::Kick
+            }
+        }
         AppMode::One => {
             if !has_text {
                 // Model produced only thinking tokens (or nothing) — kick up to 3 times.
@@ -407,6 +415,8 @@ pub struct App {
     last_build_kick: std::time::Instant,
     /// Consecutive build-mode kicks without tool calls — stuck detection
     consecutive_empty_kicks: u32,
+    /// Explicit flag: autonomous kicks are paused (model stuck / errors). Reset on user input.
+    autokick_paused: bool,
     /// Consecutive format-error corrections injected — loop break
     consecutive_format_errors: u32,
     /// Consecutive tool errors (same tool failing) — loop break
@@ -596,6 +606,7 @@ impl App {
             agents_config,
             last_build_kick: std::time::Instant::now(),
             consecutive_empty_kicks: 0,
+            autokick_paused: false,
             consecutive_format_errors: 0,
             consecutive_tool_errors: 0,
             last_errored_tool: String::new(),
@@ -1034,7 +1045,13 @@ impl App {
                 self.tool_iteration_count = 0;
                 self.last_stream_token_time = None;
                 if matches!(self.mode, AppMode::Build | AppMode::One) {
-                    self.inject_continue_kick();
+                    self.consecutive_empty_kicks += 1;
+                    if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                        self.autokick_paused = true;
+                        self.push_agent_notice("⏸️ Stream keeps stalling — pausing. Send a message to retry.".to_string());
+                    } else {
+                        self.inject_continue_kick();
+                    }
                 }
             }
             return;
@@ -1112,9 +1129,14 @@ impl App {
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                     self.last_infer_rate = None;
-                    // Build/One mode: retry after surfacing the error
                     if matches!(self.mode, AppMode::Build | AppMode::One) {
-                        self.inject_continue_kick();
+                        self.consecutive_empty_kicks += 1;
+                        if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                            self.autokick_paused = true;
+                            self.push_agent_notice("⏸️ Too many errors — pausing. Send a message to retry.".to_string());
+                        } else {
+                            self.inject_continue_kick();
+                        }
                     }
                     return;
                 }
@@ -1128,7 +1150,13 @@ impl App {
                         self.turn_phase = TurnPhase::Idle;
                         self.tool_iteration_count = 0;
                         if matches!(self.mode, AppMode::Build | AppMode::One) {
-                            self.inject_continue_kick();
+                            self.consecutive_empty_kicks += 1;
+                            if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                                self.autokick_paused = true;
+                                self.push_agent_notice("⏸️ Connection lost repeatedly — pausing. Send a message to retry.".to_string());
+                            } else {
+                                self.inject_continue_kick();
+                            }
                         }
                     }
                     return;
@@ -1203,7 +1231,7 @@ impl App {
     fn complete_streaming_turn(&mut self) {
         self.stream_start_time = None;
         self.last_stream_token_time = None;
-        if self.streaming_text.is_empty() {
+        if self.streaming_text.is_empty() && self.thinking_text.is_empty() {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
@@ -1212,17 +1240,22 @@ impl App {
             match action {
                 StreamEndAction::CompleteOne(reason) => {
                     self.push_agent_notice(
-                        format!("⚠️ Three empty responses (thinking only) — completing One mode.")
+                        "⚠️ Empty responses (thinking only) — completing task.".to_string()
                     );
                     self.complete_one_mode(reason);
                 }
+                StreamEndAction::Halt(reason) => {
+                    self.autokick_paused = true;
+                    self.push_agent_notice(
+                        format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
+                    );
+                }
                 StreamEndAction::Kick => {
-                    if self.consecutive_empty_kicks >= 3 {
+                    if self.consecutive_empty_kicks == 3 {
                         self.push_agent_notice(
                             "⚠️ Three empty responses. If you are done, summarize. \
                              If not, emit a tool call.".to_string()
                         );
-                        self.consecutive_empty_kicks = 0;
                     }
                     self.inject_continue_kick();
                 }
@@ -1305,9 +1338,9 @@ impl App {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
-            if matches!(self.mode, AppMode::Build | AppMode::One) {
-                self.inject_continue_kick();
-            }
+            // Don't retry generation — message wasn't persisted, context is stale
+            self.autokick_paused = true;
+            self.push_agent_notice("⏸️ Storage error — pausing. Fix the issue and send a message to resume.".to_string());
             return;
         }
         self.cached_message_count = self.message_buffer.count()
@@ -1691,13 +1724,18 @@ impl App {
                         self.stream_rx = None;
                         return;
                     }
+                    StreamEndAction::Halt(reason) => {
+                        self.autokick_paused = true;
+                        self.push_agent_notice(
+                            format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
+                        );
+                    }
                     StreamEndAction::Kick => {
-                        if self.consecutive_empty_kicks >= 3 {
+                        if self.consecutive_empty_kicks == 3 {
                             self.push_agent_notice(
                                 "⚠️ No tool calls in last 3 responses. If you are done, summarize. \
                                  If not, emit a tool call.".to_string()
                             );
-                            self.consecutive_empty_kicks = 0;
                         }
                         self.inject_continue_kick();
                         return;
@@ -1726,6 +1764,7 @@ impl App {
         self.turn_phase = TurnPhase::Idle;
         self.tool_iteration_count = 0;
         self.consecutive_empty_kicks = 0;
+        self.autokick_paused = false;
     }
 
     fn inject_continue_kick(&mut self) {
@@ -2247,7 +2286,13 @@ impl App {
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
                 if matches!(self.mode, AppMode::Build | AppMode::One) {
-                    self.inject_continue_kick();
+                    self.consecutive_empty_kicks += 1;
+                    if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                        self.autokick_paused = true;
+                        self.push_agent_notice("⏸️ Tool failures — pausing. Send a message to retry.".to_string());
+                    } else {
+                        self.inject_continue_kick();
+                    }
                 }
             }
         }
@@ -2264,12 +2309,14 @@ impl App {
         let _ = self.config.save();
         self.status_message = "✅ Task complete".to_string();
         self.consecutive_empty_kicks = 0;
+        self.autokick_paused = false;
         self.render_cache_dirty = true;
     }
 
     /// Launch One mode after agent declared [UNDERSTOOD]: switch mode, kick, clear flag.
     fn launch_plan_understood(&mut self) {
         self.plan_understood = false;
+        self.autokick_paused = false;
         self.input_buffer.clear();
         self.mode = crate::config::AppMode::One;
         self.config.mode = self.mode;
@@ -4162,6 +4209,7 @@ impl App {
             // Message validation: no excessive length, check for reasonable content
             self.inline_tool_results.clear(); // Clear inline results when user sends new message
             self.consecutive_empty_kicks = 0; // Reset stuck detection on new user input
+            self.autokick_paused = false;
             self.consecutive_format_errors = 0;
             // Reset loop-prevention state on new user input
             self.recent_tool_calls.clear();
@@ -5203,10 +5251,12 @@ impl App {
 
         // Watchdog: if Build mode has been idle for 5+ seconds, re-kick.
         // One mode does not auto-kick — it waits for user input.
+        // Respect autokick_paused: model is stuck or erroring, don't re-kick.
         if self.mode == AppMode::Build
             && self.turn_phase == TurnPhase::Idle
             && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
             && self.ollama_client.is_some()
+            && !self.autokick_paused
         {
             self.inject_continue_kick();
         }
@@ -6810,19 +6860,27 @@ mod stream_tests {
     }
 
     // ============================================================================
-    // decide_stream_end — Build mode
+    // decide_stream_end — Build mode (halts after 5 kicks)
     // ============================================================================
 
     #[test]
-    fn build_empty_text_always_kicks() {
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 0),  StreamEndAction::Kick);
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 10), StreamEndAction::Kick);
+    fn build_kicks_below_threshold() {
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 3), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 2), StreamEndAction::Kick);
     }
 
     #[test]
-    fn build_has_text_no_tools_always_kicks() {
-        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 0), StreamEndAction::Kick);
-        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 0), StreamEndAction::Kick);
+    fn build_halts_at_threshold() {
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 4), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 4), StreamEndAction::Halt("model stuck"));
+    }
+
+    #[test]
+    fn build_halts_above_threshold() {
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 10), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 99), StreamEndAction::Halt("model stuck"));
     }
 
     // ============================================================================
