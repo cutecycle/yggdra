@@ -291,6 +291,8 @@ async fn stream_openai(
     msgs_dropped: usize,
 ) {
     request.stream = true;
+    crate::dlog!("stream_openai: POST {} model={} msgs={} api_key_set={}",
+        url, request.model, request.messages.len(), !api_key.is_empty());
     let response = match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -301,6 +303,7 @@ async fn stream_openai(
     {
         Ok(r) => r,
         Err(e) => {
+            crate::dlog!("stream_openai: request failed: {}", e);
             let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
             return;
         }
@@ -309,9 +312,11 @@ async fn stream_openai(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        crate::dlog!("stream_openai: HTTP {}: {}", status, body);
         let _ = tx.send(StreamEvent::Error(format!("OpenAI error {}: {}", status, body)));
         return;
     }
+    crate::dlog!("stream_openai: HTTP OK, reading SSE stream");
 
     use futures_util::StreamExt;
     let mut stream = response.bytes_stream();
@@ -319,6 +324,9 @@ async fn stream_openai(
     let mut had_thinking = false;
     let mut prompt_tokens = 0u32;
     let mut gen_tokens = 0u32;
+    let mut chunks_seen = 0u32;
+    let mut content_chunks = 0u32;
+    let mut parse_errors = 0u32;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -338,6 +346,8 @@ async fn stream_openai(
                     };
 
                     if data == "[DONE]" {
+                        crate::dlog!("stream_openai: [DONE] received chunks={} content_chunks={} prompt_tokens={} gen_tokens={} had_thinking={}",
+                            chunks_seen, content_chunks, prompt_tokens, gen_tokens, had_thinking);
                         let _ = tx.send(StreamEvent::Done {
                             prompt_tokens,
                             gen_tokens,
@@ -349,6 +359,7 @@ async fn stream_openai(
                         return;
                     }
 
+                    chunks_seen += 1;
                     match serde_json::from_str::<OAIStreamChunk>(data) {
                         Ok(chunk) => {
                             if let Some(usage) = &chunk.usage {
@@ -361,22 +372,30 @@ async fn stream_openai(
                                     let _ = tx.send(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
                                 }
                                 if !choice.delta.content.is_empty() {
+                                    content_chunks += 1;
                                     if tx.send(StreamEvent::Token(choice.delta.content.clone())).is_err() {
                                         return;
                                     }
                                 }
                             }
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            parse_errors += 1;
+                            if parse_errors <= 3 {
+                                crate::dlog!("stream_openai: parse error #{}: {} | data: {}", parse_errors, e, &data.chars().take(200).collect::<String>());
+                            }
+                        }
                     }
                 }
             }
             Err(e) => {
+                crate::dlog!("stream_openai: stream error: {}", e);
                 let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
                 return;
             }
         }
     }
+    crate::dlog!("stream_openai: stream ended without [DONE] chunks={} content_chunks={}", chunks_seen, content_chunks);
 
     let _ = tx.send(StreamEvent::Done {
         prompt_tokens,
