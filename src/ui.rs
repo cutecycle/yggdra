@@ -613,6 +613,15 @@ impl App {
         } else {
             "Offline".to_string()
         };
+
+        // Use detect_safe() here — it uses macOS system APIs and can't block.
+        // detect() uses OSC11 which toggles raw mode and can hang before TerminalGuard is set up.
+        let theme = Theme::detect_safe()
+            .map(|light| if light { Theme::light() } else { Theme::dark() })
+            .unwrap_or_else(Theme::dark);
+
+        let project_context = build_project_context(10000);
+
         Self {
             config,
             session,
@@ -658,7 +667,7 @@ impl App {
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
             model_picker_query: String::new(),
-            theme: Theme::detect(),
+            theme,
             metrics: MetricsTracker::new(),
             config_watcher_rx,
             runtime_params: crate::config::ModelParams::default(),
@@ -692,7 +701,7 @@ impl App {
             pending_auto_compress: false,
             zero_truncation: false,
             context_cutoff_dropped: 0,
-            project_context: build_project_context(10000),
+            project_context,
             project_context_built: std::time::Instant::now(),
             msg_cursor: None,
             expanded_msgs: std::collections::HashSet::new(),
@@ -3864,7 +3873,7 @@ impl App {
                             eprintln!("⚠️ Failed to save config: {}", e);
                         }
                         let endpoint = self.config.endpoint.clone();
-                        match OllamaClient::new(&endpoint, &model_name).await {
+                        match OllamaClient::new_with_key(&endpoint, &model_name, self.config.api_key.as_deref()).await {
                             Ok(client) => {
                                 self.ollama_client = Some(client);
                                 self.notify(format!("🌸 Switched to {}", model_name));
@@ -5099,7 +5108,7 @@ impl App {
 
         if needs_reconnect {
             self.status_message = format!("🔌 Connecting to {}…", target_endpoint);
-            match OllamaClient::new(&target_endpoint, &self.config.model).await {
+            match OllamaClient::new_with_key(&target_endpoint, &self.config.model, self.config.api_key.as_deref()).await {
                 Ok(client) => {
                     self.config.endpoint = target_endpoint.clone();
                     self.ollama_client = Some(client);
@@ -5190,7 +5199,7 @@ impl App {
         }
 
         self.status_message = format!("🔌 Connecting to {}…", endpoint);
-        match OllamaClient::new(endpoint, &self.config.model).await {
+        match OllamaClient::new_with_key(endpoint, &self.config.model, self.config.api_key.as_deref()).await {
             Ok(client) => {
                 self.config.endpoint = endpoint.to_string();
                 let _ = self.config.save();
@@ -5214,7 +5223,7 @@ impl App {
         match &self.ollama_client {
             Some(client) => {
                 self.status_message = format!("🌸 Switching to {}…", model);
-                match OllamaClient::new(&self.config.endpoint, model).await {
+                match OllamaClient::new_with_key(&self.config.endpoint, model, self.config.api_key.as_deref()).await {
                     Ok(new_client) => {
                         new_client.fetch_native_ctx().await;
                         self.config.model = model.to_string();
@@ -5248,7 +5257,7 @@ impl App {
                 
                 if model_changed {
                     let endpoint = fresh_config.endpoint.clone();
-                    match OllamaClient::new(&endpoint, &fresh_config.model).await {
+                    match OllamaClient::new_with_key(&endpoint, &fresh_config.model, fresh_config.api_key.as_deref()).await {
                         Ok(client) => {
                             client.fetch_native_ctx().await;
                             self.config = fresh_config;
@@ -5286,7 +5295,7 @@ impl App {
                             ).await;
                             if new_model != self.config.model {
                                 let endpoint = self.config.endpoint.clone();
-                                match OllamaClient::new(&endpoint, &new_model).await {
+                                match OllamaClient::new_with_key(&endpoint, &new_model, self.config.api_key.as_deref()).await {
                                     Ok(new_client) => {
                                         new_client.fetch_native_ctx().await;
                                         self.config.model = new_model.clone();
@@ -6302,12 +6311,15 @@ fn build_project_context(max_chars: usize) -> String {
         "target", ".git", "node_modules", ".yggdra/log", ".yggdra/knowledge",
         "vendor", "dist", "build", ".next", "__pycache__",
     ];
+    const MAX_FILES: usize = 5000; // bail out if directory is huge (e.g. home dir)
 
     struct FileEntry { path: String, size: u64, modified: u64 }
 
     fn collect(dir: &std::path::Path, skip: &[&str], out: &mut Vec<FileEntry>) {
+        if out.len() >= MAX_FILES { return; }
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
+            if out.len() >= MAX_FILES { return; }
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') && name != ".yggdra" { continue; }
