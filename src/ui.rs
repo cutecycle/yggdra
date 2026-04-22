@@ -549,6 +549,8 @@ pub struct App {
     render_cache_exchange_end: usize,
     /// True when the agent declared [UNDERSTOOD] in Plan mode; cleared when One mode launches.
     plan_understood: bool,
+    /// Endpoint type for display in status bar (e.g., "Ollama", "OpenRouter", "llama.cpp")
+    endpoint_type: String,
 }
 
 impl App {
@@ -606,6 +608,11 @@ impl App {
         stats.save(&cwd);
 
         let profile = config.profile;
+        let endpoint_type = if ollama_client.is_some() {
+            crate::ollama::detect_endpoint_type(&config.endpoint)
+        } else {
+            "Offline".to_string()
+        };
         Self {
             config,
             session,
@@ -696,6 +703,7 @@ impl App {
             render_cache_theme: crate::theme::ThemeKind::Dark,
             render_cache_exchange_end: 0,
             plan_understood: false,
+            endpoint_type,
         }
     }
 
@@ -3140,10 +3148,26 @@ impl App {
             }
         };
 
+        // Endpoint type indicator with color
+        let (endpoint_display, endpoint_color) = match self.endpoint_type.as_str() {
+            "OpenRouter" => (&self.endpoint_type, Color::Red),
+            "llama.cpp" => (&self.endpoint_type, Color::Magenta),
+            "Ollama" => (&self.endpoint_type, Color::Green),
+            "Offline" => (&self.endpoint_type, Color::Gray),
+            _ => (&self.endpoint_type, Color::Yellow),
+        };
+
         let header_line = Line::from(vec![
             Span::raw("🌷 "),
             Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" | {} | {} | {}", connection_status, self.config.model, context_indicator)),
+            Span::raw(" | "),
+            Span::raw(connection_status),
+            Span::raw(" | "),
+            Span::raw(&self.config.model),
+            Span::raw(" | "),
+            Span::raw(&context_indicator),
+            Span::raw(" | "),
+            Span::styled(format!("[{}]", endpoint_display), Style::default().fg(endpoint_color)),
         ]);
 
         let header = Paragraph::new(header_line)
@@ -5171,7 +5195,8 @@ impl App {
                 self.config.endpoint = endpoint.to_string();
                 let _ = self.config.save();
                 self.ollama_client = Some(client);
-                self.notify(format!("✅ Endpoint changed to {}", endpoint));
+                self.endpoint_type = crate::ollama::detect_endpoint_type(&self.config.endpoint);
+                self.notify(format!("✅ Endpoint changed to {} [{}]", endpoint, self.endpoint_type));
             }
             Err(e) => {
                 self.notify(format!("❌ Failed to connect to {}: {}", endpoint, e));
@@ -5227,6 +5252,7 @@ impl App {
                         Ok(client) => {
                             client.fetch_native_ctx().await;
                             self.config = fresh_config;
+                            self.endpoint_type = crate::ollama::detect_endpoint_type(&self.config.endpoint);
                             self.ollama_client = Some(client);
                             self.notify(format!("🌸 Switched to model: {}", self.config.model));
                         }
@@ -5236,7 +5262,8 @@ impl App {
                     }
                 } else if endpoint_changed {
                     self.config = fresh_config;
-                    self.notify(format!("🔄 Endpoint changed to {}", self.config.endpoint));
+                    self.endpoint_type = crate::ollama::detect_endpoint_type(&self.config.endpoint);
+                    self.notify(format!("🔄 Endpoint changed to {} [{}]", self.config.endpoint, self.endpoint_type));
                 } else {
                     // Silent reload — config didn't meaningfully change
                     self.config = fresh_config;

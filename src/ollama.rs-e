@@ -50,8 +50,11 @@ pub fn detect_api_format(endpoint: &str) -> ApiFormat {
         || lower.contains("/v1")
     {
         ApiFormat::OpenAI
-    } else if lower.contains("localhost:8080") || lower.contains("127.0.0.1:8080") {
-        // Only treat port 8080 as llama.cpp (its default); other ports are Ollama
+    } else if lower.contains("localhost:8080")
+        || lower.contains("127.0.0.1:8080")
+        || (lower.contains("localhost:") && !lower.contains("/v1") && !lower.contains("/api"))
+        || (lower.contains("127.0.0.1:") && !lower.contains("/v1") && !lower.contains("/api"))
+    {
         ApiFormat::LlamaCpp
     } else {
         ApiFormat::Ollama
@@ -1052,64 +1055,19 @@ impl OllamaClient {
                     .map(|m| format!("{}: {}", m.role, m.content))
                     .collect::<Vec<_>>()
                     .join("\n");
+                let request = LlamaCppRequest {
+                    prompt,
+                    n_predict: params.num_predict,
+                    stream: true,
+                    temperature: params.temperature,
+                    top_p: params.top_p,
+                };
                 let url = format!("{}/completion", endpoint.trim_end_matches('/'));
                 let client = self.http_client.clone();
                 tokio::spawn(async move {
-                    let request = serde_json::json!({
-                        "prompt": prompt,
-                        "stream": true,
-                        "n_predict": params.num_predict.unwrap_or(1024),
-                    });
-                    let response = match client.post(&url).json(&request).send().await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let _ = tx.send(StreamEvent::Error(format!("llama.cpp request failed: {}", e)));
-                            return;
-                        }
-                    };
-                    if !response.status().is_success() {
-                        let _ = tx.send(StreamEvent::Error(format!("llama.cpp returned {}", response.status())));
-                        return;
-                    }
-                    use futures_util::StreamExt;
-                    let mut stream = response.bytes_stream();
-                    let mut buffer = String::new();
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
-                                    if line.is_empty() { continue; }
-                                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
-                                        if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
-                                            if !content.is_empty() {
-                                                if tx.send(StreamEvent::Token(content.to_string())).is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        if obj.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            let _ = tx.send(StreamEvent::Done {
-                                                prompt_tokens: 0,
-                                                gen_tokens: 0,
-                                                had_thinking: false,
-                                                eval_duration_ns: None,
-                                                context_trimmed,
-                                                msgs_dropped,
-                                            });
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(StreamEvent::Error(format!("llama.cpp stream error: {}", e)));
-                                return;
-                            }
-                        }
-                    }
+                    stream_llamacpp(client, url, request, tx, context_trimmed, msgs_dropped).await;
+                });
+            }
                     let _ = tx.send(StreamEvent::Done {
                         prompt_tokens: 0,
                         gen_tokens: 0,
@@ -1228,22 +1186,82 @@ impl OllamaClient {
                 });
             }
             Backend::LlamaCpp { endpoint } => {
-                let prompt = messages
-                    .iter()
-                    .map(|m| format!("{}: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let request = LlamaCppRequest {
-                    prompt,
-                    n_predict: params.num_predict,
-                    stream: true,
-                    temperature: params.temperature,
-                    top_p: params.top_p,
+                // For llama.cpp stream_messages, convert to text prompt
+                let prompt = if messages.is_empty() {
+                    "".to_string()
+                } else {
+                    messages
+                        .iter()
+                        .map(|m| format!("{}: {}", m.role, m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 };
                 let url = format!("{}/completion", endpoint.trim_end_matches('/'));
                 let client = self.http_client.clone();
                 tokio::spawn(async move {
-                    stream_llamacpp(client, url, request, tx, false, 0).await;
+                    let request = serde_json::json!({
+                        "prompt": prompt,
+                        "stream": true,
+                        "n_predict": params.ctx_size.unwrap_or(1024),
+                    });
+                    let response = match client.post(&url).json(&request).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = tx.send(StreamEvent::Error(format!("llama.cpp request failed: {}", e)));
+                            return;
+                        }
+                    };
+                    if !response.status().is_success() {
+                        let _ = tx.send(StreamEvent::Error(format!("llama.cpp returned {}", response.status())));
+                        return;
+                    }
+                    use futures_util::StreamExt;
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(bytes) => {
+                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                while let Some(newline_pos) = buffer.find('\n') {
+                                    let line = buffer[..newline_pos].trim().to_string();
+                                    buffer = buffer[newline_pos + 1..].to_string();
+                                    if line.is_empty() { continue; }
+                                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
+                                        if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                                            if !content.is_empty() {
+                                                if tx.send(StreamEvent::Token(content.to_string())).is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        if obj.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            let _ = tx.send(StreamEvent::Done {
+                                                prompt_tokens: 0,
+                                                gen_tokens: 0,
+                                                had_thinking: false,
+                                                eval_duration_ns: None,
+                                                context_trimmed: false,
+                                                msgs_dropped: 0,
+                                            });
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamEvent::Error(format!("llama.cpp stream error: {}", e)));
+                                return;
+                            }
+                        }
+                    }
+                    let _ = tx.send(StreamEvent::Done {
+                        prompt_tokens: 0,
+                        gen_tokens: 0,
+                        had_thinking: false,
+                        eval_duration_ns: None,
+                        context_trimmed: false,
+                        msgs_dropped: 0,
+                    });
                 });
             }
         }
@@ -1317,35 +1335,32 @@ impl OllamaClient {
                 Ok(choice.message.content)
             }
             Backend::LlamaCpp { endpoint } => {
-                let prompt = ollama_messages
-                    .iter()
-                    .map(|m| format!("{}: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let request = LlamaCppRequest {
-                    prompt,
-                    n_predict: params.num_predict,
-                    stream: false,
-                    temperature: params.temperature,
-                    top_p: params.top_p,
+                let prompt = if ollama_messages.is_empty() {
+                    "".to_string()
+                } else {
+                    ollama_messages
+                        .iter()
+                        .map(|m| format!("{}: {}", m.role, m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 };
                 let url = format!("{}/completion", endpoint.trim_end_matches('/'));
-                let response = self.http_client.post(&url)
-                    .header("Content-Type", "application/json")
-                    .json(&request)
-                    .send().await
+                let request = serde_json::json!({
+                    "prompt": prompt,
+                    "stream": false,
+                    "n_predict": params.ctx_size.unwrap_or(1024),
+                });
+                let response = self.http_client.post(&url).json(&request).send().await
                     .map_err(|e| anyhow!("Failed to send request to llama.cpp at {}: {}", endpoint, e))?;
                 if !response.status().is_success() {
                     return Err(anyhow!("llama.cpp returned error: {}", response.status()));
                 }
-                #[derive(Deserialize)]
-                struct LlamaCppResp {
-                    #[serde(default)]
-                    content: String,
-                }
-                let data: LlamaCppResp = response.json().await
+                let data: serde_json::Value = response.json().await
                     .map_err(|e| anyhow!("Failed to parse llama.cpp response: {}", e))?;
-                Ok(data.content)
+                let content = data.get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(content.to_string())
             }
         }
     }
@@ -1416,19 +1431,10 @@ impl OllamaClient {
                 })
             }
             Backend::LlamaCpp { endpoint } => {
-                let prompt = messages
-                    .iter()
-                    .map(|m| format!("{}: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let request = LlamaCppRequest {
-                    prompt,
-                    n_predict: params.num_predict,
-                    stream: false,
-                    temperature: params.temperature,
-                    top_p: params.top_p,
-                };
-                let url = format!("{}/completion", endpoint.trim_end_matches('/'));
+                let mut request = build_openai_request(model, messages, params);
+                request.stream = false;
+                request.stream_options = None;
+                let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
                 let response = self.http_client.post(&url)
                     .header("Content-Type", "application/json")
                     .json(&request)
@@ -1441,17 +1447,20 @@ impl OllamaClient {
                         response.text().await.unwrap_or_default()
                     ));
                 }
-                #[derive(Deserialize)]
-                struct LlamaCppResp {
-                    #[serde(default)]
-                    content: String,
-                }
-                let data: LlamaCppResp = response.json().await
+                let data: OAINonStreamResponse = response.json().await
                     .map_err(|e| anyhow!("Failed to parse llama.cpp response: {}", e))?;
+                let choice = data.choices.into_iter().next()
+                    .ok_or_else(|| anyhow!("llama.cpp returned no choices"))?;
+                let content = choice.message.content;
+                let thinking = choice.message.reasoning_content.unwrap_or_default();
                 Ok(GenerateResponse {
                     message: OllamaMessage {
                         role: "assistant".to_string(),
-                        content: data.content,
+                        content: if thinking.is_empty() {
+                            content
+                        } else {
+                            format!("<think>{}</think>{}", thinking, content)
+                        },
                     },
                 })
             }
