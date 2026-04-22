@@ -1,0 +1,126 @@
+warning: methods `record_inference` and `format_status_bar` are never used
+   --> src/metrics.rs:32:12
+    |
+ 16 | impl MetricsTracker {
+    | ------------------- methods in this implementation
+...
+ 32 |     pub fn record_inference(&mut self, tokens: u64, ...
+    |            ^^^^^^^^^^^^^^^^
+...
+141 |     pub fn format_status_bar(&self) -> String {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: `yggdra` (bin "yggdra") generated 35 warnings (33 duplicates)
+warning: `yggdra` (bin "yggdra-shell") generated 35 warnings (15 duplicates)
+    Finished `release` profile [optimized] target(s) in 57.90s
+     Removed 26695 files, 5.0GiB total
+
+real	0m57.929s
+user	2m1.066s
+sys	0m9.172s
+--- changes ---
+diff --git a/.yggdra/stats.json b/.yggdra/stats.json
+index 093f2150..282c6a96 100644
+--- a/.yggdra/stats.json
++++ b/.yggdra/stats.json
+@@ -1,12 +1,23 @@
+ {
+-  "tools": {},
+-  "llm_requests": 0,
+-  "prompt_tokens": 0,
+-  "gen_tokens": 0,
++  "tools": {
++    "readfile": {
++      "calls": 1,
++      "failures": 0,
++      "output_bytes": 11323
++    },
++    "think": {
++      "calls": 2,
++      "failures": 0,
++      "output_bytes": 32
++    }
++  },
++  "llm_requests": 6,
++  "prompt_tokens": 44288,
++  "gen_tokens": 3435,
+   "avg_tok_per_s_x100": 0,
+-  "sessions": 3,
+-  "last_active_unix": 1776851450,
+-  "uptime_seconds": 0,
++  "sessions": 7,
++  "last_active_unix": 1776879671,
++  "uptime_seconds": 195,
+   "context_trims": 0,
+   "compressions": 0
+ }
+\ No newline at end of file
+diff --git a/src/main.rs b/src/main.rs
+index 5041e8d4..0306eaf1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
+             "--ask"        => mode_override = Some(AppMode::Ask),
+             "--build"      => mode_override = Some(AppMode::Build),
+             "--plan"       => mode_override = Some(AppMode::Plan),
+-            "--one"        => { mode_override = Some(AppMode::One); shell_only = false; }
++            "--one"        => mode_override = Some(AppMode::One),
+             "--shell-only" => shell_only = true,
+             "--standard"   => shell_only = false,
+             "--help" | "-h" => {
+diff --git a/src/ui.rs b/src/ui.rs
+index 5459d450..7d75961c 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -1478,9 +1478,10 @@ impl App {
+             // Handle any tellhuman messages — show in chat + fire OS notification
+             for call in &tool_calls {
+                 if let Some(msg) = &call.tellhuman {
+-                    self.push_system_event(format!("💬 {}", msg));
+-                    let msg_owned = msg.clone();
+-                    tokio::spawn(async move { crate::notifications::agent_says(&msg_owned).await; });
++                    let task_summary = self.task_summary();
++                    let formatted_msg = format!("[{}] {}", task_summary, msg);
++                    self.push_system_event(format!("💬 {}", &formatted_msg));
++                    tokio::spawn(async move { crate::notifications::agent_says(&formatted_msg).await; });
+                 }
+             }
+ 
+@@ -2523,6 +2524,37 @@ impl App {
+         }
+     }
+ 
++    /// Extract a 3-word summary of the current task for notifications.
++    fn task_summary(&self) -> String {
++        let messages = match self.message_buffer.messages() {
++            Ok(m) => m,
++            Err(_) => return "Task complete".to_string(),
++        };
++        let task = messages.iter().find(|m| {
++            m.role == "user"
++                && !m.content.starts_with("[TOOL_OUTPUT:")
++                && !m.content.starts_with("[TOOL_ERROR:")
++                && !m.content.starts_with("[ASYNC_RESULT:")
++                && !m.content.trim().is_empty()
++        });
++        match task {
++            None => "Task complete".to_string(),
++            Some(m) => {
++                // Split into words, take first 3, filter out empty
++                let words: Vec<&str> = m.content
++                    .split_whitespace()
++                    .filter(|w| !w.starts_with('[') && !w.starts_with('('))
++                    .take(3)
++                    .collect();
++                if words.is_empty() {
++                    "Task complete".to_string()
++                } else {
++                    words.join(" ")
++                }
++            }
++        }
++    }
++
+     /// Last N tool result messages (TOOL_OUTPUT or TOOL_ERROR), formatted compactly.
+     /// command truncated at 80 chars, result at 200 chars.
+     fn last_actions_block(&self, n: usize) -> String {

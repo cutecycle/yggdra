@@ -1478,9 +1478,10 @@ impl App {
             // Handle any tellhuman messages — show in chat + fire OS notification
             for call in &tool_calls {
                 if let Some(msg) = &call.tellhuman {
-                    self.push_system_event(format!("💬 {}", msg));
-                    let msg_owned = msg.clone();
-                    tokio::spawn(async move { crate::notifications::agent_says(&msg_owned).await; });
+                    let task_summary = self.task_summary();
+                    let formatted_msg = format!("[{}] {}", task_summary, msg);
+                    self.push_system_event(format!("💬 {}", &formatted_msg));
+                    tokio::spawn(async move { crate::notifications::agent_says(&formatted_msg).await; });
                 }
             }
 
@@ -2519,6 +2520,37 @@ impl App {
                 let s: String = m.content.chars().take(150).collect();
                 let ellipsis = if m.content.chars().count() > 150 { "…" } else { "" };
                 format!("TASK: {}{}\n", s.replace('\n', " "), ellipsis)
+            }
+        }
+    }
+
+    /// Extract a 3-word summary of the current task for notifications.
+    fn task_summary(&self) -> String {
+        let messages = match self.message_buffer.messages() {
+            Ok(m) => m,
+            Err(_) => return "Task complete".to_string(),
+        };
+        let task = messages.iter().find(|m| {
+            m.role == "user"
+                && !m.content.starts_with("[TOOL_OUTPUT:")
+                && !m.content.starts_with("[TOOL_ERROR:")
+                && !m.content.starts_with("[ASYNC_RESULT:")
+                && !m.content.trim().is_empty()
+        });
+        match task {
+            None => "Task complete".to_string(),
+            Some(m) => {
+                // Split into words, take first 3, filter out empty
+                let words: Vec<&str> = m.content
+                    .split_whitespace()
+                    .filter(|w| !w.starts_with('[') && !w.starts_with('('))
+                    .take(3)
+                    .collect();
+                if words.is_empty() {
+                    "Task complete".to_string()
+                } else {
+                    words.join(" ")
+                }
             }
         }
     }

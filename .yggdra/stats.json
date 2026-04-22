@@ -1,12 +1,33 @@
 {
-  "tools": {},
-  "llm_requests": 0,
-  "prompt_tokens": 0,
-  "gen_tokens": 0,
+  "tools": {
+    "readfile": {
+      "calls": 1,
+      "failures": 0,
+      "output_bytes": 11323
+    },
+    "think": {
+      "calls": 2,
+      "failures": 0,
+      "output_bytes": 32
+    },
+    "__batch__": {
+      "calls": 11,
+      "failures": 0,
+      "output_bytes": 35654
+    },
+    "shell": {
+      "calls": 30,
+      "failures": 0,
+      "output_bytes": 168428
+    }
+  },
+  "llm_requests": 51,
+  "prompt_tokens": 694366,
+  "gen_tokens": 24846,
   "avg_tok_per_s_x100": 0,
-  "sessions": 3,
-  "last_active_unix": 1776851450,
-  "uptime_seconds": 0,
+  "sessions": 8,
+  "last_active_unix": 1776880527,
+  "uptime_seconds": 1312,
   "context_trims": 0,
   "compressions": 0
 }

@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
             "--ask"        => mode_override = Some(AppMode::Ask),
             "--build"      => mode_override = Some(AppMode::Build),
             "--plan"       => mode_override = Some(AppMode::Plan),
-            "--one"        => { mode_override = Some(AppMode::One); shell_only = false; }
+            "--one"        => mode_override = Some(AppMode::One),
             "--shell-only" => shell_only = true,
             "--standard"   => shell_only = false,
             "--help" | "-h" => {
