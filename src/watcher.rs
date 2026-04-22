@@ -1,7 +1,7 @@
 /// Filesystem watcher module for monitoring configuration and agent changes
 ///
-/// Watches `.yggdra/config.json` and `AGENTS.md` for modifications and emits
-/// change notifications through an mpsc channel.
+/// Watches `.yggdra/config.json`, `AGENTS.md` (cwd), and `~/AGENTS.md` for
+/// modifications and emits change notifications through an mpsc channel.
 
 use notify::{Watcher, RecursiveMode};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,7 @@ pub fn spawn_watcher(
     let (tx, rx) = mpsc::unbounded_channel();
     let config_path = cwd.join(".yggdra").join("config.json");
     let agents_path = cwd.join("AGENTS.md");
+    let global_agents_path = dirs::home_dir().map(|h| h.join("AGENTS.md"));
 
     let tx = std::sync::Arc::new(Mutex::new(tx));
     let debounce = std::sync::Arc::new(Mutex::new(DebounceState::new(500)));
@@ -89,6 +90,7 @@ pub fn spawn_watcher(
         let debounce = std::sync::Arc::clone(&debounce);
         let config_path = config_path.clone();
         let agents_path = agents_path.clone();
+        let global_agents_path = global_agents_path.clone();
         let cwd = cwd.clone();
 
         move || {
@@ -121,6 +123,15 @@ pub fn spawn_watcher(
                 eprintln!("Failed to watch cwd: {}", e);
             }
 
+            // Watch ~/AGENTS.md for global instructions changes
+            if let Some(ref global_path) = global_agents_path {
+                if let Some(home_dir) = global_path.parent() {
+                    if let Err(e) = watcher.watch(home_dir, RecursiveMode::NonRecursive) {
+                        eprintln!("Failed to watch home dir for AGENTS.md: {}", e);
+                    }
+                }
+            }
+
             // Process watch events
             for event_result in watcher_rx.iter() {
                 match event_result {
@@ -139,7 +150,9 @@ pub fn spawn_watcher(
                                         }
                                     }
                                     // Check if this is our agents file
-                                    else if path == agents_path {
+                                    else if path == agents_path
+                                        || global_agents_path.as_deref() == Some(path.as_path())
+                                    {
                                         let mut debounce = debounce.lock().unwrap();
                                         if debounce.should_emit(&path) {
                                             if let Ok(tx) = tx.lock() {

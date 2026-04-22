@@ -5,6 +5,15 @@ All notable changes to Yggdra will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-21
+
+### Added
+
+- Global `~/AGENTS.md` support: loaded on every startup and prepended to the
+  project-local `AGENTS.md`. Both files are live-watched — edits apply without
+  restart. Useful for personal preferences, persona, or cross-project constraints.
+- `merge_agents_md()` helper in the library crate with 4 unit tests.
+
 ## [0.2.0] - 2026-04-21
 
 ### Added

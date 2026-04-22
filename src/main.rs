@@ -162,10 +162,14 @@ async fn main() -> Result<()> {
     
     let session = Session::load_or_create()?;
 
-    // Load AGENTS.md from CWD if present
-    let agents_md = std::fs::read_to_string(cwd.join("AGENTS.md"))
+    // Load AGENTS.md: global ~/AGENTS.md first, then project-local appended
+    let global_agents = dirs::home_dir()
+        .and_then(|h| std::fs::read_to_string(h.join("AGENTS.md")).ok())
+        .filter(|c| !c.trim().is_empty());
+    let local_agents = std::fs::read_to_string(cwd.join("AGENTS.md"))
         .ok()
         .filter(|c| !c.trim().is_empty());
+    let agents_md = yggdra::merge_agents_md(global_agents, local_agents);
 
     // Reuse the client already validated during config load if the model matches,
     // otherwise create a fresh one.  Either way we avoid a second /api/tags round-trip.
@@ -202,3 +206,4 @@ async fn main() -> Result<()> {
 
     result
 }
+

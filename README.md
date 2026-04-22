@@ -160,6 +160,23 @@ export OLLAMA_MODEL=qwen3:8b
 yggdra --build
 ```
 
+### Global agent instructions
+
+Create `~/AGENTS.md` to define your personal preferences, persona, or
+constraints that apply across **every** project:
+
+```markdown
+# My global instructions
+
+- Prefer short, direct answers
+- Always write tests for Rust code
+- My name is Nina — address me by name
+```
+
+When yggdra starts, it reads `~/AGENTS.md` first, then appends the
+project-local `AGENTS.md` (if any) after a `# --- project AGENTS.md ---`
+separator. Both files are watched live — edits are picked up without restart.
+
 ### OpenAI-compatible endpoints (OpenRouter, etc.)
 
 Yggdra speaks Ollama's API by default but works with any OpenAI-compatible
