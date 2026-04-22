@@ -625,7 +625,7 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
         const UNIX_COMMANDS: &[&str] = &[
             "cat", "ls", "grep", "find", "head", "tail", "echo", "mkdir", "rm",
             "mv", "cp", "touch", "chmod", "chown", "wc", "sort", "uniq", "cut",
-            "awk", "sed", "rg", "fd", "curl", "wget", "python", "python3", "node",
+            "awk", "sed", "rg", "fd", "python", "python3", "node",
             "cargo", "git", "make", "jq", "bat", "tree", "sh", "bash",
         ];
         let (tool_name, remap_prefix): (String, Option<String>) =
