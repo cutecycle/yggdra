@@ -1,0 +1,22 @@
+# Normalize line endings for cross-platform consistency.
+# This ensures vendor files keep LF on Windows checkout,
+# so cargo checksum verification doesn't fail (checksums are computed on LF content).
+* text=auto eol=lf
+
+# Binary files must never be converted
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.mp4 binary
+*.webm binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.tgz binary
