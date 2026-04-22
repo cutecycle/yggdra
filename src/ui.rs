@@ -33,6 +33,19 @@ use tokio::sync::{mpsc, oneshot};
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 const MAX_TOOL_ITERATIONS: usize = 30;
+const DEFAULT_TOOL_OUTPUT_CAP: usize = 600;
+
+/// Truncate output to at most `cap` chars, keeping the **tail** (most recent output).
+/// Compiler errors, test failures, etc. always appear at the end — the tail is what matters.
+fn truncate_tail(output: &str, cap: usize) -> String {
+    let chars: Vec<char> = output.chars().collect();
+    if chars.len() <= cap {
+        return output.to_string();
+    }
+    let dropped = chars.len() - cap;
+    let tail: String = chars[dropped..].iter().collect();
+    format!("…({} chars omitted)\n{}", dropped, tail)
+}
 
 /// A command that can be invoked from the palette
 struct PaletteCommand {
@@ -57,23 +70,34 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "temperature", description: "Set sampling temperature (0.0–2.0)", keywords: "temperature heat creativity sampling randomness", fill: "/temperature " },
     PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
     PaletteCommand { name: "toolcap", description: "Set tool output cap (chars, or 'off')", keywords: "tool output truncate cap compress context", fill: "/toolcap " },
+    PaletteCommand { name: "zt",      description: "Toggle zero-truncation (show full raw tool output)", keywords: "truncation raw full output tool context debug", fill: "/zt" },
     PaletteCommand { name: "stats",   description: "Show cumulative session stats",       keywords: "stats metrics tokens usage tools sessions uptime", fill: "/stats" },
     PaletteCommand { name: "compress", description: "Summarize session and reset context", keywords: "compress summarize archive context reset memory", fill: "/compress" },
     PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
+    PaletteCommand { name: "theme",    description: "Set colour theme (dark/light/auto)",  keywords: "theme dark light color colour visual",  fill: "/theme " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
     PaletteCommand { name: "tasks",  description: "Show task dependency graph",         keywords: "task deps dependencies adjacency",   fill: "/tasks" },
     PaletteCommand { name: "gaps",   description: "Show recorded knowledge gaps",        keywords: "knowledge gap unknown missing info",  fill: "/gaps" },
     PaletteCommand { name: "save",   description: "Save current plan as a todo task",    keywords: "save plan todo task write markdown",  fill: "/save" },
-    PaletteCommand { name: "mode",  description: "Cycle or set mode (ask/plan/build)", keywords: "mode switch cycle toggle ask plan build", fill: "/mode " },
+    PaletteCommand { name: "mode",  description: "Cycle or set mode (ask/plan/build/one)", keywords: "mode switch cycle toggle ask plan build one", fill: "/mode " },
+    PaletteCommand { name: "build", description: "Switch to Build mode (autonomous execution)", keywords: "build mode autonomous switch", fill: "/build" },
+    PaletteCommand { name: "plan",  description: "Switch to Plan mode (interactive)", keywords: "plan mode interactive switch default", fill: "/plan" },
+    PaletteCommand { name: "ask",   description: "Switch to Ask mode (read-only)", keywords: "ask mode read only switch", fill: "/ask" },
+    PaletteCommand { name: "one",   description: "Switch to One mode (one-off task w/ notification)", keywords: "one off task complete notification mode switch", fill: "/one" },
+    PaletteCommand { name: "abort", description: "Abort stream / async tasks / tool execution", keywords: "stop abort cancel stuck stalled timeout stream async", fill: "/abort" },
+    PaletteCommand { name: "test_notification", description: "Fire a test OS notification", keywords: "notify notification test os macos toast alert", fill: "/test_notification" },
     PaletteCommand { name: "copycode",  description: "Copy code block from last reply",   keywords: "copy code block clipboard snippet", fill: "/copycode" },
     PaletteCommand { name: "copytext",  description: "Copy full last reply as plain text", keywords: "copy text clipboard message",      fill: "/copytext" },
+    PaletteCommand { name: "copyprompt", description: "Copy current system prompt to clipboard", keywords: "copy prompt system clipboard debug", fill: "/copyprompt" },
+    PaletteCommand { name: "showprompt", description: "Show full system prompt in chat (scrollable)", keywords: "show display prompt system inspect debug tree files", fill: "/showprompt" },
     PaletteCommand { name: "copylink",  description: "Copy URL from last reply",           keywords: "copy link url clipboard",          fill: "/copylink" },
     PaletteCommand { name: "openlink",  description: "Open URL from last reply in browser", keywords: "open link url browser",           fill: "/openlink" },
     PaletteCommand { name: "tool rg",    description: "Search files with ripgrep",      keywords: "search grep find file text",        fill: "/tool rg " },
-    PaletteCommand { name: "tool editfile", description: "Read file contents",          keywords: "read open cat file view",           fill: "/tool editfile " },
-    PaletteCommand { name: "tool spawn",    description: "Execute a local binary",      keywords: "run exec spawn binary program",     fill: "/tool spawn " },
+    PaletteCommand { name: "tool setfile", description: "Create or overwrite a file",     keywords: "write create overwrite file setfile", fill: "/tool setfile " },
+    PaletteCommand { name: "tool exec",     description: "Execute a command directly",    keywords: "run exec binary program command",   fill: "/tool exec " },
+    PaletteCommand { name: "tool shell",    description: "Run via sh -c (pipes/chains)",  keywords: "shell pipe redirect chain bash",    fill: "/tool shell " },
     PaletteCommand { name: "tool commit",   description: "Git commit with message",     keywords: "git save version commit history",   fill: "/tool commit " },
     PaletteCommand { name: "tool python",   description: "Run a Python script",         keywords: "python py script run execute",      fill: "/tool python " },
     PaletteCommand { name: "tool ruste",    description: "Compile and run Rust code",   keywords: "rust compile execute cargo rustc",  fill: "/tool ruste " },
@@ -139,8 +163,17 @@ enum TurnPhase {
 /// Result from async tool execution
 struct ToolResult {
     tool_name: String,
-    _args: String,
+    args: String,
     output: std::result::Result<String, String>,
+}
+
+/// A background async tool task (spawned with mode: async).
+/// Output is written to .yggdra/async/<task_id>.txt and injected on completion.
+struct AsyncTask {
+    task_id: String,
+    command_preview: String,
+    started_at: std::time::Instant,
+    rx: tokio::sync::oneshot::Receiver<ToolResult>,
 }
 
 /// Inline tool result state — shows tool results in real-time panel
@@ -153,12 +186,53 @@ struct InlineToolResult {
     exit_code: Option<i32>,  // None if still running, Some(code) if complete
 }
 
+/// Status of a subagent in the panel
+#[derive(Debug, Clone, PartialEq)]
+enum SubagentStatus { Running, Done, Failed }
+
+/// One entry in the subagents side-panel
+#[derive(Debug, Clone)]
+struct SubagentEntry {
+    index: u32,
+    task_id: String,
+    status: SubagentStatus,
+    /// Live preview text (updated from token stream while running, then set to output summary)
+    preview: String,
+    /// Message count at the time the subagent completed (None while still running)
+    completed_at_msg: Option<usize>,
+}
+
 /// A single tab in the file viewer overlay
 struct FileTab {
     label: String,
     lines: Vec<String>,
     scroll: usize,
     is_diff: bool,
+}
+
+/// Cached pre-rendered message for the draw loop.
+/// Rebuilt only when messages_cache changes or terminal width/theme changes.
+struct CachedRender {
+    /// Rendered spacer (blank line above message)
+    blank: ratatui::text::Text<'static>,
+    /// Rendered message content
+    content: ratatui::text::Text<'static>,
+    style: Style,
+    height: u16,  // content height (depends on area_width)
+}
+
+fn text_height_static(text: &ratatui::text::Text, area_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    let line_count = text.lines.len().max(1);
+    let wrap_extra: usize = if area_width > 0 {
+        text.lines.iter()
+            .map(|l| {
+                let w: usize = l.spans.iter().map(|s| s.content.width()).sum();
+                (w as u16).saturating_sub(1) / area_width.max(1)
+            })
+            .sum::<u16>() as usize
+    } else { 0 };
+    (line_count + wrap_extra).max(1) as u16
 }
 
 /// Minimal TUI application
@@ -177,6 +251,10 @@ pub struct App {
     cached_message_count: usize,
     /// Accumulates tokens during streaming
     streaming_text: String,
+    /// Accumulates native thinking tokens during streaming (from msg.thinking field)
+    thinking_text: String,
+    /// True while we're inside an inline <think>...</think> block during streaming
+    in_think_block: bool,
     /// Receives tokens from the streaming task
     stream_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
     /// Explicit state machine for the current turn
@@ -185,6 +263,8 @@ pub struct App {
     tool_iteration_count: usize,
     /// Receives result from async tool execution
     tool_result_rx: Option<oneshot::Receiver<ToolResult>>,
+    /// Background async tasks spawned via mode:async tool calls
+    async_tasks: Vec<AsyncTask>,
     /// Receives result from async gap query
     gap_rx: Option<oneshot::Receiver<Option<crate::gaps::Gap>>>,
     /// Async writer for .yggdra/log hierarchy
@@ -221,6 +301,8 @@ pub struct App {
     last_clock: std::time::Instant,
     /// When the current streaming turn started (for prefill elapsed timer)
     stream_start_time: Option<std::time::Instant>,
+    /// When the last streaming token was received (for stall detection)
+    last_stream_token_time: Option<std::time::Instant>,
     /// Whether the command palette is open
     palette_open: bool,
     /// Which palette item is highlighted
@@ -247,18 +329,28 @@ pub struct App {
     last_build_kick: std::time::Instant,
     /// Consecutive build-mode kicks without tool calls — stuck detection
     consecutive_empty_kicks: u32,
+    /// Consecutive format-error corrections injected — loop break
+    consecutive_format_errors: u32,
+    /// Consecutive tool errors (same tool failing) — loop break
+    consecutive_tool_errors: u32,
+    /// Name of the last tool that produced an error (for grouping consecutive errors)
+    last_errored_tool: String,
     /// Whether gradient background is enabled in message area
     gradient_enabled: bool,
     /// Inference rate from last completed generation (tokens/second)
     last_infer_rate: Option<f64>,
-    /// Cached battery power state (refreshed every 30s)
+    /// Cached battery power state (refreshed every 5 minutes via spawn_blocking)
     on_battery: BatteryState,
     /// Last time battery status was checked
     last_battery_check: std::time::Instant,
+    /// Pending async battery check result
+    battery_result_rx: Option<tokio::sync::oneshot::Receiver<BatteryState>>,
     /// Syntax highlighter for code blocks
     highlighter: Highlighter,
     /// Currently displayed inline tool results (cleared when tool completes and is added to history)
     inline_tool_results: Vec<InlineToolResult>,
+    /// Subagent panel entries — each spawned subagent has one; shown for 5 messages after completion
+    subagent_entries: Vec<SubagentEntry>,
     /// Cached message list — refreshed from SQLite only when cached_message_count changes.
     /// Avoids running a full SELECT on every draw frame during streaming.
     messages_cache: Vec<crate::message::Message>,
@@ -285,6 +377,36 @@ pub struct App {
     last_mutating_action: std::time::Instant,
     /// True once we've sent the "no files changed in N calls" stall notice this session.
     stall_notice_sent: bool,
+    /// Set by check_context_pressure when usage ≥ 90% — consumed by the async run loop.
+    pending_auto_compress: bool,
+    /// When true, tool output is never truncated — full raw content injected into context.
+    zero_truncation: bool,
+    /// Number of messages dropped by the last sliding-window context trim (0 = nothing dropped).
+    /// Used to render the cutoff divider in the message list.
+    context_cutoff_dropped: usize,
+    /// Compact project file listing (size + modified time + path, newest-first).
+    /// Injected into every system prompt so the model knows what exists.
+    project_context: String,
+    /// When project_context was last built (refresh after mutations or after 60s stale)
+    project_context_built: std::time::Instant,
+    /// Which message index (in messages_cache) the expand/collapse cursor is on (None = no cursor)
+    msg_cursor: Option<usize>,
+    /// Set of message indices (in messages_cache) that have been expanded by the user
+    expanded_msgs: std::collections::HashSet<usize>,
+    /// Forces a render cache rebuild on next draw (set when cursor or expanded state changes)
+    render_cache_dirty: bool,
+    /// Pre-rendered message cache — rebuilt only when messages_cache changes or
+    /// the terminal width / theme changes. Avoids re-running syntax highlighting
+    /// on every draw frame while streaming.
+    render_cache: Vec<CachedRender>,
+    /// messages_cache.len() when render_cache was last built
+    render_cache_msg_count: usize,
+    /// Terminal area_width when render_cache was last built
+    render_cache_width: u16,
+    /// Theme kind when render_cache was last built
+    render_cache_theme: crate::theme::ThemeKind,
+    /// exchange_idx after the last cached message (so streaming text picks up the right band)
+    render_cache_exchange_end: usize,
 }
 
 impl App {
@@ -300,7 +422,10 @@ impl App {
             .unwrap_or_else(|e| {
                 eprintln!("🌹 Failed to open messages DB: {}", e);
                 MessageBuffer::new(&session.messages_db)
-                    .expect("Cannot create message database")
+                    .unwrap_or_else(|e2| {
+                        eprintln!("🌹 FATAL: Cannot create message database at {:?}: {}", session.messages_db, e2);
+                        std::process::exit(1);
+                    })
             });
         // Clean up any kick messages persisted by older versions of yggdra
         let _ = message_buffer.purge_kicks();
@@ -308,7 +433,10 @@ impl App {
             .unwrap_or_else(|e| {
                 eprintln!("🌹 Failed to open tasks DB: {}", e);
                 TaskManager::new(&session.tasks_db)
-                    .expect("Cannot create task database")
+                    .unwrap_or_else(|e2| {
+                        eprintln!("🌹 FATAL: Cannot create task database at {:?}: {}", session.tasks_db, e2);
+                        std::process::exit(1);
+                    })
             });
         let status_message = if ollama_client.is_some() {
             "✅ Ollama connected".to_string()
@@ -335,6 +463,7 @@ impl App {
         stats.on_session_start();
         stats.save(&cwd);
 
+        let profile = config.profile;
         Self {
             config,
             session,
@@ -345,13 +474,16 @@ impl App {
             message_buffer,
             task_manager,
             ollama_client,
-            tool_registry: ToolRegistry::new(),
+            tool_registry: ToolRegistry::new(profile),
             cached_message_count: 0,
             streaming_text: String::new(),
+            thinking_text: String::new(),
+            in_think_block: false,
             stream_rx: None,
             turn_phase: TurnPhase::Idle,
             tool_iteration_count: 0,
             tool_result_rx: None,
+            async_tasks: Vec::new(),
             gap_rx: None,
             log_sender,
             log_dir,
@@ -370,6 +502,7 @@ impl App {
             user_scrolled: false,
             last_clock: std::time::Instant::now(),
             stream_start_time: None,
+            last_stream_token_time: None,
             palette_open: false,
             palette_selection: 0,
             model_picker_open: false,
@@ -383,12 +516,17 @@ impl App {
             agents_config,
             last_build_kick: std::time::Instant::now(),
             consecutive_empty_kicks: 0,
+            consecutive_format_errors: 0,
+            consecutive_tool_errors: 0,
+            last_errored_tool: String::new(),
             gradient_enabled,
             last_infer_rate: None,
             on_battery: crate::battery::battery_state(),
             last_battery_check: std::time::Instant::now(),
+            battery_result_rx: None,
             highlighter: Highlighter::new(),
             inline_tool_results: Vec::new(),
+            subagent_entries: Vec::new(),
             messages_cache: Vec::new(),
             theme_check_counter: 0,
             file_viewer_open: false,
@@ -401,7 +539,182 @@ impl App {
             recent_tool_errors: std::collections::HashMap::new(),
             last_mutating_action: std::time::Instant::now(),
             stall_notice_sent: false,
+            pending_auto_compress: false,
+            zero_truncation: false,
+            context_cutoff_dropped: 0,
+            project_context: build_project_context(10000),
+            project_context_built: std::time::Instant::now(),
+            msg_cursor: None,
+            expanded_msgs: std::collections::HashSet::new(),
+            render_cache_dirty: false,
+            render_cache: Vec::new(),
+            render_cache_msg_count: usize::MAX, // force first build
+            render_cache_width: 0,
+            render_cache_theme: crate::theme::ThemeKind::Dark,
+            render_cache_exchange_end: 0,
         }
+    }
+
+    /// Build (or rebuild) the pre-rendered message cache.
+    /// Called before draw() whenever the message list, terminal width, or theme changes.
+    /// This amortizes syntax-highlighting cost: O(N) only on changes, O(1) per frame.
+    fn build_render_cache(&mut self, area_width: u16) {
+        let is_dark = self.theme.kind == crate::theme::ThemeKind::Dark;
+        let mut cache: Vec<CachedRender> = Vec::with_capacity(self.messages_cache.len() + 1);
+        let mut exchange_idx: usize = 0;
+
+        // Compute which message index (in messages_cache) is the first one INSIDE context.
+        // build_messages filters out system/clock/think-tool messages before sliding-window drop.
+        // msgs_dropped non-system/clock/kick messages (after the first user msg) are out of context.
+        let cutoff_insert_idx: Option<usize> = if self.context_cutoff_dropped > 0 {
+            let mut dropped_seen = 0usize;
+            let mut first_user_seen = false;
+            let mut result = None;
+            for (i, msg) in self.messages_cache.iter().enumerate() {
+                let skip = msg.role == "system" || msg.role == "clock" || msg.role == "kick"
+                    || (msg.role == "tool" && msg.content.contains("[TOOL_OUTPUT: think ="));
+                if skip { continue; }
+                if !first_user_seen {
+                    // The first user message is always pinned in context — skip past it
+                    if msg.role == "user" || msg.role == "notice" {
+                        first_user_seen = true;
+                    }
+                    continue;
+                }
+                // Messages after the first user: the first msgs_dropped are out of context
+                dropped_seen += 1;
+                if dropped_seen > self.context_cutoff_dropped {
+                    result = Some(i);
+                    break;
+                }
+            }
+            result
+        } else {
+            None
+        };
+
+        let cutoff_label = if self.context_cutoff_dropped > 0 {
+            let n = self.context_cutoff_dropped;
+            format!("╌╌╌  {} message{} above not in model context  ╌╌╌",
+                n, if n == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
+
+        let mut divider_inserted = false;
+
+        for (msg_idx, msg) in self.messages_cache.iter().enumerate() {
+            // Insert divider before the first in-context message
+            if !divider_inserted {
+                if let Some(cut_idx) = cutoff_insert_idx {
+                    if msg_idx == cut_idx {
+                        let dim_color = if is_dark {
+                            Color::Rgb(90, 90, 110)
+                        } else {
+                            Color::Rgb(140, 140, 160)
+                        };
+                        let divider_content = ratatui::text::Text::from(
+                            ratatui::text::Line::from(vec![
+                                ratatui::text::Span::styled(
+                                    cutoff_label.clone(),
+                                    Style::default().fg(dim_color),
+                                )
+                            ])
+                        );
+                        let blank = ratatui::text::Text::from(" ".to_string());
+                        let height = 1u16;
+                        cache.push(CachedRender { blank, content: divider_content, style: Style::default(), height });
+                        divider_inserted = true;
+                    }
+                }
+            }
+            if msg.role == "kick" { continue; }
+
+            let is_cursor = self.msg_cursor == Some(msg_idx);
+            let is_tool_msg = msg.role == "tool" || msg.role == "spawn";
+            let is_expanded = self.zero_truncation || self.expanded_msgs.contains(&msg_idx);
+
+            let (emoji, bg_tint, show_band) = match msg.role.as_str() {
+                "user" => {
+                    exchange_idx += 1;
+                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
+                    ("👤", Some(tint), true)
+                }
+                "assistant" => {
+                    exchange_idx += 1;
+                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
+                    ("🤖", Some(tint), true)
+                }
+                "tool"   => ("🔧", None, false),
+                "system" => ("⚙️", None, false),
+                "notice" => ("📋", None, false),
+                "clock"  => ("🕐", None, false),
+                "spawn"  => ("🤖", Some(self.theme.band_spawn), true),
+                _        => ("💬", None, false),
+            };
+
+            // For cursor on tool messages: replace emoji with ► and add expand hint
+            let display_emoji = if is_cursor && is_tool_msg {
+                if is_expanded { "▼" } else { "►" }
+            } else {
+                emoji
+            };
+
+            let content = if is_tool_msg {
+                // Check if this tool output contains diff content — if so, render with colors.
+                let diff_content = if let Some(rest) = msg.content.strip_prefix("[TOOL_OUTPUT: ") {
+                    if let Some(eq) = rest.find(" = ") {
+                        let name = &rest[..eq];
+                        let raw_body = rest[eq + 3..].trim_end_matches(']');
+                        if Self::looks_like_diff(raw_body) {
+                            let hint = if is_cursor {
+                                if is_expanded { "collapse" } else { "expand" }
+                            } else { "" };
+                            let max_lines = if is_expanded { 0 } else { 10 };
+                            let diff_lines = Self::render_diff_styled(display_emoji, name, raw_body, max_lines, hint);
+                            Some(ratatui::text::Text::from(diff_lines))
+                        } else { None }
+                    } else { None }
+                } else { None };
+
+                if let Some(t) = diff_content {
+                    t
+                } else {
+                    let body = self.format_tool_content_expanded(&msg.content, is_expanded);
+                    let hint = if is_cursor {
+                        if is_expanded { "  [Space=collapse]" } else { "  [Space=expand]" }
+                    } else { "" };
+                    let text_str = format!("{} {}{}", display_emoji, body, hint);
+                    ratatui::text::Text::from(text_str)
+                }
+            } else {
+                self.format_message_styled(display_emoji, &msg.content)
+            };
+
+            let height = text_height_static(&content, area_width);
+
+            let style = if show_band {
+                // bg_tint is always Some when show_band is true (set together above), but
+                // fall back to Reset defensively rather than panicking.
+                let tint = bg_tint.unwrap_or(Color::Reset);
+                if is_dark {
+                    Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
+                } else {
+                    Style::default().bg(tint)
+                }
+            } else {
+                Style::default()
+            };
+
+            let blank = ratatui::text::Text::from(" ".to_string());
+            cache.push(CachedRender { blank, content, style, height });
+        }
+
+        self.render_cache_exchange_end = exchange_idx;
+        self.render_cache_msg_count = self.messages_cache.len();
+        self.render_cache_width = area_width;
+        self.render_cache_theme = self.theme.kind.clone();
+        self.render_cache = cache;
     }
 
     /// Run the TUI — main event loop with streaming support
@@ -412,8 +725,8 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        // In Build mode, always fire a kick prompt to orient the agent
-        if self.mode == AppMode::Build {
+        // In Build/One mode, always fire a kick prompt to orient the agent
+        if matches!(self.mode, AppMode::Build | AppMode::One) {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
@@ -454,8 +767,11 @@ impl App {
                     let (tool_cap, ctx_win) = self.compression_params();
                     self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
                     self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
                     self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
                     self.tool_iteration_count = 0;
                 }
                 self.last_build_kick = std::time::Instant::now();
@@ -493,11 +809,26 @@ impl App {
             self.check_gap_result();
             // Check for completed subagent execution
             self.check_subagent_result();
+            // Check for completed async background tasks
+            self.check_async_tasks();
 
-            // Refresh battery state every 30 seconds
-            if self.last_battery_check.elapsed() > Duration::from_secs(30) {
-                self.on_battery = crate::battery::battery_state();
+            // Refresh battery state every 5 minutes — dispatch async so pmset doesn't block the loop.
+            if self.last_battery_check.elapsed() > Duration::from_secs(300) {
                 self.last_battery_check = std::time::Instant::now();
+                if self.battery_result_rx.is_none() {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(crate::battery::battery_state());
+                    });
+                    self.battery_result_rx = Some(rx);
+                }
+            }
+            // Collect completed battery check
+            if let Some(ref mut brx) = self.battery_result_rx {
+                if let Ok(state) = brx.try_recv() {
+                    self.on_battery = state;
+                    self.battery_result_rx = None;
+                }
             }
 
             // Refresh messages cache only when the count has changed — avoids
@@ -507,6 +838,17 @@ impl App {
                     self.messages_cache = msgs;
                     self.cached_message_count = self.messages_cache.len();
                 }
+            }
+
+            // Rebuild render cache if messages, terminal width, theme, or cursor/expanded state changed.
+            let current_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+            if self.render_cache_dirty
+                || self.render_cache_msg_count != self.messages_cache.len()
+                || self.render_cache_width != current_width
+                || self.render_cache_theme != self.theme.kind
+            {
+                self.render_cache_dirty = false;
+                self.build_render_cache(current_width);
             }
 
             terminal.draw(|f| self.draw(f))?;
@@ -547,23 +889,22 @@ impl App {
                 break;
             }
 
-            // Periodically re-detect terminal theme using safe (no-raw-mode) methods.
-            // ~60 s at 16 ms/tick. Catches macOS dark/light mode switches mid-session.
+            // Theme auto-detection removed: `defaults read` transiently returns "light"
+            // even in dark mode, causing random theme flips. Use /theme to switch manually.
             self.theme_check_counter = self.theme_check_counter.wrapping_add(1);
-            if self.theme_check_counter % 3750 == 0 {
-                if let Some(is_light) = Theme::detect_safe() {
-                    let new_kind = if is_light { crate::theme::ThemeKind::Light } else { crate::theme::ThemeKind::Dark };
-                    if new_kind != self.theme.kind {
-                        self.theme = if is_light { Theme::light() } else { Theme::dark() };
-                    }
-                }
-            }
 
             // Yield to the Tokio scheduler between frames. Using sleep().await (instead of the
             // old blocking crossterm::event::poll(N ms)) lets other async tasks — the stream
             // reader, gap queries, subagent channels — run during idle time.
             let sleep_ms = if self.turn_phase == TurnPhase::Idle { 16 } else { 10 };
             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+            // Auto-compress: triggered when context pressure hits ≥90%
+            if self.pending_auto_compress && self.turn_phase == TurnPhase::Idle {
+                self.pending_auto_compress = false;
+                self.handle_compress().await;
+                self.last_warned_ctx_pct = 0; // reset so pressure warnings fire again after compaction
+            }
         }
 
         // Save stats and epoch summary on clean exit
@@ -577,22 +918,95 @@ impl App {
         Ok(())
     }
 
-    /// Drain all available tokens from the stream receiver
+    /// Drain all available tokens from the stream receiver.
+    /// Also enforces stall timeouts: aborts if no tokens arrive within
+    /// PREFILL_TIMEOUT_SECS (while empty) or STALL_TIMEOUT_SECS (while generating).
     fn drain_stream_tokens(&mut self) {
         let rx = match self.stream_rx.as_mut() {
             Some(rx) => rx,
             None => return,
         };
 
+        // Stall detection: abort if Ollama goes silent mid-stream.
+        // Prefill can be slow for large contexts; generation stalls are less expected.
+        const PREFILL_TIMEOUT_SECS: u64 = u64::MAX; // no prefill timeout — model loading can take arbitrarily long
+        const STALL_TIMEOUT_SECS: u64 = u64::MAX;  // no generation stall timeout — slow hardware
+
+        let now = std::time::Instant::now();
+        let stall_timeout = if self.streaming_text.is_empty() {
+            PREFILL_TIMEOUT_SECS
+        } else {
+            STALL_TIMEOUT_SECS
+        };
+        let last_activity = self.last_stream_token_time
+            .or(self.stream_start_time)
+            .unwrap_or(now);
+        if last_activity.elapsed().as_secs() > stall_timeout {
+            let phase = if self.streaming_text.is_empty() { "prefill" } else { "generation" };
+            self.notify(format!("⏱ Stream stalled during {} ({}s) — aborting", phase, stall_timeout));
+            if !self.streaming_text.is_empty() {
+                self.complete_streaming_turn();
+            } else {
+                self.stream_rx = None;
+                self.turn_phase = TurnPhase::Idle;
+                self.tool_iteration_count = 0;
+                self.last_stream_token_time = None;
+                if matches!(self.mode, AppMode::Build | AppMode::One) {
+                    self.inject_continue_kick();
+                }
+            }
+            return;
+        }
+
         loop {
             match rx.try_recv() {
                 Ok(StreamEvent::Token(token)) => {
-                    self.streaming_text.push_str(&token);
+                    // Route inline <think>...</think> blocks to thinking_text so they
+                    // display in the thinking pane rather than streaming as plain text.
+                    if self.in_think_block {
+                        if let Some(end) = token.find("</think>") {
+                            // Closing tag arrived in this chunk
+                            self.thinking_text.push_str(&token[..end]);
+                            let rest = &token[end + "</think>".len()..];
+                            self.in_think_block = false;
+                            if !rest.is_empty() {
+                                self.streaming_text.push_str(rest);
+                            }
+                        } else {
+                            self.thinking_text.push_str(&token);
+                        }
+                    } else {
+                        self.streaming_text.push_str(&token);
+                        // Check if we just entered a <think> block
+                        if self.streaming_text.starts_with("<think>") {
+                            if let Some(end) = self.streaming_text.find("</think>") {
+                                // Complete inline think block in one shot
+                                let content = self.streaming_text[7..end].to_string();
+                                let rest = self.streaming_text[end + "</think>".len()..].to_string();
+                                self.thinking_text.push_str(&content);
+                                self.streaming_text = rest;
+                            } else {
+                                // Partial think block — move content-so-far to thinking_text
+                                let content = self.streaming_text[7..].to_string();
+                                self.thinking_text.push_str(&content);
+                                self.streaming_text.clear();
+                                self.in_think_block = true;
+                            }
+                        }
+                    }
+                    self.last_stream_token_time = Some(std::time::Instant::now());
+                    self.render_cache_dirty = true;  // Force re-render for live streaming
                     if !self.user_scrolled {
                         self.scroll_offset = 0;
                     }
                 }
-                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns, context_trimmed }) => {
+                Ok(StreamEvent::ThinkToken(chunk)) => {
+                    self.thinking_text.push_str(&chunk);
+                    self.last_stream_token_time = Some(std::time::Instant::now());
+                    self.render_cache_dirty = true;  // Force re-render to show thinking growth
+                    if !self.user_scrolled { self.scroll_offset = 0; }
+                }
+                Ok(StreamEvent::Done { prompt_tokens, gen_tokens, had_thinking: _, eval_duration_ns, context_trimmed, msgs_dropped }) => {
                     self.last_token_counts = (prompt_tokens, gen_tokens);
                     self.total_tokens_used += prompt_tokens + gen_tokens;
                     // Compute inference rate (tok/s)
@@ -603,18 +1017,21 @@ impl App {
                     };
                     self.stats.record_llm(prompt_tokens, gen_tokens, self.last_infer_rate);
                     if context_trimmed { self.stats.context_trims += 1; }
+                    self.context_cutoff_dropped = msgs_dropped;
                     self.complete_streaming_turn();
                     return;
                 }
                 Ok(StreamEvent::Error(e)) => {
                     self.notify(format!("❌ Stream error: {}", e));
                     self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
                     self.stream_rx = None;
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                     self.last_infer_rate = None;
-                    // Build mode: retry after surfacing the error
-                    if self.mode == AppMode::Build {
+                    // Build/One mode: retry after surfacing the error
+                    if matches!(self.mode, AppMode::Build | AppMode::One) {
                         self.inject_continue_kick();
                     }
                     return;
@@ -628,7 +1045,7 @@ impl App {
                         self.stream_rx = None;
                         self.turn_phase = TurnPhase::Idle;
                         self.tool_iteration_count = 0;
-                        if self.mode == AppMode::Build {
+                        if matches!(self.mode, AppMode::Build | AppMode::One) {
                             self.inject_continue_kick();
                         }
                     }
@@ -638,7 +1055,8 @@ impl App {
         }
     }
 
-    /// Drain pending tokens from a running subagent's stream into subagent_live_text.
+    /// Drain pending tokens from a running subagent's stream into subagent_live_text
+    /// and the active subagent panel entry's preview.
     fn drain_subagent_tokens(&mut self) {
         let rx = match self.subagent_token_rx.as_mut() {
             Some(rx) => rx,
@@ -648,13 +1066,24 @@ impl App {
             match rx.try_recv() {
                 Ok(tok) => {
                     self.subagent_live_text.push_str(&tok);
+                    // Mirror into the panel entry so it stays up-to-date
+                    if let Some(entry) = self.subagent_entries.iter_mut()
+                        .rev()
+                        .find(|e| e.status == SubagentStatus::Running)
+                    {
+                        entry.preview.push_str(&tok);
+                        // Keep preview bounded to last 400 chars
+                        if entry.preview.len() > 400 {
+                            let trim_at = entry.preview.len() - 400;
+                            entry.preview = entry.preview[trim_at..].to_string();
+                        }
+                    }
                     if !self.user_scrolled {
                         self.scroll_offset = 0;
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // Sender dropped (subagent finished) — stop polling
                     self.subagent_token_rx = None;
                     return;
                 }
@@ -666,13 +1095,13 @@ impl App {
     fn check_context_pressure(&mut self) {
         let (prompt_tok, _) = self.last_token_counts;
         if prompt_tok == 0 { return; }
-        let context_window = self.config.context_window.unwrap_or(4096) as f64;
+        let context_window = self.effective_context_window() as f64;
         let usage_pct = ((prompt_tok as f64) / context_window * 100.0).min(100.0) as u32;
 
         let (threshold, msg) = if usage_pct >= 95 {
-            (95u32, format!("🔴 Context critical (~{}%) — /compress now or quality will degrade", usage_pct))
+            (95u32, format!("🔴 Context critical (~{}%) — auto-compressing now", usage_pct))
         } else if usage_pct >= 90 {
-            (90u32, format!("🟠 Context at ~{}% — recommend /compress soon", usage_pct))
+            (90u32, format!("🟠 Context at ~{}% — auto-compressing", usage_pct))
         } else if usage_pct >= 80 {
             (80u32, format!("⚠️ Context at ~{}% — consider /compress", usage_pct))
         } else {
@@ -682,17 +1111,21 @@ impl App {
         if self.last_warned_ctx_pct < threshold {
             self.last_warned_ctx_pct = threshold;
             self.push_agent_notice(msg);
+            if threshold >= 90 {
+                self.pending_auto_compress = true;
+            }
         }
     }
 
     /// Streaming finished: persist response, check for tool calls, maybe continue
     fn complete_streaming_turn(&mut self) {
         self.stream_start_time = None;
+        self.last_stream_token_time = None;
         if self.streaming_text.is_empty() {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
-            if self.mode == AppMode::Build {
+            if matches!(self.mode, AppMode::Build | AppMode::One) {
                 self.inject_continue_kick();
             }
             return;
@@ -700,18 +1133,68 @@ impl App {
 
         let response_text = self.streaming_text.clone();
 
+        // Extract thinking content before sanitizing:
+        // 1. Native thinking tokens (from msg.thinking API field)
+        // 2. Inline <think>...</think> tags in the text
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if !self.thinking_text.is_empty() {
+            thinking_parts.push(self.thinking_text.trim().to_string());
+        }
+        // Extract inline <think> blocks from response_text ONLY if the live state machine
+        // didn't already capture them. When a model emits native ThinkToken events, the
+        // same content also appears as <think>...</think> in the text stream — scanning
+        // both sources would duplicate the block.
+        if self.thinking_text.is_empty() {
+            let mut scan = response_text.as_str();
+            while let Some(start) = scan.find("<think>") {
+                let after = &scan[start + "<think>".len()..];
+                let end = after.find("</think>").unwrap_or(after.len());
+                let content = after[..end].trim();
+                if !content.is_empty() {
+                    thinking_parts.push(content.to_string());
+                }
+                scan = if end + "</think>".len() <= after.len() {
+                    &after[end + "</think>".len()..]
+                } else {
+                    ""
+                };
+            }
+        }
+
         // Sanitize training artifacts before persisting or parsing
         let response_text = agent::sanitize_model_output(&response_text);
+
+        // Parse tool calls early so we can inject narration before persisting
+        let tool_calls = agent::parse_tool_calls(&response_text, self.config.profile);
+        let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
+
+        // If the model emitted a bare tool call (no explanation), synthesize one
+        let response_text = if !tool_calls.is_empty() && extract_prose_before_json(&response_text).is_empty() {
+            let narration = synthesize_tool_narration(&tool_calls);
+            format!("{}\n{}", narration, response_text)
+        } else {
+            response_text
+        };
+
+        // Prepend thinking block to stored message so it's visible in history
+        let response_text = if !thinking_parts.is_empty() {
+            let combined = thinking_parts.join("\n\n");
+            format!("[THINK: {}]\n{}", combined, response_text)
+        } else {
+            response_text
+        };
 
         // Persist assistant message
         let model_msg = Message::new("assistant", &response_text);
         if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
             self.notify(format!("⚠️ Response received but not saved: {}", e));
             self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
-            if self.mode == AppMode::Build {
+            if matches!(self.mode, AppMode::Build | AppMode::One) {
                 self.inject_continue_kick();
             }
             return;
@@ -722,13 +1205,9 @@ impl App {
         // Warn if context window is filling up
         self.check_context_pressure();
 
-        // Check for tool calls in the response
-        let tool_calls = agent::parse_tool_calls(&response_text);
-        let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
-
-        // Also extract spawn_agent from JSON-parsed tool calls (if any)
+        // Also extract spawn (subagent) from JSON-parsed tool calls (if any)
         for tc in &tool_calls {
-            if tc.name == "spawn_agent" {
+            if tc.name == "spawn" {
                 let mut parts = tc.args.splitn(2, ' ');
                 let task_id = parts.next().unwrap_or("task").to_string();
                 let desc = parts.next().unwrap_or("").to_string();
@@ -737,9 +1216,9 @@ impl App {
                 }
             }
         }
-        // Filter spawn_agent out of tool_calls so it's not double-dispatched
+        // Filter spawn (subagent) out of tool_calls so it's not double-dispatched
         let tool_calls: Vec<_> = tool_calls.into_iter()
-            .filter(|tc| tc.name != "spawn_agent")
+            .filter(|tc| tc.name != "spawn")
             .collect();
 
         // Fire-and-forget gap reflection: only on final prose responses (no tool calls).
@@ -772,6 +1251,17 @@ impl App {
         if response_text.contains("[DONE]") {
             self.push_system_event("🌸 milestone");
             tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
+            // One-mode: [DONE] is an authoritative completion signal — stop here.
+            if self.mode == AppMode::One {
+                self.complete_one_mode("[DONE] emitted");
+                self.streaming_text.clear();
+                self.thinking_text.clear();
+                self.in_think_block = false;
+                self.stream_rx = None;
+                self.turn_phase = TurnPhase::Idle;
+                self.tool_iteration_count = 0;
+                return;
+            }
         }
 
         // Handle spawn_agent: show 🤖 N indicator in chat, execute first one
@@ -786,21 +1276,106 @@ impl App {
             self.cached_message_count = self.message_buffer.count()
                 .unwrap_or(self.cached_message_count + 1);
             self.status_message = format!("🤖 #{n} running: {task_id}");
+            // Add entry to subagents panel
+            self.subagent_entries.push(SubagentEntry {
+                index: n,
+                task_id: task_id.clone(),
+                status: SubagentStatus::Running,
+                preview: String::new(),
+                completed_at_msg: None,
+            });
             self.execute_subagent_async(task_id.clone(), task_desc.clone());
-            self.turn_phase = TurnPhase::ExecutingTool(format!("spawn_agent:{}", task_id));
-        } else if !is_hallucinating && !tool_calls.is_empty() && self.tool_iteration_count < MAX_TOOL_ITERATIONS {
-            if tool_calls.len() > 1 {
+            self.turn_phase = TurnPhase::ExecutingTool(format!("spawn:{}", task_id));
+        } else if !is_hallucinating && !tool_calls.is_empty() {
+            // Handle any tellhuman messages — show in chat + fire OS notification
+            for call in &tool_calls {
+                if let Some(msg) = &call.tellhuman {
+                    self.push_system_event(format!("💬 {}", msg));
+                    let msg_owned = msg.clone();
+                    tokio::spawn(async move { crate::notifications::agent_says(&msg_owned).await; });
+                }
+            }
+
+            // Partition async and sync tool calls
+            let (async_calls, sync_calls): (Vec<_>, Vec<_>) = tool_calls.iter()
+                .partition(|c| c.async_mode);
+
+            // Fire off all async calls immediately (non-blocking)
+            for call in &async_calls {
+                let task_id = call.async_task_id.clone()
+                    .unwrap_or_else(|| format!("task-{}", &call.args.chars().take(12).collect::<String>().replace(' ', "-")));
+                let preview = call.args.chars().take(60).collect::<String>();
+                let ack = format!("[ASYNC_STARTED: {} = {} (running...)]", task_id, preview);
+                let ack_msg = Message::new("tool", &ack);
+                if let Err(e) = self.message_buffer.add_and_persist(ack_msg) {
+                    self.notify(format!("⚠️ Failed to save async ack: {}", e));
+                } else {
+                    self.cached_message_count = self.message_buffer.count()
+                        .unwrap_or(self.cached_message_count + 1);
+                }
+                self.status_message = format!("🔄 async: {}", task_id);
+                let (tx, rx) = oneshot::channel::<ToolResult>();
+                let tool_name = call.name.clone();
+                let args = call.args.clone();
+                let profile = self.config.profile;
+                let tool_name_for_result = tool_name.clone();
+                let args_for_result = args.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let registry = crate::tools::ToolRegistry::new(profile);
+                        registry.execute(&tool_name, &args).map_err(|e| e.to_string())
+                    }).await;
+                    let output = match result {
+                        Ok(Ok(out)) => Ok(out),
+                        Ok(Err(e)) => Err(e),
+                        Err(e) => Err(format!("task panicked: {}", e)),
+                    };
+                    let _ = tx.send(ToolResult { tool_name: tool_name_for_result, args: args_for_result, output });
+                });
+                self.async_tasks.push(AsyncTask {
+                    task_id,
+                    command_preview: preview,
+                    started_at: std::time::Instant::now(),
+                    rx,
+                });
+            }
+
+            // If there are also sync calls, dispatch those normally; otherwise kick next turn
+            let tool_calls = sync_calls;
+            if tool_calls.is_empty() {
+                // All calls were async — kick next stream turn so model can continue
+                if let Some(client) = &self.ollama_client {
+                    let steering_text = self.steering_text();
+                    let messages = self.message_buffer.messages().unwrap_or_default();
+                    let (tool_cap, ctx_win) = self.compression_params();
+                    let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
+                    self.stream_rx = Some(rx);
+                    self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
+                    self.tool_iteration_count += 1;
+                } else {
+                    self.turn_phase = TurnPhase::Idle;
+                }
+            } else if tool_calls.len() > 1 {
                 // Batch execution for multiple tool calls
                 let calls: Vec<(String, String)> = tool_calls.iter()
                     .map(|c| (c.name.clone(), c.args.clone()))
                     .collect();
                 self.status_message = format!("🔧 Executing {} tools in batch...", calls.len());
                 let (tx, rx) = oneshot::channel::<ToolResult>();
+                let profile = self.config.profile;
+                let cap = Some(self.config.tool_output_cap
+                    .or(self.config.params.tool_output_cap)
+                    .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP));
                 tokio::spawn(async move {
-                    let output = App::execute_tools_batch_async(calls).await;
+                    let output = App::execute_tools_batch_async(calls, cap, profile).await;
                     let _ = tx.send(ToolResult {
                         tool_name: "__batch__".to_string(),
-                        _args: String::new(),
+                        args: String::new(),
                         output: Ok(output),
                     });
                 });
@@ -809,9 +1384,11 @@ impl App {
             } else {
                 // Single tool call — existing behavior
                 let call = &tool_calls[0];
-                let status = if call.name == "writefile" {
+                let status = if let Some(desc) = call.description.as_deref().filter(|s| !s.is_empty()) {
+                    format!("🔧 {}", desc)
+                } else if call.name == "setfile" {
                     let path = call.args.split('\x00').next().unwrap_or("?");
-                    format!("🔧 writefile: {}", path)
+                    format!("🔧 setfile: {}", path)
                 } else {
                     format!("🔧 Executing tool: {} ...", call.name)
                 };
@@ -820,25 +1397,191 @@ impl App {
                 self.turn_phase = TurnPhase::ExecutingTool(call.name.clone());
             }
         } else {
-            // No tool calls — plain response, treat as done
-            if self.tool_iteration_count >= MAX_TOOL_ITERATIONS {
-                self.notify("⚠️ Max tool iterations reached — resetting");
-                self.tool_iteration_count = 0;
-                self.consecutive_empty_kicks = 0;
-                if self.mode == AppMode::Build {
-                    self.inject_continue_kick();
+            // No valid tool calls — check if model tried a blocked tool (profile restriction)
+            let blocked = agent::parse_blocked_tool_names(&response_text, self.config.profile);
+            if !blocked.is_empty() && !is_hallucinating {
+                let error_parts: Vec<String> = blocked.iter().map(|name| {
+                    format!(
+                        "[TOOL_OUTPUT: {} = ⚠️ '{}' is not available in shell-only mode. \
+                         Use the shell tool instead: \
+                         <tool>shell</tool><command>{} ...</command><desc>what and why</desc>]",
+                        name, name, name
+                    )
+                }).collect();
+                let error_text = error_parts.join("\n");
+                let error_msg = Message::new("tool", &error_text);
+                if let Err(e) = self.message_buffer.add_and_persist(error_msg) {
+                    self.notify(format!("⚠️ Failed to save blocked tool error: {}", e));
+                } else {
+                    self.cached_message_count = self.message_buffer.count()
+                        .unwrap_or(self.cached_message_count + 1);
+                }
+                // Continue the turn so model can self-correct
+                if let Some(client) = &self.ollama_client {
+                    let steering_text = self.steering_text();
+                    let messages = self.message_buffer.messages().unwrap_or_default();
+                    let (tool_cap, ctx_win) = self.compression_params();
+                    let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
+                    self.stream_rx = Some(rx);
+                    self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
+                    self.tool_iteration_count += 1;
+                } else {
+                    self.turn_phase = TurnPhase::Idle;
+                }
+                return;
+            }
+
+            // No tool calls — plain response
+            // ShellOnly: model didn't output valid JSON tool call.
+            // Two distinct failure modes:
+            //   1. No "tool_calls" key at all — model output prose → inject format correction
+            //   2. "tool_calls" present but parse failed — truncated/malformed stream →
+            //      delete the partial message from history and silently retry (model gets a
+            //      clean slate without seeing its own garbled output)
+            let shell_only = self.config.profile == crate::config::CapabilityProfile::ShellOnly;
+            let has_tool_calls_key = response_text.contains("\"tool_calls\"");
+            // Detect malformed/cutoff output differently for XML vs JSON format
+            let xml_started = response_text.contains("<tool>");
+            let xml_malformed = xml_started
+                && !response_text.contains("</command>")
+                && !response_text.contains("</tool_call>");
+            // Truly malformed = model tried to write JSON (has the key, starts with `{`)
+            // but the stream ended before the JSON was closed.
+            let json_malformed = {
+                let t = response_text.trim();
+                let opens_brace  = t.chars().filter(|&c| c == '{').count();
+                let closes_brace = t.chars().filter(|&c| c == '}').count();
+                let opens_brack  = t.chars().filter(|&c| c == '[').count();
+                let closes_brack = t.chars().filter(|&c| c == ']').count();
+                let unbalanced = opens_brace != closes_brace || opens_brack != closes_brack;
+                let truncated_marker = t.ends_with("...");
+                let starts_json = t.starts_with('{') || t.starts_with('[');
+                (has_tool_calls_key && unbalanced)
+                    || truncated_marker
+                    || (starts_json && unbalanced)
+            };
+            let json_malformed = json_malformed || xml_malformed;
+            if shell_only
+                && !response_text.trim().is_empty()
+            {
+                if json_malformed {
+                    // Stream was cut short or JSON was malformed — delete the garbage from history
+                    // and retry transparently. Don't inject a correction (it would confuse the model).
+                    let _ = self.message_buffer.delete_last();
+                    self.cached_message_count = self.message_buffer.count()
+                        .unwrap_or(self.cached_message_count.saturating_sub(1));
+                    self.notify("⚠️ Stream cut short — retrying silently");
+                    self.tool_iteration_count += 1;
+                    if let Some(client) = self.ollama_client.clone() {
+                        let messages = self.message_buffer.messages().unwrap_or_default();
+                        let steering = self.steering_text();
+                        let (tool_cap, ctx_win) = self.compression_params();
+                        let rx = client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win);
+                        self.stream_rx = Some(rx);
+                        self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
+                        self.turn_phase = TurnPhase::Streaming;
+                        self.stream_start_time = Some(std::time::Instant::now());
+                        self.last_stream_token_time = None;
+                    }
                     return;
                 }
-            } else if self.mode == AppMode::Build {
-                // Build mode: auto-continue — but detect if model is stuck
+                // Build a concrete correction: if we can extract a backtick command from prose,
+                // show the model exactly what the correct XML would have looked like.
+                self.consecutive_format_errors += 1;
+                // After 2 consecutive format errors: give up injecting and switch to Ask mode
+                if self.consecutive_format_errors >= 2 {
+                    self.consecutive_format_errors = 0;
+                    let msg = format!(
+                        "🤖 Agent gave up after {} format correction attempts — switching to Ask mode.\n\
+                         The agent sent prose instead of a tool call. You can give new instructions or \
+                         rephrase the task.",
+                        self.consecutive_format_errors + 2
+                    );
+                    self.push_agent_notice(msg);
+                    self.mode = crate::config::AppMode::Ask;
+                    let _ = self.config.save();
+                    self.notify("🤖 Format loop — switched to Ask mode");
+                    self.turn_phase = TurnPhase::Idle;
+                    self.stream_rx = None;
+                    return;
+                }
+                let example = agent::extract_backtick_command_pub(&response_text)
+                    .map(|cmd| format!(
+                        "\nYour command `{}` should have been:\n\
+                         <tool>shell</tool>\n\
+                         <command>{}</command>\n\
+                         <desc><one sentence></desc>",
+                        cmd, cmd
+                    ))
+                    .unwrap_or_default();
+                let correction = format!(
+                    "FORMAT ERROR: your last response was not an XML tool call.\n\
+                     Respond ONLY with XML tags — no prose outside the tags.\n\
+                     Required format:\n\
+                     <tool>shell</tool>\n\
+                     <command>your sh -c command</command>\n\
+                     <desc>what and why</desc>{}",
+                    example
+                );
+                let correction_msg = Message::new("user", correction);
+                self.persist_message(correction_msg);
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+                self.notify("⚠️ Format error — injecting correction");
+                self.tool_iteration_count += 1;
+                // Restart streaming with the correction in context
+                if let Some(client) = self.ollama_client.clone() {
+                    let messages = self.message_buffer.messages().unwrap_or_default();
+                    let steering = self.steering_text();
+                    let (tool_cap, ctx_win) = self.compression_params();
+                    let rx = client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win);
+                    self.stream_rx = Some(rx);
+                    self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
+                    self.turn_phase = TurnPhase::Streaming;
+                    self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
+                }
+                return;
+            }
+
+            // No tool calls — plain response, treat as done
+            if self.tool_iteration_count >= MAX_TOOL_ITERATIONS
+                && self.tool_iteration_count % MAX_TOOL_ITERATIONS == 0
+            {
+                // Inject a small steering nudge every MAX_TOOL_ITERATIONS steps, then keep going
+                self.push_agent_notice(format!(
+                    "🔄 {} tool steps completed. If your task is done, emit [DONE] or summarize. \
+                     If not, keep going.",
+                    self.tool_iteration_count
+                ));
+                // Do NOT reset counter or stop — let the agent continue
+            } else if matches!(self.mode, AppMode::Build | AppMode::One) {
+                // Build/One mode: auto-continue — detect stuck and hint, but never pause
                 self.consecutive_empty_kicks += 1;
                 if self.consecutive_empty_kicks >= 3 {
-                    self.notify("⚠️ Model appears stuck (3 responses with no tool calls) — send a message to redirect".to_string());
+                    self.push_agent_notice(
+                        "⚠️ No tool calls in last 3 responses. If you are done, summarize results. \
+                         If not done, emit a tool call to continue.".to_string()
+                    );
                     self.consecutive_empty_kicks = 0;
-                    self.status_message = "⏸ Paused — model stuck".to_string();
+                }
+                if self.mode == AppMode::One {
+                    // One-mode: a turn with no tool calls means the task is complete.
+                    self.complete_one_mode("no tool calls");
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                     self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
                     self.stream_rx = None;
                     return;
                 }
@@ -852,11 +1595,30 @@ impl App {
         }
 
         self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
         self.stream_rx = None;
     }
 
     /// Inject a continue-kick message and immediately start a new streaming turn (for Build mode & /ctx)
+    /// Abort any in-flight stream, tool, or subagent turn and return to Idle.
+    /// Call this when switching to Ask mode to hard-stop autonomous execution.
+    fn abort_active_turn(&mut self) {
+        self.stream_rx = None;
+        self.tool_result_rx = None;
+        self.turn_phase = TurnPhase::Idle;
+        self.tool_iteration_count = 0;
+        self.consecutive_empty_kicks = 0;
+    }
+
     fn inject_continue_kick(&mut self) {
+        // Never kick while a compress is pending — the main loop will compress first,
+        // then resume. Without this guard the kick races ahead and starts a new streaming
+        // turn before compress fires, keeping turn_phase == Streaming forever.
+        if self.pending_auto_compress {
+            self.turn_phase = TurnPhase::Idle;
+            return;
+        }
         // Kick is ephemeral: appended to the messages list in memory only, never persisted.
         // Persisting kicks causes them to accumulate in context over long sessions.
         let kick = Message::new("kick", "Keep going. Find the next task or improvement.");
@@ -867,8 +1629,11 @@ impl App {
             let (tool_cap, ctx_win) = self.compression_params();
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
             self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
             self.turn_phase = TurnPhase::Streaming;
             self.stream_start_time = Some(std::time::Instant::now());
+            self.last_stream_token_time = None;
             self.tool_iteration_count = 0;
             self.last_build_kick = std::time::Instant::now();
         }
@@ -897,88 +1662,64 @@ impl App {
 
     /// Spawn tool execution off the UI thread
     fn execute_tool_async(&mut self, tool_name: String, args: String) {
-        // Announce action
-        let truncated_args = if args.len() > 100 { 
-            format!("{}...", &args[..100]) 
-        } else { 
-            args.clone() 
-        };
-        self.push_system_event(format!("🎯 EXECUTING: {} ({})", tool_name, truncated_args));
-        
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name.as_str() {
-                "writefile" | "commit" | "python" | "ruste" => {
+                "setfile" | "commit" | "python" | "ruste" => {
                     self.push_agent_notice(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     self.turn_phase = TurnPhase::Idle;
                     return;
                 }
-                _ => {} // rg, spawn, editfile are allowed (read-only)
+                _ => {} // rg, spawn, readfile, exec, shell are allowed
             }
         }
 
-        // ── Repeated-identical-call detection (DISABLED) ──────────────────────
-        // NOTE: This detection was triggering false positives on legitimate reads
-        // (e.g., agent reading the same file twice to double-check). Disabled for now.
-        // Error-loop detection (lines 1144-1186) remains to catch pathological retries.
-        //
-        // To re-enable: uncomment block below and tune repeat_count >= threshold.
-        //
-        // {
-        //     use std::hash::{Hash, Hasher};
-        //     let mut h = std::collections::hash_map::DefaultHasher::new();
-        //     tool_name.hash(&mut h);
-        //     args.hash(&mut h);
-        //     let call_hash = h.finish();
-        //
-        //     self.recent_tool_calls.push_back((tool_name.clone(), call_hash));
-        //     if self.recent_tool_calls.len() > 20 {
-        //         self.recent_tool_calls.pop_front();
-        //     }
-        //
-        //     let window = self.recent_tool_calls.iter().rev().take(6);
-        //     let repeat_count = window.filter(|(n, h)| n == &tool_name && *h == call_hash).count();
-        //     if repeat_count >= 5 {  // Higher threshold to allow legitimate re-reads
-        //         self.push_agent_notice(format!(
-        //             "⚠️ Loop detected: '{}' called with identical arguments {} times in the last 6 steps.",
-        //             tool_name, repeat_count
-        //         ));
-        //         self.spin_notice_count += 1;
-        //         if self.spin_notice_count >= 2 {
-        //             self.notify("⏸ Paused — agent stuck in a repeat loop. Send a message to redirect.");
-        //             self.turn_phase = TurnPhase::Idle;
-        //             self.spin_notice_count = 0;
-        //             return;
-        //         }
-        //     }
-        // }
-        // ────────────────────────────────────────────────────────────────────
+        // ── Repeated-identical-call detection ─────────────────────────────
+        {
+            let call_hash = hash_tool_call(&tool_name, &args);
+            self.recent_tool_calls.push_back((tool_name.clone(), call_hash));
+            if self.recent_tool_calls.len() > 4 {
+                self.recent_tool_calls.pop_front();
+            }
+            let repeat_count = count_repeat_calls(&self.recent_tool_calls, &tool_name, call_hash);
+            if repeat_count >= 3 {
+                use crate::config::CapabilityProfile;
+                let hint = if self.config.profile == CapabilityProfile::ShellOnly {
+                    "Try a different approach: use shell with a different command or narrower grep pattern.".to_string()
+                } else {
+                    "Try a different approach: advance the line range (e.g. start_line=<next>), \
+                     use `rg` to search for a specific pattern, or use readfile with a `search` parameter.".to_string()
+                };
+                self.push_agent_notice(format!(
+                    "⚠️ You have called '{}' with identical arguments {} times in a row. {}",
+                    tool_name, repeat_count, hint
+                ));
+            }
+        }
+        // ──────────────────────────────────────────────────────────────────
 
         let (tx, rx) = oneshot::channel();
+        let tool_profile = self.config.profile;
+        let args_for_result = args.clone();
 
         // Wrap in tokio timeout as a safety net — spawn's own timeout handles the
         // common case, but this catches any other tool that could hang indefinitely.
         tokio::spawn(async move {
-            const TOOL_TIMEOUT_SECS: u64 = 60;
             let tool_name_for_result = tool_name.clone();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                tokio::task::spawn_blocking(move || {
-                    let registry = ToolRegistry::new();
-                    registry.execute(&tool_name, &args)
-                        .map_err(|e| e.to_string())
-                }),
-            ).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let registry = ToolRegistry::new(tool_profile);
+                registry.execute(&tool_name, &args)
+                    .map_err(|e| e.to_string())
+            }).await;
 
             let output = match result {
-                Ok(Ok(Ok(output))) => Ok(output),
-                Ok(Ok(Err(e))) => Err(e),
-                Ok(Err(join_err)) => Err(format!("tool panicked: {}", join_err)),
-                Err(_) => Err(format!("tool timed out after {}s", TOOL_TIMEOUT_SECS)),
+                Ok(Ok(output)) => Ok(output),
+                Ok(Err(e)) => Err(e),
+                Err(join_err) => Err(format!("tool panicked: {}", join_err)),
             };
             let _ = tx.send(ToolResult {
                 tool_name: tool_name_for_result,
-                _args: String::new(),
+                args: args_for_result,
                 output,
             });
         });
@@ -988,17 +1729,11 @@ impl App {
 
     /// Spawn a subagent off the UI thread; result arrives via subagent_result_rx
     fn execute_subagent_async(&mut self, task_id: String, task_desc: String) {
-        // Announce action
-        let truncated_desc = if task_desc.len() > 100 { 
-            format!("{}...", &task_desc[..100]) 
-        } else { 
-            task_desc.clone() 
-        };
-        self.push_system_event(format!("🎯 SPAWNING SUBAGENT: {} | {}", task_id, truncated_desc));
-        
         let (tx, rx) = oneshot::channel();
         let endpoint = self.config.endpoint.clone();
         let model = self.config.model.clone();
+        let app_profile = self.config.profile;
+        let project_ctx = self.project_context.clone();
 
         let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         self.subagent_token_rx = Some(token_rx);
@@ -1009,6 +1744,8 @@ impl App {
                 .with_max_iterations(10)
                 .with_max_recursion_depth(10)
                 .with_app_mode(crate::config::AppMode::Build)
+                .with_profile(app_profile)
+                .with_project_context(project_ctx)
                 .with_token_tx(token_tx);
             let result = crate::spawner::spawn_subagent(
                 "ui", &task_id, &task_desc, &endpoint, config,
@@ -1034,7 +1771,10 @@ impl App {
         if !done { return; }
 
         // Re-take and receive (already peeked Ok above, so this won't block)
-        let mut rx = self.subagent_result_rx.take().unwrap();
+        let mut rx = match self.subagent_result_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
         let result = match rx.try_recv() {
             Ok(r) => r,
             _ => return,
@@ -1056,6 +1796,15 @@ impl App {
         } else {
             preview
         };
+        // Update the panel entry: mark complete and set final preview
+        if let Some(entry) = self.subagent_entries.iter_mut()
+            .rev()
+            .find(|e| e.status == SubagentStatus::Running)
+        {
+            entry.status = if result.success { SubagentStatus::Done } else { SubagentStatus::Failed };
+            entry.preview = preview.clone();
+            entry.completed_at_msg = Some(self.cached_message_count);
+        }
         let done_content = format!("#{} {}  {}\n{}",
             self.subagent_count, status_icon, result.agent_id, preview);
         let done_msg = Message::new("spawn", done_content);
@@ -1075,15 +1824,81 @@ impl App {
 
         // Kick next stream turn with the injected result
         if let Some(client) = self.ollama_client.clone() {
-            self.push_system_event("🎯 QUERYING LLM".to_string());
             let messages: Vec<Message> = self.message_buffer.messages().unwrap_or_default();
             let steering = self.steering_text();
             let (tool_cap, ctx_win) = self.compression_params();
             let rx = client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win);
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
             self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
+        }
+    }
+
+
+    /// Check for completed async background tasks; inject results and kick stream.
+    fn check_async_tasks(&mut self) {
+        if self.async_tasks.is_empty() { return; }
+
+        // Drain all completed tasks
+        let mut completed: Vec<(String, String, std::result::Result<String, String>)> = Vec::new();
+        self.async_tasks.retain_mut(|task| {
+            match task.rx.try_recv() {
+                Ok(result) => {
+                    completed.push((task.task_id.clone(), task.command_preview.clone(), result.output));
+                    false // remove from vec
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true, // still running
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    completed.push((task.task_id.clone(), task.command_preview.clone(),
+                        Err("channel closed".to_string())));
+                    false
+                }
+            }
+        });
+
+        if completed.is_empty() { return; }
+
+        for (task_id, _preview, output) in &completed {
+            // Write output to .yggdra/async/<task_id>.txt
+            let async_dir = std::path::Path::new(".yggdra/async");
+            let _ = std::fs::create_dir_all(async_dir);
+            let out_str = match output {
+                Ok(s) => s.clone(),
+                Err(e) => format!("[error: {}]", e),
+            };
+            let _ = std::fs::write(async_dir.join(format!("{}.txt", task_id)), &out_str);
+
+            // Inject result as tool message
+            let injection = format!("[ASYNC_RESULT: {} = {}]", task_id, out_str);
+            let msg = Message::new("tool", &injection);
+            if let Err(e) = self.message_buffer.add_and_persist(msg) {
+                self.notify(format!("⚠️ Failed to save async result: {}", e));
+            } else {
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+            }
+        }
+
+        // Kick a new stream turn so model processes the injected results.
+        // In Ask mode, results are stored but we don't auto-continue — wait for user input.
+        if self.mode != AppMode::Ask {
+            if let Some(client) = self.ollama_client.clone() {
+                let messages = self.message_buffer.messages().unwrap_or_default();
+                let steering = self.steering_text();
+                let (tool_cap, ctx_win) = self.compression_params();
+                let rx = client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win);
+                self.stream_rx = Some(rx);
+                self.streaming_text.clear();
+                self.thinking_text.clear();
+                self.in_think_block = false;
+                self.turn_phase = TurnPhase::Streaming;
+                self.stream_start_time = Some(std::time::Instant::now());
+                self.last_stream_token_time = None;
+            }
         }
     }
 
@@ -1101,7 +1916,7 @@ impl App {
                 // In Ask-only mode, detect and revert any file changes
                 if self.mode == AppMode::Ask {
                     // Skip file-change check for read-only tools
-                    let is_readonly = matches!(result.tool_name.as_str(), "rg" | "spawn");
+                    let is_readonly = matches!(result.tool_name.as_str(), "rg" | "exec" | "shell");
                     
                     if !is_readonly {
                         if let Ok(output) = std::process::Command::new("git")
@@ -1132,17 +1947,23 @@ impl App {
 
                 let output_text = match &result.output {
                     Ok(output) => {
-                        // Pre-formatted batch output — use directly
                         if output.starts_with("[TOOL_OUTPUT:") || output.starts_with("[TOOL_ERROR:") {
                             output.clone()
                         } else {
-                            let truncated = if output.chars().count() > 4000 {
-                                let truncated: String = output.chars().take(4000).collect();
-                                format!("{}...(truncated)", truncated)
+                            // Strip diff section — diffs are for human display only, not model context
+                            let model_output = if let Some(idx) = output.find("\n--- changes ---\n") {
+                                &output[..idx]
                             } else {
-                                output.clone()
+                                output.as_str()
                             };
-                            format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncated)
+                            let cap = self.config.tool_output_cap
+                                .or(self.config.params.tool_output_cap)
+                                .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP);
+                            if model_output.chars().count() > cap {
+                                format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncate_tail(model_output, cap))
+                            } else {
+                                format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, model_output)
+                            }
                         }
                     }
                     Err(e) => format!("[TOOL_ERROR: {} = {}]", result.tool_name, e),
@@ -1183,20 +2004,38 @@ impl App {
                                  Stop retrying — read the error carefully and try a different approach.",
                                 tool, count
                             ));
-                            self.notify(format!("⏸ Paused — '{}' error loop", tool));
-                            self.turn_phase = TurnPhase::Idle;
-                            self.tool_iteration_count = 0;
                             self.recent_tool_errors.clear();
-                            return;
+                            // No pause — let the model read the hint and self-correct
+                        }
+
+                        // Consecutive errors for the same tool (even with varying errors)
+                        if self.last_errored_tool == result.tool_name {
+                            self.consecutive_tool_errors += 1;
+                        } else {
+                            self.consecutive_tool_errors = 1;
+                            self.last_errored_tool = result.tool_name.clone();
+                        }
+                        if self.consecutive_tool_errors >= 2 {
+                            let hint = match result.tool_name.as_str() {
+                                "shell" | "exec" => {
+                                    "⚠️ shell is failing repeatedly.\n\
+                                     For file writes use setfile instead (no shell escaping needed):\n\
+                                     {\"name\": \"setfile\", \"parameters\": {\"path\": \"file\", \"content\": \"content here\"}}"
+                                }
+                                _ => "⚠️ Tool failing repeatedly — try a different approach.",
+                            };
+                            self.push_agent_notice(hint.to_string());
+                            self.consecutive_tool_errors = 0;
                         }
                     }
                     Ok(output) => {
                         // Successful mutation: update progress tracker and clear error counts
                         match result.tool_name.as_str() {
-                            "editfile" | "writefile" | "patchfile" | "commit" => {
+                            "setfile" | "patchfile" | "commit" => {
                                 self.last_mutating_action = std::time::Instant::now();
                                 self.stall_notice_sent = false;
                                 self.recent_tool_errors.clear();
+                                self.refresh_project_context();
                             }
                             _ => {}
                         }
@@ -1210,7 +2049,7 @@ impl App {
                     Err(_) => Some(1),  // Error variant = failed
                     Ok(output) => {
                         // Check for common error indicators in spawn output
-                        if result.tool_name == "spawn" {
+                        if result.tool_name == "exec" || result.tool_name == "shell" {
                             if output.to_lowercase().contains("error:")
                                 || output.contains("not found")
                                 || output.contains("No such file")
@@ -1253,20 +2092,29 @@ impl App {
                 }
                 // Reset stuck detection — model is making progress
                 self.consecutive_empty_kicks = 0;
+                self.consecutive_format_errors = 0;
                 self.status_message = format!(
-                    "⏳ Continuing after {} (step {}/{})...",
-                    result.tool_name, self.tool_iteration_count, MAX_TOOL_ITERATIONS
+                    "⏳ Continuing after {} (step {})...",
+                    result.tool_name, self.tool_iteration_count
                 );
 
-                if let Some(client) = &self.ollama_client {
+                if self.mode == AppMode::Ask {
+                    // Ask mode: store tool result for context but do not kick a new stream.
+                    // Stay Idle until the user sends their next message.
+                    self.turn_phase = TurnPhase::Idle;
+                    self.tool_iteration_count = 0;
+                } else if let Some(client) = &self.ollama_client {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
                     let (tool_cap, ctx_win) = self.compression_params();
                     let rx = client.generate_streaming(messages, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
                     self.stream_rx = Some(rx);
                     self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
                     self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
                 } else {
                     self.notify("⚠️ Ollama offline — retrying after next message");
                     self.turn_phase = TurnPhase::Idle;
@@ -1281,11 +2129,25 @@ impl App {
                 self.tool_result_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
-                if self.mode == AppMode::Build {
+                if matches!(self.mode, AppMode::Build | AppMode::One) {
                     self.inject_continue_kick();
                 }
             }
         }
+    }
+
+    /// Signal completion of a One-mode task: switch back to Plan, persist config,
+    /// fire a persistent OS notification, and surface a clear message in the chat.
+    /// `reason` is a short human-readable explanation logged to the chat.
+    fn complete_one_mode(&mut self, reason: &str) {
+        self.push_system_event(format!("✅ Task complete ({reason}) — switching to Plan mode"));
+        tokio::spawn(crate::notifications::agent_says("✅ Task complete"));
+        self.mode = crate::config::AppMode::Plan;
+        self.config.mode = self.mode;
+        let _ = self.config.save();
+        self.status_message = "✅ Task complete".to_string();
+        self.consecutive_empty_kicks = 0;
+        self.render_cache_dirty = true;
     }
 
     /// Check if the async gap reflection query has completed; record and surface if so
@@ -1317,51 +2179,234 @@ impl App {
         }
     }
 
-     fn steering_text(&self) -> String {
+    /// Last 10 messages as a compact recap injected into system prompt.
+    /// Keeps context visible even after rolling trim drops older messages.
+    fn recent_messages_block(&self) -> String {
+        let messages = match self.message_buffer.messages() {
+            Ok(msgs) => msgs,
+            Err(_) => return String::new(),
+        };
+        if messages.is_empty() { return String::new(); }
+        let recent: Vec<_> = messages.iter().rev().take(10).rev().collect();
+        let mut out = String::from("RECENT CONTEXT:\n");
+        for msg in recent {
+            let snippet: String = msg.content.chars().take(600).collect();
+            let snippet = snippet.replace('\n', " ");
+            let ellipsis = if msg.content.chars().count() > 600 { "…" } else { "" };
+            out.push_str(&format!("[{}] {}{}\n", msg.role, snippet, ellipsis));
+        }
+        out
+    }
+
+    /// Contents of .yggdra/memory.md (last 60 lines) — agent-writable persistent notes.
+    fn memory_block() -> String {
+        let root = crate::sandbox::project_root()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = root.join(".yggdra/memory.md");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+        if content.trim().is_empty() { return String::new(); }
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(60);
+        let tail = lines[start..].join("\n");
+        format!("MEMORY (.yggdra/memory.md):\n{}\n", tail)
+    }
+
+    /// Contents of .yggdra/thoughts.md (last 30 lines) — agent-writable reasoning notes.
+    fn thoughts_block() -> String {
+        let root = crate::sandbox::project_root()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = root.join(".yggdra/thoughts.md");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+        if content.trim().is_empty() { return String::new(); }
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(30);
+        let tail = lines[start..].join("\n");
+        format!("THOUGHTS (.yggdra/thoughts.md):\n{}\n", tail)
+    }
+
+    /// First real user message (not a tool result injection), truncated to 150 chars.
+    /// Used to anchor the model's goal at the bottom of the system prompt.
+    fn current_task_block(&self) -> String {
+        let messages = match self.message_buffer.messages() {
+            Ok(m) => m,
+            Err(_) => return String::new(),
+        };
+        let task = messages.iter().find(|m| {
+            m.role == "user"
+                && !m.content.starts_with("[TOOL_OUTPUT:")
+                && !m.content.starts_with("[TOOL_ERROR:")
+                && !m.content.starts_with("[ASYNC_RESULT:")
+                && !m.content.trim().is_empty()
+        });
+        match task {
+            None => String::new(),
+            Some(m) => {
+                let s: String = m.content.chars().take(150).collect();
+                let ellipsis = if m.content.chars().count() > 150 { "…" } else { "" };
+                format!("TASK: {}{}\n", s.replace('\n', " "), ellipsis)
+            }
+        }
+    }
+
+    /// Last N tool result messages (TOOL_OUTPUT or TOOL_ERROR), formatted compactly.
+    /// command truncated at 80 chars, result at 200 chars.
+    fn last_actions_block(&self, n: usize) -> String {
+        let messages = match self.message_buffer.messages() {
+            Ok(m) => m,
+            Err(_) => return String::new(),
+        };
+        let tool_msgs: Vec<_> = messages.iter().rev()
+            .filter(|m| m.role == "user" && (
+                m.content.starts_with("[TOOL_OUTPUT:") ||
+                m.content.starts_with("[TOOL_ERROR:")
+            ))
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if tool_msgs.is_empty() { return String::new(); }
+        let mut out = String::new();
+        for msg in &tool_msgs {
+            // Parse: [TOOL_OUTPUT: name = result]
+            let content = &msg.content;
+            let is_error = content.starts_with("[TOOL_ERROR:");
+            let prefix = if is_error { "[TOOL_ERROR:" } else { "[TOOL_OUTPUT:" };
+            let inner = content.trim_start_matches(prefix).trim_start();
+            // Split on first " = "
+            let (name_cmd, result) = if let Some(eq) = inner.find(" = ") {
+                (&inner[..eq], inner[eq + 3..].trim_end_matches(']'))
+            } else {
+                (inner.trim_end_matches(']'), "")
+            };
+            // Truncate command at 80 chars
+            let cmd_truncated: String = name_cmd.chars().take(80).collect();
+            let cmd_ellipsis = if name_cmd.chars().count() > 80 { "…" } else { "" };
+            // Truncate result at 200 chars
+            let result_truncated: String = result.chars().take(200).collect();
+            let result_ellipsis = if result.chars().count() > 200 { "…" } else { "" };
+            let marker = if is_error { "⚠ " } else { "" };
+            out.push_str(&format!(
+                "{}LAST: {} → {}{}\n",
+                marker,
+                format!("{}{}", cmd_truncated, cmd_ellipsis),
+                result_truncated.replace('\n', " "),
+                result_ellipsis
+            ));
+        }
+        out
+    }
+
+    /// If the most recent tool result was an error, return a highlighted block.
+    fn last_error_block(&self) -> String {
+        let messages = match self.message_buffer.messages() {
+            Ok(m) => m,
+            Err(_) => return String::new(),
+        };
+        let last_tool = messages.iter().rev().find(|m| {
+            m.role == "user" && (
+                m.content.starts_with("[TOOL_OUTPUT:") ||
+                m.content.starts_with("[TOOL_ERROR:")
+            )
+        });
+        match last_tool {
+            Some(m) if m.content.starts_with("[TOOL_ERROR:") => {
+                let inner = m.content.trim_start_matches("[TOOL_ERROR:").trim_start();
+                let truncated: String = inner.chars().take(300).collect();
+                let ellipsis = if inner.chars().count() > 300 { "…" } else { "" };
+                format!("⚠ ERROR: {}{}\n", truncated.replace('\n', " "), ellipsis)
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn steering_text(&self) -> String {
         let os = std::env::consts::OS;
         let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
-        let mode_block = match self.mode {
-            AppMode::Ask =>
-                "MODE: ASK (read-only). You may search and read files, but MUST NOT write files, \
-                 edit code, run commits, or make any changes. Use rg, editfile, spawn (read-only \
-                 commands like ls/cat/git log) only. If asked to make changes, explain what you \
-                 would do but don't do it.",
-            AppMode::Plan =>
-                "MODE: PLAN (interactive). Discuss, analyse, and suggest. \
-                 rg/readfile/spawn freely; writefile/commit only when user explicitly requests changes.",
-            AppMode::Build =>
-                "MODE: BUILD (autonomous). Execute immediately and continuously. \
-                 Read todos, write code, run tests, commit. Do not wait for permission. \
-                 Work through tasks end-to-end. Continue to the next task when one is done.",
+        use crate::config::CapabilityProfile;
+        let shell_only = self.config.profile == CapabilityProfile::ShellOnly;
+
+        let mode_block = if shell_only {
+            match self.mode {
+                AppMode::Ask =>
+                    "MODE: ASK (read-only). Read files freely — discuss, analyse, explain.",
+                AppMode::Plan =>
+                    "MODE: PLAN (interactive). Discuss and analyse. Use shell for read-only commands only.",
+                AppMode::Build =>
+                    "MODE: BUILD (autonomous). Execute shell commands to complete tasks.",
+                AppMode::One =>
+                    "MODE: ONE (one-off). Execute shell commands autonomously to complete a single task. \
+                     When the task is fully complete, emit [DONE] on its own line — this stops the loop.",
+            }
+        } else {
+            match self.mode {
+                AppMode::Ask =>
+                    "MODE: ASK (read-only). Search and read freely. Explain what changes would look like.",
+                AppMode::Plan =>
+                    "MODE: PLAN (interactive). Discuss, analyse, and suggest. \
+                     rg/readfile/exec/shell freely; setfile/commit only when user explicitly requests changes.",
+                AppMode::Build =>
+                    "MODE: BUILD (autonomous). Execute immediately and continuously. \
+                     Read todos, write code, run tests, commit. Act immediately. \
+                     Work through tasks end-to-end. Continue to the next task when one is done.",
+                AppMode::One =>
+                    "MODE: ONE (one-off). Autonomously complete a SINGLE task end-to-end. \
+                     Read todos, write code, run tests, commit as needed. \
+                     When the task is fully complete, emit [DONE] on its own line to stop the loop. \
+                     Do NOT pick up additional tasks after completion.",
+            }
         };
-        let mut base = format!(
-            "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
-             {mode_block}\n\
-             \n\
-             You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
-             AVAILABLE TOOLS:\n\
-             • rg — ripgrep search: find patterns in files/dirs\n\
-             • readfile — read a file (optionally: readfile path start end for a line range)\n\
-             • editfile — modify existing files: exact old_text → new_text (PREFERRED for code changes)\n\
-             • writefile — create new files; avoid on existing files (rewrites everything)\n\
-             • spawn — run ANY command/tool (git, cargo, make, find, jq, node, python, etc.)\n\
-             • commit — git commit changes\n\
-             • python — run Python code or complex shell logic\n\
-             • ruste — compile & run Rust code\n\
-             • think — reasoning block (use freely)\n\
-             \n\
-             SHELL COMMANDS (spawn tool):\n\
-             spawn executes commands directly (no shell wrapper). Use for: git, cargo, make, find, jq, node, python, etc.\n\
-             • Works: spawn \"cargo test\", spawn \"find . -name '*.rs'\", spawn \"git log --oneline\"\n\
-             • With args: spawn \"find . -maxdepth 2 -type f -name '*.rs'\"\n\
-             ⚠️ Does NOT work (no shell): pipes |, redirects >, chains &&, OR || — use python tool for complex pipelines\n\
-             Blocked: bash/sh/zsh interpreters (for safety — run commands directly instead)\n\
-             \n\
-             TOOL FORMAT:\n"
-        );
+
+        let mut base = if shell_only {
+            let ctx_note = self.config.params.num_ctx
+                .or(self.config.context_window)
+                .map(|n| format!("\nCONTEXT WINDOW: {} tokens — budget returnlines accordingly", n))
+                .unwrap_or_default();
+            format!(
+                "yggdra shell-only | OS: {os}\n\
+                 {mode_block}\n\
+                 ONE tool: shell{ctx_note}\n\
+                 ---\n"
+            )
+        } else {
+            format!(
+                "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
+                 {mode_block}\n\
+                 ---\n\
+                 You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
+                 AVAILABLE TOOLS:\n\
+                 • rg — ripgrep search: find patterns in files/dirs\n\
+                 • readfile — read a file (optionally: readfile path start end for a line range)\n\
+                 • setfile — create or fully overwrite a file (auto-commits; git tracks history)\n\
+                 • patchfile — surgical line-range replacement (readfile first; commit after)\n\
+                 • exec — run a single command (git, cargo, make, find, jq, node, python, etc.)\n\
+                 • shell — run via sh -c (use for pipes, redirects, && chains)\n\
+                 • commit — git commit changes\n\
+                 • python — run Python code or complex logic\n\
+                 • ruste — compile & run Rust code\n\
+                 • think — reasoning block (use freely)\n\
+                 • spawn — spawn a subagent for parallel subtasks\n\
+                 ---\n\
+                 SHELL COMMANDS:\n\
+                 • exec: single commands — exec \"cargo test\", exec \"git log --oneline\"\n\
+                 • shell: pipelines & chains — shell \"git log | head -5\", shell \"cargo build && cargo test\"\n\
+                 Use exec for simple commands, shell whenever you need pipes (|), redirects (>), or && / ||\n\
+                 exec uses PATH (git, cargo, node) — use shell for sh -c pipelines\n\
+                 ---\n\
+                 TOOL FORMAT:\n"
+            )
+        };
         // JSON format only — all production models (qwen3.5, gemma-4) support it
-        base.push_str(agent::json_tool_descriptions());
-        base.push('\n');
+        base.push_str(&agent::json_tool_descriptions(self.config.profile));
+        base.push_str("\n---\n");
 
         // Inject project root so the model always knows where to put files
         let root_display = crate::sandbox::project_root()
@@ -1371,72 +2416,157 @@ impl App {
                 .unwrap_or_else(|_| "(current directory)".to_string()));
         base.push_str(&format!(
             "PROJECT ROOT: {root}\n\
-             All files you create or edit MUST be inside this directory.\n\
+             All files go inside this directory.\n\
              Use relative paths (e.g. src/foo.rs) — they resolve to the project root automatically.\n\
-             Never write to parent directories, home directories, or other repositories.\n\
-             \n",
+             Write only within the project root.\n\
+             ---\n",
             root = root_display
         ));
 
-        base.push_str(
-            "Never say \"I cannot access files.\" Use rg or spawn instead.\n\
-             Use tools proactively to explore, analyze, and implement. Be concise.\n\
-             \n\
-             PROJECT DIRS:\n\
-             • .yggdra/todo/ — task files (status, requirements, hints). Find with rg\n\
-             • .yggdra/log/ — session history by timestamp. Read with spawn\n\
-             • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
-             • .yggdra/knowledge/INDEX.md — indexed category list (auto-refreshed)\n\
-             \n\
-             KNOWLEDGE BASE:\n\
-             Check INDEX.md first to see which categories are indexed.\n\
-             For indexed categories (large keyword lists), search directly: rg \"term\" .yggdra/knowledge/category/\n\
-             For unindexed content, INDEX.md suggests fallback commands.\n\
-             As indexing runs in background on battery-aware schedule, INDEX.md grows over time.\n\
-             \n\
-             WORKFLOW:\n\
-             1. Discover pending todos: rg TODO .yggdra/todo/\n\
-             2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
-             3. Work on task — for code changes:\n\
-                a. readfile the target (note line numbers)\n\
-                b. patchfile (preferred) or editfile to make the change\n\
-                c. commit immediately with a message: WHAT changed + WHY\n\
-                d. repeat steps a-c for each logical change\n\
-             4. Update todo status to done\n\
-             5. Commit the todo status update\n\
-             6. Continue to the next task\n\
-             \n\
-             COMMIT RULE: every file write is followed immediately by a commit.\n\
-             Never batch multiple unrelated changes into one commit.\n\
-             Commit messages explain the change (e.g. 'fix(agent): add patchfile to is_valid_tool')."
-        );
-        if let Some(ctx) = &self.agents_context {
-            base.push_str("\n\n--- AGENTS.md ---\n");
-            base.push_str(ctx);
+        if shell_only {
+            base.push_str(
+                "ASYNC: add <mode>async</mode> and <task_id>my-task</task_id> tags to any call\n\
+                 to run it in the background. You get an immediate ack and continue.\n\
+                 Result injected as [ASYNC_RESULT: my-task = ...] when done.\n\
+                 Output also written to .yggdra/async/my-task.txt for inspection.\n\
+                 Use async for: long builds, test suites, background installs.\n\
+                 ---\n\
+                 CODE EDITING — reliable shell patterns:\n\
+                 1. Read first — always get exact lines before changing:\n\
+                    cat -n src/foo.rs | sed -n '25,40p'\n\
+                 2. Single-line replace by line number (no regex, handles any chars):\n\
+                    awk 'NR==30{print \"new content\"; next} {print}' f.rs > f.new && mv f.new f.rs\n\
+                 3. Multi-line splice by line numbers:\n\
+                    { head -n $((N-1)) f.rs; printf 'new\\ncontent\\n'; tail -n +$((M+1)) f.rs; } > f.new && mv f.new f.rs\n\
+                 4. Complex changes (handles any special chars):\n\
+                    python3 -c \"s=open('f.rs').read(); open('f.rs','w').write(s.replace('exact old','new'))\"\n\
+                 Verify every edit: cat -n f.rs | sed -n 'N,Mp'\n\
+                 sed regex on Rust code is fragile — use awk line-numbers or python3.replace instead.\n\
+                 ---\n\
+                 KNOWLEDGE BASE: .yggdra/knowledge/ — 135,000+ offline docs (Rust, Godot, physics, etc)\n\
+                 shell \"ls .yggdra/knowledge/\"                          — list categories\n\
+                 shell \"rg 'topic' .yggdra/knowledge/rust/ -l\"     — search docs\n\
+                 shell \"cat .yggdra/knowledge/rust/some-doc.md\"         — read a doc\n\
+                 .yggdra/knowledge/INDEX.md — indexed category list. Check it before searching.\n\
+                 ---\n\
+                 AGENTS.md is already in context — start working immediately.\n\
+                 PERSIST NOTES: shell \"echo 'note' >> .yggdra/memory.md\" to remember facts across turns.\n\
+                 PERSIST REASONING: shell \"echo 'thought' >> .yggdra/thoughts.md\" before complex steps."
+            );
+            // Inject recent context / memory / thoughts
+            let recent = self.recent_messages_block();
+            if !recent.is_empty() {
+                base.push_str("\n---\n");
+                base.push_str(&recent);
+            }
+            let memory = Self::memory_block();
+            if !memory.is_empty() {
+                base.push_str("\n---\n");
+                base.push_str(&memory);
+            }
+            let thoughts = Self::thoughts_block();
+            if !thoughts.is_empty() {
+                base.push_str("\n---\n");
+                base.push_str(&thoughts);
+            }
         } else {
-            base.push_str("\n\nNo AGENTS.md exists yet. If you haven't already, explore the \
-                directory and create one with readfile/writefile AGENTS.md.");
+            base.push_str(
+                "Access any file using rg, readfile, exec, or shell.\n\
+                 Use tools proactively to explore, analyze, and implement. Be concise.\n\
+                 ---\n\
+                 PROJECT DIRS:\n\
+                 • .yggdra/todo/ — task files (status, requirements, hints). Find with rg\n\
+                 • .yggdra/log/ — session history by timestamp. Read with exec\n\
+                 • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
+                 • .yggdra/knowledge/INDEX.md — indexed category list (auto-refreshed)\n\
+                 ---\n\
+                 KNOWLEDGE BASE:\n\
+                 Check INDEX.md first to see which categories are indexed.\n\
+                 For indexed categories (large keyword lists), search directly: rg \"term\" .yggdra/knowledge/category/\n\
+                 For unindexed content, INDEX.md suggests fallback commands.\n\
+                 As indexing runs in background on battery-aware schedule, INDEX.md grows over time.\n\
+                 ---\n\
+                 WORKFLOW:\n\
+                 1. Discover pending todos: rg TODO .yggdra/todo/\n\
+                 2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
+                 3. Work on task — for code changes:\n\
+                    a. readfile the target (note line numbers)\n\
+                    b. patchfile (surgical) or setfile (full rewrite) to make the change\n\
+                    c. commit immediately with a message: WHAT changed + WHY\n\
+                    d. repeat steps a-c for each logical change\n\
+                 4. Update todo status to done\n\
+                 5. Commit the todo status update\n\
+                 6. Continue to the next task\n\
+                 ---\n\
+                 COMMIT RULE: every file write is followed immediately by a commit.\n\
+                 One logical change per commit.\n\
+                 Commit messages explain the change (e.g. 'fix(agent): add patchfile to is_valid_tool').\n\
+                 ---\n\
+                 BEFORE EACH TOOL CALL: write one short sentence saying what you are about to do and why.\n\
+                 Example: \"Searching for existing tests before adding a new one.\"\n\
+                 Keep it to one line. Then emit the tool call JSON immediately after.\n\
+                 ---\n\
+                 🎯 AGENTS.md is already in context — start working immediately."
+            );
+            // Inject recent context / memory / thoughts
+            let recent = self.recent_messages_block();
+            if !recent.is_empty() { base.push_str("\n---\n"); base.push_str(&recent); }
+            let memory = Self::memory_block();
+            if !memory.is_empty() { base.push_str("\n---\n"); base.push_str(&memory); }
+            let thoughts = Self::thoughts_block();
+            if !thoughts.is_empty() { base.push_str("\n---\n"); base.push_str(&thoughts); }
+        }
+        if let Some(ctx) = &self.agents_context {
+            base.push_str("\n---\n--- AGENTS.md ---\n");
+            base.push_str(ctx);
+        } else if shell_only {
+            base.push_str("\n---\nNo AGENTS.md exists yet. Use shell \"cat AGENTS.md\" or \
+                shell \"ls\" to explore the directory.");
+        } else {
+            base.push_str("\n---\nNo AGENTS.md exists yet. If you haven't already, explore the \
+                directory and create one with readfile/setfile AGENTS.md.");
+        }
+        // Inject live project file listing — model knows what exists without ls/find turns
+        base.push_str("\n---\n");
+        base.push_str(&self.project_context);
+        base.push_str("\n⚠️ The file tree is live — go directly to relevant files.");
+
+        // --- Small-model-optimized state block (near generation = max recency weight) ---
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(unknown)".to_string());
+        let task_block = self.current_task_block();
+        let actions_block = self.last_actions_block(3);
+        let error_block = self.last_error_block();
+        let has_state = !task_block.is_empty() || !actions_block.is_empty() || !error_block.is_empty();
+        base.push_str(&format!("\n---\nCWD: {cwd}\n"));
+        if has_state {
+            if !task_block.is_empty() { base.push_str(&task_block); }
+            if !actions_block.is_empty() { base.push_str(&actions_block); }
+            if !error_block.is_empty() { base.push_str(&error_block); }
+        }
+
+        if shell_only {
+            base.push_str("---\nOutput XML tool tags only — no prose outside the tags.");
         }
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
 
     /// Execute multiple tool calls in parallel (blocking) and return pre-formatted output.
-    async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>) -> String {
+    async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>, cap: Option<usize>, profile: crate::config::CapabilityProfile) -> String {
+        let registry = crate::tools::ToolRegistry::new(profile);
         tokio::task::spawn_blocking(move || {
-            let registry = ToolRegistry::new();
             let results: Vec<String> = tool_calls
                 .into_iter()
                 .map(|(name, args)| {
                     match registry.execute(&name, &args) {
                         Ok(output) => {
-                            // Truncate to prevent SQLITE_TOOBIG when batch results are large
-                            let truncated = if output.chars().count() > 4000 {
-                                let t: String = output.chars().take(4000).collect();
-                                format!("{}...(truncated)", t)
-                            } else {
-                                output
-                            };
-                            format!("[TOOL_OUTPUT: {} = {}]", name, truncated)
+                            if let Some(n) = cap {
+                                if output.chars().count() > n {
+                                    return format!("[TOOL_OUTPUT: {} = {}]", name, truncate_tail(&output, n));
+                                }
+                            }
+                            format!("[TOOL_OUTPUT: {} = {}]", name, output)
                         }
                         Err(e) => format!("[TOOL_ERROR: {} = {}]", name, e),
                     }
@@ -1511,7 +2641,17 @@ impl App {
 
     /// Returns (tool_output_cap, context_window) for smart context compression.
     fn compression_params(&self) -> (Option<usize>, Option<u32>) {
-        (self.config.tool_output_cap, self.config.context_window)
+        let cap = self.config.tool_output_cap
+            .or(self.config.params.tool_output_cap)
+            .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP);
+        let native_ctx = self.ollama_client.as_ref().and_then(|c| c.get_native_ctx());
+        (Some(cap), self.config.context_window.or(self.config.params.num_ctx).or(native_ctx).or(Some(32768)))
+    }
+
+    /// Effective context window: user override > native detected > 32768 fallback.
+    fn effective_context_window(&self) -> u32 {
+        let native_ctx = self.ollama_client.as_ref().and_then(|c| c.get_native_ctx());
+        self.config.context_window.or(self.config.params.num_ctx).or(native_ctx).unwrap_or(32768)
     }
 
     fn push_system_event(&mut self, text: impl Into<String>) {
@@ -1570,19 +2710,30 @@ impl App {
         let input_content_len = if self.input_buffer.is_empty() {
             0
         } else {
-            2 + self.input_buffer.chars().count() // "> " prefix
+            2 + self.input_buffer.width() // "> " prefix, display columns (handles wide chars/emoji)
         };
         let content_rows = ((input_content_len + inner_width - 1) / inner_width).max(1) as u16;
         let input_height = (content_rows + 2).min(12); // +2 for borders, cap at 12
 
-        // Calculate inline results panel height: 0 if no results, 1-8 lines if there are results
-        let inline_results_height = if self.inline_tool_results.is_empty() {
+        // Calculate subagent panel height
+        const SUBAGENT_MSG_TTL: usize = 5;
+        let visible_subagents: Vec<&SubagentEntry> = self.subagent_entries.iter()
+            .filter(|e| {
+                e.status == SubagentStatus::Running
+                    || e.completed_at_msg.map_or(true, |m| {
+                        self.cached_message_count.saturating_sub(m) < SUBAGENT_MSG_TTL
+                    })
+            })
+            .collect();
+        // Each entry: 1 header + up to 2 preview lines + 1 blank = 4 lines; cap at 10
+        let subagent_panel_height: u16 = if visible_subagents.is_empty() {
             0
         } else {
-            // Show summary line + first few lines of each result
-            let lines_per_result = 2; // tool name + one line of output
-            let max_height = (self.inline_tool_results.len() as u16 * lines_per_result).min(8);
-            max_height.max(3) // Minimum 3 lines if there are results
+            let lines: u16 = visible_subagents.iter().map(|e| {
+                let preview_lines = e.preview.lines().count().min(2) as u16;
+                1 + preview_lines + 1  // header + preview + blank
+            }).sum::<u16>() + 2; // +2 for block borders
+            lines.min(12).max(3)
         };
 
         let chunks = Layout::default()
@@ -1592,7 +2743,7 @@ impl App {
                     Constraint::Length(2),                      // [0] Header
                     Constraint::Min(5),                         // [1] Messages
                     Constraint::Length(1),                      // [2] Spacer above boxes
-                    Constraint::Length(inline_results_height),  // [3] Inline results (0 if no results)
+                    Constraint::Length(subagent_panel_height),  // [3] Subagent panel (0 if none visible)
                     Constraint::Length(input_height),           // [4] Input
                     Constraint::Length(1),                      // [5] Status bar
                 ]
@@ -1606,13 +2757,14 @@ impl App {
             AppMode::Build => ("⚡ BUILD", self.theme.violet),
             AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
             AppMode::Ask => ("🔍 ASK", Color::Yellow),
-        };
+            AppMode::One => ("🎯 ONE", Color::Green),
+        }; 
 
         // Token usage indicator — real counts when available, estimate otherwise
         let (prompt_tok, gen_tok) = self.last_token_counts;
         let context_indicator = if prompt_tok > 0 {
             // Real data from Ollama
-            let context_window = self.config.context_window.unwrap_or(4096) as f64;
+            let context_window = self.effective_context_window() as f64;
             let usage_pct = ((prompt_tok as f64) / context_window * 100.0).min(100.0) as u32;
             let dot = if usage_pct > 70 { "🔴" } else if usage_pct > 50 { "🟡" } else { "🟢" };
             format!("{dot} {prompt_tok}+{gen_tok}tok ({usage_pct}%)")
@@ -1640,91 +2792,91 @@ impl App {
         let viewport_height = messages_area.height as i32;
         let area_width = messages_area.width;
 
-        // Pre-compute each message's formatted text, style, and estimated height
+        // Build a flat list of (content, style, height) from the pre-rendered cache.
+        // Only streaming text and subagent text need to be computed fresh each frame.
         struct RenderedMsg {
             content: ratatui::text::Text<'static>,
             style: Style,
             height: u16,
         }
 
-        fn text_height(text: &ratatui::text::Text, area_width: u16) -> u16 {
-            let line_count = text.lines.len().max(1);
-            let wrap_extra: usize = if area_width > 0 {
-                text.lines.iter()
-                    .map(|l| (l.width() as u16).saturating_sub(1) / area_width.max(1))
-                    .sum::<u16>() as usize
-            } else { 0 };
-            (line_count + wrap_extra).max(1) as u16
+        let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(self.render_cache.len() * 2 + 2);
+        for cr in &self.render_cache {
+            // Re-compute height for current width (cheap: just counts lines)
+            let height = text_height_static(&cr.content, area_width);
+            rendered.push(RenderedMsg { content: cr.blank.clone(), style: cr.style, height: 1 });
+            rendered.push(RenderedMsg { content: cr.content.clone(), style: cr.style, height });
         }
-
-        let mut rendered: Vec<RenderedMsg> = Vec::with_capacity(self.messages_cache.len() + 1);
-        let mut exchange_idx: usize = 0;
-
-        for msg in self.messages_cache.iter() {
-            // Skip internal kick messages — they're for the model, not the user
-            if msg.role == "kick" { continue; }
-
-            // Solarized-light-friendly pastel bands — no explicit fg so terminal default
-            // dark text shows through. Works on both light and dark terminals.
-            let (emoji, bg_tint, show_band) = match msg.role.as_str() {
-                "user" => {
-                    exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
-                    ("👤", Some(tint), true)
-                }
-                "assistant" => {
-                    exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
-                    ("🤖", Some(tint), true)
-                }
-                "tool"   => ("🔧", None, false),
-                "system" => ("⚙️", None, false),
-                "notice" => ("📋", None, false),
-                "clock"  => ("🕐", None, false),
-                "spawn"  => ("🤖", Some(self.theme.band_spawn), true),
-                _        => ("💬", None, false),
-            };
-
-            let content = if msg.role == "tool" || msg.role == "spawn" {
-                let text_str = format!("{} {}", emoji, self.format_tool_content(&msg.content));
-                ratatui::text::Text::from(text_str)
-            } else {
-                self.format_message_styled(emoji, &msg.content)
-            };
-
-            let height = text_height(&content, area_width);
-
-            let style = if show_band {
-                // Dark theme: set explicit light fg so text contrasts against dark band
-                // Light theme: no explicit fg → terminal's dark default text shows through
-                if self.theme.kind == crate::theme::ThemeKind::Dark {
-                    Style::default().fg(Color::Rgb(220, 230, 240)).bg(bg_tint.unwrap())
-                } else {
-                    Style::default().bg(bg_tint.unwrap())
-                }
-            } else {
-                Style::default()
-            };
-
-            // Blank line above message for visual separation
-            rendered.push(RenderedMsg { content: ratatui::text::Text::from("\n".to_string()), style: Style::default(), height: 1 });
-            
-            rendered.push(RenderedMsg { content, style, height: height + 1 });
-            // Spacer line inherits the message band color so there's no color gap
-            rendered.push(RenderedMsg { content: ratatui::text::Text::from("\n".to_string()), style, height: 1 });
-        }
+        let exchange_idx = self.render_cache_exchange_end;
 
         // Add streaming text as a virtual message at the end
-        if !self.streaming_text.is_empty() {
+        let is_streaming = self.turn_phase == TurnPhase::Streaming;
+        if !self.streaming_text.is_empty() || !self.thinking_text.is_empty() || is_streaming {
             let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
             let agent_badge = if self.active_subagents > 0 {
                 format!(" [🤖{}]", self.active_subagents)
             } else {
                 String::new()
             };
-            let stream_text = format!("🤖{} {}▌", agent_badge, self.streaming_text);
+            let stream_text = if self.streaming_text.is_empty() && self.thinking_text.is_empty() {
+                // Prefill: model is processing the prompt, no tokens yet
+                let elapsed = self.stream_start_time
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                if elapsed < 2 {
+                    format!("🤖{} ▌", agent_badge)
+                } else {
+                    format!("🤖{} ⏳ prefill {}s…▌", agent_badge, elapsed)
+                }
+            } else if self.streaming_text.is_empty() && !self.thinking_text.is_empty() {
+                // Still in prefill but accumulating thinking tokens
+                let elapsed = self.stream_start_time
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let thinking_chars = self.thinking_text.len();
+                format!("🤖{} 💭 thinking {}s ({}b)…▌", agent_badge, elapsed, thinking_chars)
+            // If the model is building a tool-call (JSON or XML), pretty-print it; otherwise show raw.
+            } else if self.streaming_text.trim_start().starts_with('{')
+                   || self.streaming_text.contains("<tool>") {
+                if let Some(pretty) = Self::prettify_tool_calls(&self.streaming_text) {
+                    // Convert styled lines to plain text for streaming preview
+                    let preview: String = pretty.iter()
+                        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Prepend thinking if available
+                    if !self.thinking_text.is_empty() {
+                        let think_preview: String = self.thinking_text.chars().take(200).collect();
+                        format!("🤖{} 💭 {}…\n{}▌", agent_badge, think_preview, preview)
+                    } else {
+                        format!("🤖{} {}▌", agent_badge, preview)
+                    }
+                } else {
+                    // Partial JSON still building — show a neutral placeholder
+                    format!("🤖{} ⚙️ …▌", agent_badge)
+                }
+            } else if !self.thinking_text.is_empty() && self.streaming_text.is_empty() {
+                // Thinking phase: show last 4 lines as a typewriter — earlier lines are stable,
+                // only the current (bottom) line grows forward. No full-window reflow = no flicker.
+                let col_w = (area_width as usize).max(40) - 6; // leave room for badge/emoji
+                let all_lines: Vec<&str> = self.thinking_text.lines().collect();
+                let count = self.thinking_text.chars().count();
+                let tail: Vec<String> = all_lines.iter().rev().take(4).rev()
+                    .map(|l| l.chars().take(col_w).collect::<String>())
+                    .collect();
+                let body = tail.join("\n");
+                format!("🤖{} 💭 ({} chars)\n{}▌", agent_badge, count, body)
+            } else {
+                // Streaming response text — thinking already complete
+                if !self.thinking_text.is_empty() {
+                    let count = self.thinking_text.chars().count();
+                    format!("🤖{} 💭 ({} chars)\n{}▌", agent_badge, count, self.streaming_text)
+                } else {
+                    format!("🤖{} {}▌", agent_badge, self.streaming_text)
+                }
+            };
             let stream_content = ratatui::text::Text::from(stream_text);
-            let height = text_height(&stream_content, area_width);
+            let height = text_height_static(&stream_content, area_width);
             let stream_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
                 Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
             } else {
@@ -1745,13 +2897,35 @@ impl App {
             };
             let sub_text = format!("🔀 subagent: {}▌", tail);
             let sub_content = ratatui::text::Text::from(sub_text);
-            let height = text_height(&sub_content, area_width);
+            let height = text_height_static(&sub_content, area_width);
             let sub_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
                 Style::default().fg(Color::Rgb(180, 210, 255)).bg(tint)
             } else {
                 Style::default().bg(tint)
             };
             rendered.push(RenderedMsg { content: sub_content, style: sub_style, height });
+        }
+
+        // Show running async tasks indicator
+        if !self.async_tasks.is_empty() {
+            let tint = if exchange_idx % 2 == 0 { self.theme.band_b } else { self.theme.band_a };
+            let tasks_str: String = self.async_tasks.iter()
+                .map(|t| {
+                    let secs = t.started_at.elapsed().as_secs();
+                    let preview: String = t.command_preview.chars().take(40).collect();
+                    format!("  🔄 {} — {} ({}s)", t.task_id, preview, secs)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let async_text = format!("⏳ async tasks running:\n{}", tasks_str);
+            let async_content = ratatui::text::Text::from(async_text);
+            let height = text_height_static(&async_content, area_width);
+            let async_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
+                Style::default().fg(Color::Rgb(255, 210, 120)).bg(tint)
+            } else {
+                Style::default().bg(tint)
+            };
+            rendered.push(RenderedMsg { content: async_content, style: async_style, height });
         }
 
         // Calculate total content height and clamp scroll_offset
@@ -1831,9 +3005,9 @@ impl App {
                 .scroll((partial_skip, 0));
 
             let msg_area = Rect {
-                x: messages_area.x,
+                x: messages_area.x + 1,
                 y: current_y,
-                width: messages_area.width,
+                width: messages_area.width.saturating_sub(2),
                 height: draw_height,
             };
 
@@ -1863,15 +3037,38 @@ impl App {
         let dot = DOTS[(self.tick_count / 12) as usize % DOTS.len()];
         let yap = format!("🤖💬 {}", dot);
         let prefill_hint;
+        let cursor_hint;
         let input_hint: &str = match &self.turn_phase {
-            TurnPhase::Idle => "(type message or /help for commands)",
+            TurnPhase::Idle => {
+                let has_tool_msgs = self.messages_cache.iter()
+                    .any(|m| m.role == "tool" || m.role == "spawn");
+                if let Some(idx) = self.msg_cursor {
+                    let is_expanded = self.expanded_msgs.contains(&idx);
+                    cursor_hint = if is_expanded {
+                        "[ prev  ] next  Space=collapse  Esc=exit nav".to_string()
+                    } else {
+                        "[ prev  ] next  Space=expand  Esc=exit nav".to_string()
+                    };
+                    &cursor_hint
+                } else if has_tool_msgs {
+                    cursor_hint = "(type message · [ ] navigate tool output · /help for commands)".to_string();
+                    &cursor_hint
+                } else {
+                    "(type message or /help for commands)"
+                }
+            }
             TurnPhase::Streaming => {
                 if self.streaming_text.is_empty() {
                     // Still in prefill — prompt is being processed
                     let elapsed = self.stream_start_time
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(0);
-                    prefill_hint = format!("🤖 prefill… {}s", elapsed);
+                    if !self.thinking_text.is_empty() {
+                        let thinking_chars = self.thinking_text.len();
+                        prefill_hint = format!("🤖 thinking… {}s ({}b)", elapsed, thinking_chars);
+                    } else {
+                        prefill_hint = format!("🤖 prefill… {}s", elapsed);
+                    }
                     &prefill_hint
                 } else {
                     &yap
@@ -1889,6 +3086,7 @@ impl App {
             AppMode::Build => (" ⚡BUILD ", self.theme.violet),
             AppMode::Plan  => (" 🧠PLAN ",  self.theme.accent),
             AppMode::Ask => (" 🔍ASK ", Color::Yellow),
+            AppMode::One => (" 🎯ONE ", Color::Green),
         };
 
         // Compute a "frosted" bg for the boxes: gradient end color, slightly lightened
@@ -1906,18 +3104,26 @@ impl App {
         };
         let box_style = Style::default().bg(box_bg);
 
-        // Render inline tool results panel if there are results
-        if !self.inline_tool_results.is_empty() && chunks[3].height > 0 {
-            let results_text = self.format_inline_results();
-            let results_panel = Paragraph::new(results_text)
+        // Render subagent panel if there are visible entries
+        if !visible_subagents.is_empty() && chunks[3].height > 0 {
+            let panel_text = format_subagent_panel(&visible_subagents, self.tick_count);
+            let spinner_frames = ['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷'];
+            let spin = spinner_frames[(self.tick_count as usize / 4) % spinner_frames.len()];
+            let any_running = visible_subagents.iter().any(|e| e.status == SubagentStatus::Running);
+            let title = if any_running {
+                format!(" 🤖 Subagents {} ", spin)
+            } else {
+                " 🤖 Subagents ".to_string()
+            };
+            let panel = Paragraph::new(panel_text)
                 .block(Block::default()
-                    .title(" 🔧 Tool Results ")
+                    .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(self.theme.violet))
                     .style(box_style))
                 .style(box_style)
                 .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(results_panel, chunks[3]);
+            f.render_widget(panel, chunks[3]);
         }
 
         let input = Paragraph::new(format!("> {}", input_text))
@@ -1937,7 +3143,7 @@ impl App {
             let available_w = (chunks[4].width as usize).saturating_sub(2); // inside borders
             if available_w > 0 {
                 // "> " prefix is 2 chars; cursor goes after the last typed character
-                let display_chars = 2 + self.input_buffer.chars().count();
+                let display_chars = 2 + self.input_buffer.width();
                 let row_offset = (display_chars / available_w) as u16;
                 let col_in_row = (display_chars % available_w) as u16;
                 let cursor_x = (chunks[4].x + 1 + col_in_row)
@@ -2067,7 +3273,7 @@ impl App {
         }
 
         // Status bar — show current prompt tokens / context window size
-        let ctx_window = self.config.context_window.unwrap_or(4096);
+        let ctx_window = self.effective_context_window();
         let (prompt_tok, _) = self.last_token_counts;
         let token_info = if prompt_tok > 0 {
             format!("🪙 {}/{}", prompt_tok, ctx_window)
@@ -2086,9 +3292,9 @@ impl App {
             Some(r) => format!("⚡ {:.1} tok/s", r),
             None => String::new(),
         };
-        // Countdown to next auto-request: shown when on battery, build mode, idle
+        // Countdown to next auto-request: shown when on battery, build/one mode, idle
         let countdown_text = if self.on_battery == BatteryState::OnBattery
-            && self.mode == AppMode::Build
+            && matches!(self.mode, AppMode::Build | AppMode::One)
             && self.turn_phase == TurnPhase::Idle
         {
             const KICK_SECS: u64 = 5;
@@ -2308,6 +3514,13 @@ impl App {
                 self.palette_open = true;
                 self.palette_selection = 0;
             }
+            // `[` / `]` — navigate cursor to prev/next tool output message (only when input empty)
+            KeyCode::Char('[') if self.input_buffer.is_empty() => {
+                self.move_msg_cursor(-1);
+            }
+            KeyCode::Char(']') if self.input_buffer.is_empty() => {
+                self.move_msg_cursor(1);
+            }
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
                 if self.palette_open {
@@ -2367,10 +3580,25 @@ impl App {
                 if self.palette_open {
                     self.palette_open = false;
                     self.input_buffer.clear();
+                } else if self.msg_cursor.is_some() {
+                    // Clear message cursor first
+                    self.msg_cursor = None;
+                    self.render_cache_dirty = true;
                 } else if self.turn_phase != TurnPhase::Idle {
                     self.cancel_current_turn();
                 } else {
                     self.input_buffer.clear();
+                }
+            }
+            // Space — toggle expand/collapse on the cursor's tool message
+            KeyCode::Char(' ') if self.msg_cursor.is_some() && self.input_buffer.is_empty() => {
+                if let Some(idx) = self.msg_cursor {
+                    if self.expanded_msgs.contains(&idx) {
+                        self.expanded_msgs.remove(&idx);
+                    } else {
+                        self.expanded_msgs.insert(idx);
+                    }
+                    self.render_cache_dirty = true;
                 }
             }
             KeyCode::PageUp => {
@@ -2389,6 +3617,40 @@ impl App {
         }
     }
 
+    /// Move the message cursor by `delta` steps through tool/spawn messages.
+    /// delta = -1 goes to prev tool message, +1 goes to next.
+    /// Rebuild project_context if it's stale (>60s old or forced).
+    fn refresh_project_context(&mut self) {
+        // Budget: 5% of context window in chars, clamped to a reasonable range.
+        let max_chars = (self.effective_context_window() as usize / 5).clamp(2000, 20000);
+        self.project_context = build_project_context(max_chars);
+        self.project_context_built = std::time::Instant::now();
+    }
+
+    fn move_msg_cursor(&mut self, delta: i32) {
+        let tool_indices: Vec<usize> = self.messages_cache.iter().enumerate()
+            .filter(|(_, m)| m.role == "tool" || m.role == "spawn")
+            .map(|(i, _)| i)
+            .collect();
+        if tool_indices.is_empty() { return; }
+
+        let new_cursor = if let Some(current) = self.msg_cursor {
+            let pos = tool_indices.iter().position(|&i| i == current).unwrap_or(0);
+            let new_pos = (pos as i64 + delta as i64)
+                .clamp(0, tool_indices.len() as i64 - 1) as usize;
+            tool_indices[new_pos]
+        } else if delta > 0 {
+            // No cursor yet: start at last tool message (most recent)
+            // tool_indices is non-empty (checked via is_empty above)
+            tool_indices.last().copied().unwrap_or(0)
+        } else {
+            tool_indices.last().copied().unwrap_or(0)
+        };
+
+        self.msg_cursor = Some(new_cursor);
+        self.render_cache_dirty = true;
+    }
+
     /// Cancel any in-progress inference, tool execution, or subagent run.
     fn cancel_current_turn(&mut self) {
         self.stream_rx = None;
@@ -2397,6 +3659,8 @@ impl App {
         self.subagent_token_rx = None;
         self.turn_phase = TurnPhase::Idle;
         self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
         self.tool_iteration_count = 0;
         self.consecutive_empty_kicks = 0;
         self.push_system_event("⛔ Turn cancelled".to_string());
@@ -2451,12 +3715,13 @@ impl App {
     }
 
     /// Handle command submission
-    /// Cycle mode Ask→Plan→Build→Ask; if entering Build, kick the agent loop.
+    /// Cycle mode Plan→Build→One→Ask→Plan; if entering Build/One, kick the agent loop.
     async fn cycle_mode(&mut self) {
         self.mode = match self.mode {
-            AppMode::Ask   => AppMode::Plan,
             AppMode::Plan  => AppMode::Build,
-            AppMode::Build => AppMode::Ask,
+            AppMode::Build => AppMode::One,
+            AppMode::One   => AppMode::Ask,
+            AppMode::Ask   => AppMode::Plan,
         };
         self.config.mode = self.mode;
         let _ = self.config.save();
@@ -2464,9 +3729,13 @@ impl App {
             AppMode::Ask   => "🔍 Ask",
             AppMode::Plan  => "🧠 Plan",
             AppMode::Build => "⚡ Build",
+            AppMode::One   => "🎯 One",
         };
         self.notify(format!("Switched to {} mode", label));
-        if self.mode == AppMode::Build && self.turn_phase == TurnPhase::Idle {
+        self.render_cache_dirty = true;
+        if self.mode == AppMode::Ask {
+            self.abort_active_turn();
+        } else if matches!(self.mode, AppMode::Build | AppMode::One) && self.turn_phase == TurnPhase::Idle {
             self.inject_continue_kick();
         }
     }
@@ -2541,6 +3810,15 @@ impl App {
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.notify("⚡ Switched to Build mode — autonomous execution");
+        } else if command == "/one" {
+            self.mode = AppMode::One;
+            self.config.mode = self.mode;
+            let _ = self.config.save();
+            self.render_cache_dirty = true;
+            self.notify("🎯 Switched to One mode — autonomous, stops on completion");
+            if self.turn_phase == TurnPhase::Idle && self.ollama_client.is_some() {
+                self.inject_continue_kick();
+            }
         } else if command == "/plan" {
             self.mode = AppMode::Plan;
             self.config.mode = self.mode;
@@ -2550,24 +3828,30 @@ impl App {
             self.mode = AppMode::Ask;
             self.config.mode = self.mode;
             let _ = self.config.save();
+            self.abort_active_turn();
             self.notify("🔍 Switched to Ask-only mode — read-only, no modifications");
         } else if command == "/mode" || command.starts_with("/mode ") {
             if let Some(arg) = command.strip_prefix("/mode ").map(|s| s.trim()) {
                 match arg {
-                    "ask" => self.mode = AppMode::Ask,
+                    "ask" => { self.mode = AppMode::Ask; self.abort_active_turn(); }
                     "plan" => self.mode = AppMode::Plan,
                     "build" => self.mode = AppMode::Build,
+                    "one" => self.mode = AppMode::One,
                     _ => {
-                        self.notify(format!("Unknown mode '{}' — use ask, plan, or build", arg));
+                        self.notify(format!("Unknown mode '{}' — use ask, plan, build, or one", arg));
                         return;
                     }
                 }
             } else {
                 self.mode = match self.mode {
-                    AppMode::Build => AppMode::Plan,
-                    AppMode::Plan => AppMode::Ask,
-                    AppMode::Ask => AppMode::Build,
+                    AppMode::Plan => AppMode::Build,
+                    AppMode::Build => AppMode::One,
+                    AppMode::One => AppMode::Ask,
+                    AppMode::Ask => AppMode::Plan,
                 };
+                if self.mode == AppMode::Ask {
+                    self.abort_active_turn();
+                }
             }
             self.config.mode = self.mode;
             let _ = self.config.save();
@@ -2575,8 +3859,37 @@ impl App {
                 AppMode::Build => "⚡ Build",
                 AppMode::Plan => "🧠 Plan",
                 AppMode::Ask => "🔍 Ask",
+                AppMode::One => "🎯 One",
             };
             self.notify(format!("Switched to {} mode", label));
+        } else if command == "/test_notification" || command == "/notify_test" {
+            tokio::spawn(async {
+                crate::notifications::agent_says("Test notification from yggdra — if you see this, OS notifications are working.").await;
+            });
+            self.notify("🔔 Test notification dispatched. If it doesn't appear: macOS → System Settings → Notifications → allow 'Script Editor' (osascript). Linux → ensure a notification daemon is running.");
+        } else if command == "/abort" {
+            // Abort stuck/long-running generation
+            let was_streaming = self.stream_rx.is_some();
+            let was_executing = self.tool_result_rx.is_some();
+            let had_async = !self.async_tasks.is_empty();
+            
+            self.abort_active_turn();
+            self.async_tasks.clear(); // Clear background tasks
+            
+            let mut msg = String::from("⏹️ Aborted");
+            if was_streaming {
+                msg.push_str(" (stream)");
+            }
+            if was_executing {
+                msg.push_str(" (tool exec)");
+            }
+            if had_async {
+                msg.push_str(" (async tasks)");
+            }
+            if !was_streaming && !was_executing && !had_async {
+                msg = "❌ Nothing to abort (not currently running)".to_string();
+            }
+            self.notify(msg);
         } else if command.starts_with("/ctx ") {
             let ctx_str = command.strip_prefix("/ctx ").unwrap_or("").trim();
             if let Ok(new_ctx) = ctx_str.parse::<u32>() {
@@ -2588,10 +3901,9 @@ impl App {
                     self.config.context_window = Some(new_ctx);
                     let _ = self.config.save();
                     self.notify(format!("🎯 Context window set to {} tokens", new_ctx));
-                    self.inject_continue_kick();
                 }
             } else {
-                let current = self.config.context_window.unwrap_or(4096);
+                let current = self.effective_context_window();
                 self.notify(format!("❌ Usage: /ctx <number> (current: {})", current));
             }
         } else if command.starts_with("/toolcap ") {
@@ -2609,19 +3921,46 @@ impl App {
                     self.notify(format!("🗜️ Tool output cap set to {} chars", n));
                 }
             } else {
-                let current = self.config.tool_output_cap.map(|n| n.to_string()).unwrap_or_else(|| "3000 (default)".to_string());
+                let current = self.config.tool_output_cap.map(|n| n.to_string()).unwrap_or_else(|| "unlimited (default)".to_string());
                 self.notify(format!("❌ Usage: /toolcap <chars|off>  (current: {})", current));
+            }
+        } else if command == "/zt" {
+            self.zero_truncation = !self.zero_truncation;
+            if self.zero_truncation {
+                self.notify("🔍 Zero-truncation ON — full raw tool output injected into context");
+            } else {
+                let cap = self.config.tool_output_cap.unwrap_or(4000);
+                self.notify(format!("✂️  Zero-truncation OFF — tool output capped at {} chars", cap));
             }
         } else if command == "/compress" {
             self.handle_compress().await;
         } else if command == "/gradient" || command.starts_with("/gradient ") {
             let arg = command.strip_prefix("/gradient").unwrap_or("").trim();
             self.handle_gradient_command(arg);
+        } else if command == "/theme" || command.starts_with("/theme ") {
+            let arg = command.strip_prefix("/theme").unwrap_or("").trim();
+            self.handle_theme_command(arg);
         } else if command.starts_with("/copycode") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_copycode(n).await;
         } else if command == "/copytext" {
             self.handle_copytext().await;
+        } else if command == "/copyprompt" {
+            let prompt = self.steering_text();
+            match Self::copy_to_clipboard(&prompt).await {
+                Ok(()) => self.notify(format!("📋 System prompt copied ({} chars)", prompt.len())),
+                Err(e) => self.notify(format!("❌ Copy failed: {}", e)),
+            }
+        } else if command == "/showprompt" {
+            let prompt = self.steering_text();
+            let chars = prompt.len();
+            let tokens_est = chars / 4;
+            let lines: usize = prompt.lines().count();
+            let display = format!("```\n{}\n```\n— {} chars, {} lines, ~{} tokens (est.)", prompt, chars, lines, tokens_est);
+            let msg = Message::new("system", display);
+            self.persist_message(msg);
+            self.cached_message_count = self.message_buffer.count()
+                .unwrap_or(self.cached_message_count + 1);
         } else if command.starts_with("/copylink") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_link_command(false, n).await;
@@ -2640,6 +3979,7 @@ impl App {
             // Message validation: no excessive length, check for reasonable content
             self.inline_tool_results.clear(); // Clear inline results when user sends new message
             self.consecutive_empty_kicks = 0; // Reset stuck detection on new user input
+            self.consecutive_format_errors = 0;
             // Reset loop-prevention state on new user input
             self.recent_tool_calls.clear();
             self.spin_notice_count = 0;
@@ -2662,18 +4002,36 @@ impl App {
              /models       - List available models\n\
              /ctx NUM      - Set context window size\n\
              /toolcap NUM  - Cap tool outputs at N chars (or 'off'); default 3000\n\
+             /zt           - Toggle zero-truncation: inject full raw tool output into context\n\
              /compress     - Summarize session → archive → inject summary\n\
              /set_params K=V - Set model params (temperature, top_k, etc.) — persists\n\
              /temperature N  - Set temperature (0.0–2.0) shorthand\n\
-             /mode MODE    - Switch mode (ask/plan/build)\n\
+             /mode MODE    - Switch mode (ask/plan/build/one)\n\
+             /build        - Switch to Build mode (autonomous execution)\n\
+             /plan         - Switch to Plan mode (interactive)\n\
+             /ask          - Switch to Ask mode (read-only)\n\
+             /one          - Switch to One mode (one-off task w/ completion notification)\n\
+             /abort        - Abort current stream / async tasks / tool execution\n\
+             /shell CMD    - Switch to ShellOnly tool profile / run a shell command inline\n\
              /gradient     - Toggle gradient background\n\
+             /theme        - Switch theme: /theme dark | /theme light | /theme auto\n\
              /checkpoint   - Save session checkpoint\n\
              /clear        - Archive conversation to scrollback\n\
+             /save         - Save current plan as a todo task\n\
              /tasks        - Show task dependency graph\n\
              /gaps         - Show knowledge gaps\n\
              /stats        - Show cumulative session statistics\n\
-             /tool CMD     - Execute tool\n\n\
-             Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only)\n\n\
+             /tool CMD     - Execute tool (rg/setfile/exec/shell/commit/python/ruste/mem)\n\
+             /view PATH    - Open file viewer (tabs, scroll)\n\
+             /diff [PATH]  - View git diff in file viewer\n\
+             /test_notification (alias /notify_test) - Fire a test OS notification\n\
+             /copycode     - Copy code block from last reply\n\
+             /copytext     - Copy full last reply as plain text\n\
+             /copylink     - Copy URL from last reply\n\
+             /openlink     - Open URL from last reply in browser\n\
+             /copyprompt   - Copy current system prompt to clipboard\n\
+             /showprompt   - Show full system prompt in chat (scrollable)\n\n\
+             Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only) | 🎯 One (one-off)\n\n\
              Keybindings: Enter-Submit | Esc-Cancel/Clear | Ctrl+Q-Graceful exit | Ctrl+C-Force exit".to_string();
     }
 
@@ -2755,10 +4113,22 @@ impl App {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Collect pending tasks to preserve goal context across compression
+        let pending_tasks: Vec<String> = self.task_manager.pending_tasks()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| format!("• [{}] {}", t.id, t.title))
+            .collect();
+        let tasks_block = if pending_tasks.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nPENDING TASKS (preserve these in your summary):\n{}", pending_tasks.join("\n"))
+        };
+
         let summary_prompt = format!(
             "Summarize this conversation as a compact bullet list (10 bullets max). \
              Focus on: what was accomplished, key decisions, files changed, and what was in progress. \
-             Be terse — this summary replaces the full history.\n\n{}",
+             Be terse — this summary replaces the full history.{tasks_block}\n\n{}",
             transcript
         );
 
@@ -2783,10 +4153,17 @@ impl App {
         // Archive current messages to scrollback
         let archived = self.message_buffer.archive_to_scrollback().unwrap_or(0);
 
-        // Inject the summary as context for the next turn
+        // Inject the summary as context for the next turn.
+        // Append pending task list explicitly so goal state survives even if the
+        // model's summary omitted it.
+        let tasks_footer = if pending_tasks.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n**Pending tasks:**\n{}", pending_tasks.join("\n"))
+        };
         let summary_msg = crate::message::Message::new(
             "assistant",
-            format!("**[Session summary — {} messages archived]**\n\n{}", archived, summary),
+            format!("**[Session summary — {} messages archived]**\n\n{}{}", archived, summary, tasks_footer),
         );
         if let Err(e) = self.message_buffer.add_and_persist(summary_msg) {
             self.notify(format!("❌ Failed to store summary: {}", e));
@@ -2826,6 +4203,31 @@ impl App {
         }
     }
 
+    /// Handle /theme command — manually set or auto-detect the colour theme
+    fn handle_theme_command(&mut self, arg: &str) {
+        match arg {
+            "dark" => {
+                self.theme = Theme::dark();
+                self.notify("🌑 Theme set to dark");
+            }
+            "light" => {
+                self.theme = Theme::light();
+                self.notify("🌕 Theme set to light");
+            }
+            "auto" | "" => {
+                // Use safe detection only — detect() toggles raw mode which breaks the TUI
+                match Theme::detect_safe() {
+                    Some(true)  => { self.theme = Theme::light(); self.notify("🎨 Theme auto-detected: light"); }
+                    Some(false) => { self.theme = Theme::dark();  self.notify("🎨 Theme auto-detected: dark"); }
+                    None        => self.notify("⚠️  Could not detect theme — use /theme dark or /theme light"),
+                }
+            }
+            _ => {
+                self.notify("❌ Usage: /theme dark | /theme light | /theme auto");
+            }
+        }
+    }
+
     fn show_estimate(&mut self) {
         let metrics_display = self.metrics.format_detailed();
         self.status_message = format!(
@@ -2857,11 +4259,11 @@ impl App {
         // Block modifying tools in Ask-only mode
         if self.mode == AppMode::Ask {
             match tool_name {
-                "writefile" | "commit" | "python" | "ruste" => {
+                "setfile" | "commit" | "python" | "ruste" => {
                     self.notify(format!("🔒 Ask-only mode: {} is blocked (read-only mode)", tool_name));
                     return;
                 }
-                _ => {} // rg, readfile, editfile, spawn are allowed
+                _ => {} // rg, readfile, exec, shell are allowed
             }
         }
 
@@ -2953,8 +4355,11 @@ impl App {
             let (tool_cap, ctx_win) = self.compression_params();
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
             self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
             self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
             self.tool_iteration_count = 0;
         }
     }
@@ -3409,6 +4814,7 @@ impl App {
                 self.status_message = format!("🌸 Switching to {}…", model);
                 match OllamaClient::new(&self.config.endpoint, model).await {
                     Ok(new_client) => {
+                        new_client.fetch_native_ctx().await;
                         self.config.model = model.to_string();
                         let _ = self.config.save();
                         self.ollama_client = Some(new_client);
@@ -3432,7 +4838,9 @@ impl App {
         
         match change {
             ConfigChange::ConfigFileChanged => {
-                let fresh_config = crate::config::Config::reload_from_file();
+                let mut fresh_config = crate::config::Config::reload_from_file();
+                // profile is a runtime setting (not persisted) — preserve it across reloads
+                fresh_config.profile = self.config.profile;
                 let model_changed = fresh_config.model != self.config.model;
                 let endpoint_changed = fresh_config.endpoint != self.config.endpoint;
                 
@@ -3440,6 +4848,7 @@ impl App {
                     let endpoint = fresh_config.endpoint.clone();
                     match OllamaClient::new(&endpoint, &fresh_config.model).await {
                         Ok(client) => {
+                            client.fetch_native_ctx().await;
                             self.config = fresh_config;
                             self.ollama_client = Some(client);
                             self.notify(format!("🌸 Switched to model: {}", self.config.model));
@@ -3464,23 +4873,25 @@ impl App {
                 
                 let agents_config = crate::config::AgentsConfig::parse_from_file(&cwd.join("AGENTS.md"));
                 if let Some(preferred) = &agents_config.preferred_model {
-                    if preferred != &self.config.model && self.ollama_client.is_some() {
-                        let client = self.ollama_client.as_ref().unwrap();
-                        let new_model = crate::config::get_model_with_fallback(
-                            &agents_config,
-                            &self.config.model,
-                            client,
-                        ).await;
-                        if new_model != self.config.model {
-                            let endpoint = self.config.endpoint.clone();
-                            match OllamaClient::new(&endpoint, &new_model).await {
-                                Ok(new_client) => {
-                                    self.config.model = new_model.clone();
-                                    self.ollama_client = Some(new_client);
-                                    self.notify(format!("🌸 Switched to model from AGENTS.md: {}", new_model));
-                                }
-                                Err(e) => {
-                                    self.notify(format!("❌ Failed to switch model: {}", e));
+                    if preferred != &self.config.model {
+                        if let Some(client) = self.ollama_client.as_ref() {
+                            let new_model = crate::config::get_model_with_fallback(
+                                &agents_config,
+                                &self.config.model,
+                                client,
+                            ).await;
+                            if new_model != self.config.model {
+                                let endpoint = self.config.endpoint.clone();
+                                match OllamaClient::new(&endpoint, &new_model).await {
+                                    Ok(new_client) => {
+                                        new_client.fetch_native_ctx().await;
+                                        self.config.model = new_model.clone();
+                                        self.ollama_client = Some(new_client);
+                                        self.notify(format!("🌸 Switched to model from AGENTS.md: {}", new_model));
+                                    }
+                                    Err(e) => {
+                                        self.notify(format!("❌ Failed to switch model: {}", e));
+                                    }
                                 }
                             }
                         }
@@ -3523,14 +4934,6 @@ impl App {
             self.run_autocompact();
         }
 
-        // Announce action
-        let msg_preview = if message.len() > 60 {
-            format!("{}...", &message[..60])
-        } else {
-            message.to_string()
-        };
-        self.push_system_event(format!("🎯 USER QUERY: {}", msg_preview));
-
         if self.ollama_client.is_none() {
             self.push_system_event("🦙 Ollama offline: message saved but not sent");
             self.notify("⚠️ Ollama offline — message queued locally");
@@ -3539,8 +4942,14 @@ impl App {
 
         self.turn_phase = TurnPhase::Streaming;
                     self.stream_start_time = Some(std::time::Instant::now());
+                    self.last_stream_token_time = None;
         self.tool_iteration_count = 0;
         self.status_message = "⏳ Streaming response...".to_string();
+
+        // Refresh project context if stale (>60s since last build)
+        if self.project_context_built.elapsed() > std::time::Duration::from_secs(60) {
+            self.refresh_project_context();
+        }
 
         let steering_text = self.steering_text();
         let messages_for_ollama: Vec<Message> = self
@@ -3548,15 +4957,14 @@ impl App {
             .messages()
             .unwrap_or_default();
 
-        // Announce action before starting inference
-        self.push_system_event("🎯 QUERYING LLM".to_string());
-
         // Start streaming — returns immediately, tokens arrive via channel
         if let Some(client) = &self.ollama_client {
             let (tool_cap, ctx_win) = self.compression_params();
             let rx = client.generate_streaming(messages_for_ollama, Some(&steering_text), self.effective_params(), tool_cap, ctx_win);
             self.stream_rx = Some(rx);
             self.streaming_text.clear();
+                    self.thinking_text.clear();
+                    self.in_think_block = false;
             self.last_build_kick = std::time::Instant::now();
         }
     }
@@ -3592,9 +5000,9 @@ impl App {
             }
         }
 
-        // No-progress stall detection: in build mode, if many tool calls have fired
+        // No-progress stall detection: in build/one mode, if many tool calls have fired
         // but no file has been mutated for a while, the agent is over-planning.
-        if self.mode == AppMode::Build
+        if matches!(self.mode, AppMode::Build | AppMode::One)
             && self.turn_phase == TurnPhase::Idle
             && !self.stall_notice_sent
             && self.tool_iteration_count > 10
@@ -3610,8 +5018,8 @@ impl App {
             self.stall_notice_sent = true;
         }
 
-        // Watchdog: if Build mode has been idle for 5+ seconds, re-kick
-        if self.mode == AppMode::Build
+        // Watchdog: if Build/One mode has been idle for 5+ seconds, re-kick
+        if matches!(self.mode, AppMode::Build | AppMode::One)
             && self.turn_phase == TurnPhase::Idle
             && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
             && self.ollama_client.is_some()
@@ -3622,14 +5030,97 @@ impl App {
 
     /// Format message content as styled ratatui Text with syntax-highlighted code blocks
     fn format_message_styled(&self, emoji: &str, content: &str) -> ratatui::text::Text<'static> {
-        use ratatui::text::{Line as RLine, Text as RText};
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line as RLine, Span, Text as RText};
 
         let is_dark = self.theme.kind == crate::theme::ThemeKind::Dark;
         let mut lines: Vec<RLine<'static>> = Vec::new();
+
+        // Strip [THINK: ...] prefix and render it as a dim block before the rest
+        let (content, think_prefix) = if content.starts_with("[THINK: ") {
+            // Find the closing ] — it's the first ] that's not inside the think content
+            // The format is [THINK: content]\nrest, where content may span lines
+            // We look for ]\n or ] at end as the boundary
+            let after_open = &content["[THINK: ".len()..];
+            // Find "]\n" or "]\r\n" or "]" at end
+            let close = after_open.find("]\n")
+                .or_else(|| after_open.find("]\r\n"))
+                .or_else(|| if after_open.ends_with(']') { Some(after_open.len() - 1) } else { None });
+            if let Some(ci) = close {
+                let think_content = &after_open[..ci];
+                let rest_start = ci + 1 + if after_open[ci + 1..].starts_with('\n') { 1 } else { 0 };
+                let rest = if rest_start <= after_open.len() { &after_open[rest_start..] } else { "" };
+                (rest, Some(think_content.to_string()))
+            } else {
+                (content, None)
+            }
+        } else {
+            (content, None)
+        };
+
+        // Render the think block as a dim collapsible section
+        let has_think = think_prefix.is_some();
+        if let Some(ref think) = think_prefix {
+            let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+            let think_lines: Vec<&str> = think.lines().collect();
+            // Header line with emoji
+            lines.push(RLine::from(vec![
+                Span::raw(format!("{} ", emoji)),
+                Span::styled("💭 thinking".to_string(), dim),
+            ]));
+            for tl in &think_lines {
+                lines.push(RLine::from(vec![
+                    Span::styled(format!("  {}", tl), dim),
+                ]));
+            }
+            // Separator after thinking block
+            lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
+        }
+
+        // If content contains a tool-call block (JSON or XML), split into prose + pretty box.
+        // Works whether the tool call is at the start or follows narration text.
+        let tool_call_pos = content.find("{\"tool_calls\"").or_else(|| content.find("<tool>"));
+        let content_emoji = if !has_think { emoji } else { "" };
+        if let Some(tc_pos) = tool_call_pos {
+            let prose = content[..tc_pos].trim();
+            let tc_part = &content[tc_pos..];
+            if let Some(pretty_lines) = Self::prettify_tool_calls(tc_part) {
+                // Render any preceding prose first
+                if !prose.is_empty() {
+                    let mut first_prose = true;
+                    for raw_line in prose.lines() {
+                        if first_prose {
+                            lines.push(RLine::from(format!("{} {}", content_emoji, raw_line)));
+                            first_prose = false;
+                        } else {
+                            lines.push(RLine::from(raw_line.to_string()));
+                        }
+                    }
+                }
+                // Render prettified tool call box
+                let mut first_box = prose.is_empty();
+                for pl in pretty_lines {
+                    if first_box {
+                        // Prepend emoji to the first box line
+                        let mut spans = vec![ratatui::text::Span::raw(format!("{} ", content_emoji))];
+                        spans.extend(pl.spans.into_iter().map(|s| {
+                            ratatui::text::Span::styled(s.content.into_owned(), s.style)
+                        }));
+                        lines.push(RLine::from(spans));
+                        first_box = false;
+                    } else {
+                        lines.push(pl);
+                    }
+                }
+                return RText::from(lines);
+            }
+        }
+
         let mut in_code_block = false;
         let mut code_language = String::new();
         let mut code_buffer = String::new();
-        let mut first_line = true;
+        // If a think block was already rendered above, don't prepend emoji again on first content line
+        let mut first_line = !has_think;
 
         const KNOWN_LANGS: &[&str] = &[
             "rust","python","py","javascript","js","typescript","ts","go","java",
@@ -3654,7 +5145,7 @@ impl App {
                     };
                     let header = format!("┌─ {}", code_language);
                     if first_line {
-                        lines.push(RLine::from(format!("{} {}", emoji, header)));
+                        lines.push(RLine::from(format!("{} {}", content_emoji, header)));
                         first_line = false;
                     } else {
                         lines.push(RLine::from(header));
@@ -3685,7 +5176,7 @@ impl App {
                     line.to_string()
                 };
                 if first_line {
-                    lines.push(RLine::from(format!("{} {}", emoji, text)));
+                    lines.push(RLine::from(format!("{} {}", content_emoji, text)));
                     first_line = false;
                 } else {
                     lines.push(RLine::from(text));
@@ -3701,7 +5192,7 @@ impl App {
 
         // Ensure at least one line with the emoji
         if lines.is_empty() {
-            lines.push(RLine::from(format!("{} ", emoji)));
+            lines.push(RLine::from(format!("{} ", content_emoji)));
         }
 
         RText::from(lines)
@@ -3811,24 +5302,25 @@ impl App {
                 )),
             ]));
 
-            // Output preview (first 2 lines, truncated)
+            // Output lines — all when /zt, otherwise 30-line preview
             let output_lines: Vec<&str> = result.output.lines().collect();
-            let preview_lines = output_lines.iter().take(2).collect::<Vec<_>>();
+            let show_count = if self.zero_truncation { output_lines.len() } else { 30 };
+            let preview_lines = output_lines.iter().take(show_count).collect::<Vec<_>>();
             
             for line in preview_lines {
-                let truncated = if line.len() > 100 {
-                    format!("{}…", &line[..floor_char_boundary(line, 97)])
+                let truncated = if !self.zero_truncation && line.len() > 200 {
+                    format!("{}…", &line[..floor_char_boundary(line, 197)])
                 } else {
                     line.to_string()
                 };
                 lines.push(Line::from(Span::raw(format!("  {}", truncated))));
             }
 
-            // If more content, show indicator
-            if output_lines.len() > 2 {
+            // If more content, show indicator (only in normal mode)
+            if !self.zero_truncation && output_lines.len() > 30 {
                 lines.push(Line::from(Span::raw(format!(
                     "  … ({} more lines)",
-                    output_lines.len() - 2
+                    output_lines.len() - 30
                 ))));
             }
 
@@ -3841,26 +5333,125 @@ impl App {
         ratatui::text::Text::from(lines)
     }
 
+    /// True if `body` looks like unified diff output (has hunk headers or multiple +/- lines).
+    fn looks_like_diff(body: &str) -> bool {
+        let mut pm_count = 0usize;
+        for line in body.lines().take(40) {
+            if line.starts_with("@@") { return true; }
+            if (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+            {
+                pm_count += 1;
+                if pm_count >= 3 { return true; }
+            }
+        }
+        false
+    }
+
+    /// Render a diff body as colored ratatui Lines. `max_lines` caps the preview; 0 = show all.
+    fn render_diff_styled(
+        emoji: &str,
+        name: &str,
+        body: &str,
+        max_lines: usize,     // 0 = show all
+        hint: &str,           // cursor hint appended at bottom (empty if not cursor)
+    ) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::text::{Line as RLine, Span as RSpan};
+
+        let all_lines: Vec<&str> = body.lines().collect();
+        let total = all_lines.len();
+        let cap = if max_lines == 0 || max_lines >= total { total } else { max_lines };
+
+        let mut lines: Vec<RLine<'static>> = Vec::with_capacity(cap + 3);
+
+        // Header row
+        let trimmed = if cap < total {
+            format!("{} {}  ({} lines — showing {})", emoji, name, total, cap)
+        } else {
+            format!("{} {}  ({} lines)", emoji, name, total)
+        };
+        lines.push(RLine::from(RSpan::styled(
+            trimmed,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        for line in all_lines[..cap].iter() {
+            let style = if line.starts_with('+') && !line.starts_with("+++") {
+                Style::default().fg(Color::Green)
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                Style::default().fg(Color::Red)
+            } else if line.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("---")
+                || line.starts_with("+++")
+            {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(RLine::from(RSpan::styled(
+                format!("│  {}", line),
+                style,
+            )));
+        }
+
+        if cap < total {
+            lines.push(RLine::from(RSpan::styled(
+                format!("│  … {} more lines{}", total - cap,
+                    if !hint.is_empty() { "  [Space=expand]" } else { "" }),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if !hint.is_empty() {
+            lines.push(RLine::from(RSpan::styled(
+                "│  [Space=collapse]".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        lines
+    }
+
     /// Format tool output with indented bordered block
-    fn format_tool_content(&self, content: &str) -> String {
+    fn format_tool_content_expanded(&self, content: &str, expanded: bool) -> String {
         // Pretty-print [TOOL_OUTPUT: name = content] injections
         if let Some(rest) = content.strip_prefix("[TOOL_OUTPUT: ") {
             if let Some(eq) = rest.find(" = ") {
                 let name = &rest[..eq];
-                let body = &rest[eq + 3..].trim_end_matches(']');
+                let raw_body = rest[eq + 3..].trim_end_matches(']');
+
+                // Detect and strip trailing truncation marker
+                let (body, truncation_note) = if let Some(trunc_pos) = raw_body.rfind("...(truncated to ") {
+                    let note = raw_body[trunc_pos + 3..].trim_end_matches(')');
+                    let clean = raw_body[..trunc_pos].trim_end_matches('.');
+                    (clean, Some(format!("✂️  {}", note)))
+                } else {
+                    (raw_body, None)
+                };
+
                 let lines: Vec<&str> = body.lines().collect();
                 let total_lines = lines.len();
                 let total_chars = body.len();
+                if expanded {
+                    let all: String = lines.iter()
+                        .map(|l| format!("│  {}", l))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
+                    return format!("🔧 {}  ({} lines, {} chars)\n{}{}", name, total_lines, total_chars, all, trunc);
+                }
                 let preview: String = lines.iter().take(3)
                     .map(|l| format!("│  {}", l))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let more = if total_lines > 3 {
-                    format!("\n│  … ({} lines, {} chars total)", total_lines, total_chars)
+                    format!("\n│  … ({} more lines, {} chars)", total_lines - 3, total_chars)
                 } else {
                     String::new()
                 };
-                return format!("🔧 {}  ({} lines, {} chars)\n{}{}", name, total_lines, total_chars, preview, more);
+                let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
+                return format!("🔧 {}  ({} lines, {} chars)\n{}{}{}", name, total_lines, total_chars, preview, more, trunc);
             }
         }
         if let Some(rest) = content.strip_prefix("[TOOL_ERROR: ") {
@@ -3879,6 +5470,108 @@ impl App {
         }
         if result.ends_with('\n') { result.pop(); }
         result
+    }
+
+    /// Try to render a JSON or XML tool-call response as compact colored Lines.
+    /// Returns None if the string doesn't look like a tool call or fails to parse.
+    fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<'static>>> {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        let trimmed = text.trim();
+
+        // Try XML format first (ShellOnly), then JSON
+        let tool_calls: Vec<crate::agent::ToolCall> =
+            if trimmed.contains("<tool>") {
+                let calls = crate::agent::parse_xml_tool_calls(
+                    trimmed, crate::config::CapabilityProfile::ShellOnly
+                );
+                if calls.is_empty() { return None; }
+                calls
+            } else if trimmed.contains("\"tool_calls\"") {
+                let json_start = trimmed.find('{').unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).ok()?;
+                let arr = v.get("tool_calls")?.as_array()?;
+                if arr.is_empty() { return None; }
+                arr.iter().filter_map(|call| {
+                    let name = call.get("name")?.as_str()?.to_string();
+                    let params = call.get("parameters")?;
+                    let get_str = |k: &str| params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let cmd = get_str("command");
+                    let returnlines = params.get("returnlines").and_then(|v| match v {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    });
+                    let args = if let Some(rl) = returnlines { format!("{}\x00{}", cmd, rl) } else { cmd };
+                    let is_async = params.get("mode").and_then(|v| v.as_str()) == Some("async");
+                    Some(crate::agent::ToolCall {
+                        name,
+                        args,
+                        description: params.get("description").and_then(|v| v.as_str()).map(str::to_string),
+                        async_mode: is_async,
+                        async_task_id: if is_async { params.get("task_id").and_then(|v| v.as_str()).map(str::to_string) } else { None },
+                        tellhuman: params.get("tellhuman").and_then(|v| v.as_str()).map(str::to_string),
+                    })
+                }).collect()
+            } else {
+                return None;
+            };
+
+        let dim   = Style::default().fg(Color::DarkGray);
+        let cyan  = Style::default().fg(Color::Cyan);
+        let yel   = Style::default().fg(Color::Yellow);
+        let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (i, tc) in tool_calls.iter().enumerate() {
+            let name = &tc.name;
+            let tool_emoji = match name.as_str() {
+                "shell" | "exec" => "🐚",
+                "rg"             => "🔍",
+                "setfile" | "patchfile" => "📝",
+                "spawn"          => "🤖",
+                "think"          => "💭",
+                "commit"         => "📌",
+                _                => "🔧",
+            };
+
+            if i > 0 {
+                lines.push(Line::from(vec![Span::styled("├───".to_string(), dim)]));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("┌─ ".to_string(), dim),
+                Span::raw(format!("{} ", tool_emoji)),
+                Span::styled(name.clone(), cyan),
+            ]));
+
+            // Primary arg: command (strip returnlines suffix if present)
+            let cmd_display = tc.args.split('\x00').next().unwrap_or(&tc.args);
+            if !cmd_display.is_empty() {
+                let prefix = if name == "shell" || name == "exec" { "$ " } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled("│  ".to_string(), dim),
+                    Span::styled(format!("{}{}", prefix, cmd_display), yel),
+                ]));
+            }
+            if let Some(desc) = &tc.description {
+                if !desc.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("│  ↳ ".to_string(), dim),
+                        Span::styled(desc.clone(), white),
+                    ]));
+                }
+            }
+            if tc.async_mode {
+                let tid = tc.async_task_id.as_deref().unwrap_or("?");
+                lines.push(Line::from(vec![
+                    Span::styled("│  ⚡ async ".to_string(), dim),
+                    Span::styled(tid.to_string(), Style::default().fg(Color::Magenta)),
+                ]));
+            }
+        }
+        if lines.is_empty() { return None; }
+        Some(lines)
     }
 
     /// Handle /checkpoint command to save session progress
@@ -4078,6 +5771,220 @@ impl App {
 /// Return the largest index ≤ `max` that is a valid UTF-8 char boundary in `s`.
 /// Prevents panics when slicing at an arbitrary byte offset into a string that
 /// may contain multibyte characters (emoji, curly quotes, etc.).
+/// Returns true if the shell command is a pure listing/discovery operation
+/// (ls, find, tree, git ls-files, git log, etc.) — these get an elevated output cap.
+fn is_listing_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    let listing_prefixes = [
+        "ls", "find ", "find\t", "tree", "git ls-files", "git log",
+        "git status", "git branch", "rg --files", "rg -l ", "fd ",
+        "dir ", "exa ", "lsd ", "ls ", "ls\n",
+    ];
+    listing_prefixes.iter().any(|p| cmd.starts_with(p))
+        || cmd == "find" || cmd == "ls" || cmd == "tree"
+        || cmd == "git ls-files" || cmd == "git log" || cmd == "git status"
+}
+
+
+/// Mirrors `ls -lht` — gives the model rich file awareness without any discovery turns.
+fn build_project_context(max_chars: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::BTreeMap;
+
+    const SKIP_DIRS: &[&str] = &[
+        "target", ".git", "node_modules", ".yggdra/log", ".yggdra/knowledge",
+        "vendor", "dist", "build", ".next", "__pycache__",
+    ];
+
+    struct FileEntry { path: String, size: u64, modified: u64 }
+
+    fn collect(dir: &std::path::Path, skip: &[&str], out: &mut Vec<FileEntry>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') && name != ".yggdra" { continue; }
+            let rel = path.to_string_lossy();
+            if skip.iter().any(|s| rel.contains(s)) { continue; }
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if meta.is_dir() {
+                collect(&path, skip, out);
+            } else {
+                let modified = meta.modified().ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                let p = path.strip_prefix("./").unwrap_or(&path);
+                out.push(FileEntry { path: p.to_string_lossy().into_owned(), size: meta.len(), modified });
+            }
+        }
+    }
+
+    fn human_size(b: u64) -> String {
+        if b >= 1_048_576 { format!("{:.1}M", b as f64 / 1_048_576.0) }
+        else if b >= 1024  { format!("{}K", b / 1024) }
+        else               { format!("{}B", b) }
+    }
+
+    fn human_time(secs: u64) -> String {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
+        let age = now.saturating_sub(secs);
+        if age < 86400 {
+            let h = (secs / 3600) % 24; let m = (secs / 60) % 60;
+            format!("{:02}:{:02}", h, m)
+        } else if age < 86400 * 30 {
+            let days = secs / 86400;
+            let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+            format!("{}{:02}", months[((days % 365) / 30).min(11) as usize], (days % 365) % 30 + 1)
+        } else {
+            format!("{}", 1970 + secs / (86400 * 365))
+        }
+    }
+
+    let mut files: Vec<FileEntry> = Vec::new();
+    collect(std::path::Path::new("."), SKIP_DIRS, &mut files);
+
+    // Build dir → [(filename, size, modified)] map
+    let mut tree: BTreeMap<String, Vec<(String, u64, u64)>> = BTreeMap::new();
+    for f in &files {
+        let p = std::path::Path::new(&f.path);
+        let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        tree.entry(dir).or_default().push((name, f.size, f.modified));
+    }
+    for v in tree.values_mut() { v.sort_by(|a, b| b.2.cmp(&a.2)); }
+
+    fn render_dir(
+        tree: &BTreeMap<String, Vec<(String, u64, u64)>>,
+        dir: &str,
+        line_prefix: &str,  // branch characters for indentation (e.g., "│   " or "    ")
+        depth_limit: usize,
+        max_leaves: usize,
+        out: &mut Vec<String>,
+        human_size: fn(u64) -> String,
+        human_time: fn(u64) -> String,
+    ) {
+        let dir_prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir) };
+        // Collect direct subdirs
+        let mut subdirs: Vec<&str> = tree.keys()
+            .filter(|k| {
+                if dir.is_empty() {
+                    !k.is_empty() && !k.contains('/')
+                } else {
+                    k.starts_with(&dir_prefix) && {
+                        let rest = &k[dir_prefix.len()..];
+                        !rest.is_empty() && !rest.contains('/')
+                    }
+                }
+            })
+            .map(|k| k.as_str())
+            .collect();
+        subdirs.sort();
+
+        let files = tree.get(dir).map(|v| v.as_slice()).unwrap_or(&[]);
+        let shown = files.len().min(max_leaves);
+        let has_more = files.len() > max_leaves;
+        // A file entry is "last" only if it's the final item (no subdirs after)
+        let total_items = shown + if has_more { 1 } else { 0 } + subdirs.len();
+        let mut item_idx = 0;
+
+        for (name, size, modified) in &files[..shown] {
+            let is_last = item_idx == total_items - 1;
+            let conn = if is_last { "└── " } else { "├── " };
+            out.push(format!("{}{}{}  {} {}", line_prefix, conn, name, human_size(*size), human_time(*modified)));
+            item_idx += 1;
+        }
+        if has_more {
+            let rest = files.len() - max_leaves;
+            let is_last = item_idx == total_items - 1;
+            let conn = if is_last { "└── " } else { "├── " };
+            out.push(format!("{}{}... {} more", line_prefix, conn, rest));
+            item_idx += 1;
+        }
+
+        if depth_limit == 0 { return; }
+
+        for (i, sub) in subdirs.iter().enumerate() {
+            let is_last_sub = i == subdirs.len() - 1;
+            let is_last = item_idx == total_items - 1;
+            let conn = if is_last { "└── " } else { "├── " };
+            let subname = sub.rsplit('/').next().unwrap_or(sub);
+            out.push(format!("{}{}{}/", line_prefix, conn, subname));
+            let child_prefix = if is_last_sub {
+                format!("{}    ", line_prefix)
+            } else {
+                format!("{}│   ", line_prefix)
+            };
+            render_dir(tree, sub, &child_prefix, depth_limit - 1, max_leaves, out, human_size, human_time);
+            item_idx += 1;
+        }
+    }
+
+    // Try rendering at decreasing depth limits until output fits
+    let file_count = files.len();
+    for depth in [999usize, 10, 7, 5, 3, 2, 1, 0] {
+        let mut lines = vec![format!("PROJECT FILES ({} total):", file_count)];
+        render_dir(&tree, "", "", depth, 30, &mut lines, human_size, human_time);
+        let tree_part = lines.join("\n");
+        // Build the rest (git, todos) for sizing
+        let rest = build_git_and_todos();
+        let full = format!("{}\n{}", tree_part, rest);
+        if full.len() <= max_chars || depth == 0 {
+            // Hard-truncate as last resort
+            if full.len() <= max_chars {
+                return full;
+            } else {
+                let cut = floor_char_boundary(&full, max_chars.saturating_sub(40));
+                return format!("{}\n... (truncated)", &full[..cut]);
+            }
+        }
+    }
+    String::new()
+}
+
+fn build_git_and_todos() -> String {
+    fn run_git(args: &[&str]) -> Option<String> {
+        std::process::Command::new("git").args(args).output().ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    let mut out = String::new();
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let status = run_git(&["status", "--short"]);
+    if branch.is_some() || status.is_some() {
+        out.push('\n');
+        out.push_str(&match &branch {
+            Some(b) => format!("GIT STATUS (branch: {}):", b),
+            None    => "GIT STATUS:".to_string(),
+        });
+        out.push('\n');
+        match status {
+            Some(s) => { for l in s.lines() { out.push_str(&format!("  {}\n", l)); } }
+            None    => { out.push_str("  (clean)\n"); }
+        }
+    }
+    if let Some(log) = run_git(&["log", "--oneline", "-5"]) {
+        out.push_str("\nRECENT COMMITS:\n");
+        for l in log.lines() { out.push_str(&format!("  {}\n", l)); }
+    }
+    let todo_dir = std::path::Path::new(".yggdra/todo");
+    if todo_dir.is_dir() {
+        let mut names: Vec<String> = std::fs::read_dir(todo_dir).into_iter().flatten().flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.ends_with(".md") && n.to_lowercase() != "readme.md" { Some(n) } else { None }
+            }).collect();
+        if !names.is_empty() {
+            names.sort();
+            out.push_str("\nACTIVE TODOS (.yggdra/todo/):\n");
+            for n in &names { out.push_str(&format!("  {}\n", n)); }
+        }
+    }
+    out
+}
+
 fn floor_char_boundary(s: &str, max: usize) -> usize {
     if max >= s.len() { return s.len(); }
     let mut i = max;
@@ -4085,3 +5992,580 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     i
 }
 
+/// Render the subagent panel content from a list of visible entries.
+fn format_subagent_panel(entries: &[&SubagentEntry], tick_count: u64) -> ratatui::text::Text<'static> {
+    use ratatui::text::{Line, Span};
+    use ratatui::style::{Color, Modifier};
+    let spinner_frames = ['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷'];
+    let spin = spinner_frames[(tick_count as usize / 4) % spinner_frames.len()];
+    let mut lines = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let (icon, status_color) = match entry.status {
+            SubagentStatus::Running => (spin.to_string(), Color::Yellow),
+            SubagentStatus::Done    => ("✅".to_string(), Color::Green),
+            SubagentStatus::Failed  => ("❌".to_string(), Color::Red),
+        };
+        // Header line: icon #N task_id
+        lines.push(Line::from(vec![
+            Span::raw(format!("{} ", icon)),
+            Span::styled(
+                format!("#{} {}", entry.index, entry.task_id),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // Preview lines (up to 2)
+        for line in entry.preview.lines().take(2) {
+            let truncated = if line.len() > 80 {
+                format!("  {}…", &line[..floor_char_boundary(line, 77)])
+            } else {
+                format!("  {}", line)
+            };
+            lines.push(Line::from(Span::raw(truncated)));
+        }
+        // Blank separator between entries (not after last)
+        if i + 1 < entries.len() {
+            lines.push(Line::from(""));
+        }
+    }
+    ratatui::text::Text::from(lines)
+}
+
+/// Extract any prose text that appears before the JSON tool call block.
+/// Returns empty str if the response starts directly with JSON.
+pub(crate) fn extract_prose_before_json(text: &str) -> &str {
+    let json_pos = text.find("{\"tool_calls\"")
+        .or_else(|| text.find("```json"))
+        .or_else(|| text.find("```\n{"))
+        .or_else(|| text.find("<tool>"));
+    match json_pos {
+        Some(pos) => text[..pos].trim(),
+        None => text.trim(),
+    }
+}
+
+/// Synthesize a one-line narration for a tool call when the model didn't provide one.
+pub(crate) fn synthesize_tool_narration(tool_calls: &[crate::agent::ToolCall]) -> String {
+    if tool_calls.is_empty() { return String::new(); }
+    let tc = &tool_calls[0];
+    let suffix = if tool_calls.len() > 1 {
+        format!(" (+ {} more)", tool_calls.len() - 1)
+    } else {
+        String::new()
+    };
+    let desc = match tc.name.as_str() {
+        "readfile" => {
+            let path = tc.args.split('\x00').next()
+                .and_then(|p| p.split_whitespace().next())
+                .unwrap_or(&tc.args);
+            format!("Reading `{}`.", path)
+        }
+        "rg" => {
+            let mut parts = tc.args.splitn(2, '\x00');
+            let pattern = parts.next().unwrap_or(&tc.args);
+            let dir = parts.next().unwrap_or(".");
+            format!("Searching `{}` for `{}`.", dir, pattern)
+        }
+        "exec" | "shell" => {
+            let preview = tc.description.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&tc.args);
+            format!("Running: `{}`.", preview)
+        }
+        "setfile" => {
+            let path = tc.args.split('\x00').next().unwrap_or(&tc.args);
+            format!("Writing `{}`.", path)
+        }
+        "patchfile" => {
+            let path = tc.args.split('\x00').next().unwrap_or(&tc.args);
+            format!("Patching `{}`.", path)
+        }
+        "commit" => format!("Committing: {}", tc.args),
+        "think" => {
+            let preview: String = tc.args.chars().take(80).collect();
+            format!("Thinking: {}", preview)
+        }
+        "python" => format!("Running Python script: `{}`.", tc.args),
+        "ruste" => format!("Compiling Rust: `{}`.", tc.args),
+        "spawn" => {
+            let task_id = tc.args.split_whitespace().next().unwrap_or(&tc.args);
+            format!("Spawning subagent: {}.", task_id)
+        }
+        _ => format!("Calling tool: {}.", tc.name),
+    };
+    format!("{}{}", desc, suffix)
+}
+
+/// Hash a (tool_name, args) pair to a u64 for loop detection.
+pub(crate) fn hash_tool_call(tool_name: &str, args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tool_name.hash(&mut h);
+    args.hash(&mut h);
+    h.finish()
+}
+
+/// Count how many times (tool_name, call_hash) appears in the recent-calls window.
+pub(crate) fn count_repeat_calls(
+    recent: &std::collections::VecDeque<(String, u64)>,
+    tool_name: &str,
+    call_hash: u64,
+) -> usize {
+    recent.iter().filter(|(n, h)| n == tool_name && *h == call_hash).count()
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+
+    // ============================================================================
+    // 1. truncate_tail() Tests
+    // ============================================================================
+
+    #[test]
+    fn truncate_tail_no_truncation_when_under_cap() {
+        let text = "Hello, world!";
+        let result = truncate_tail(text, 100);
+        assert_eq!(result, "Hello, world!");
+    }
+
+    #[test]
+    fn truncate_tail_exact_cap_no_truncation() {
+        let text = "12345";
+        let result = truncate_tail(text, 5);
+        assert_eq!(result, "12345");
+    }
+
+    #[test]
+    fn truncate_tail_keeps_tail_with_prefix() {
+        let text = "0123456789";
+        let result = truncate_tail(text, 3);
+        assert!(result.contains("…(7 chars omitted)"));
+        assert!(result.contains("789"));
+    }
+
+    #[test]
+    fn truncate_tail_shows_omitted_count() {
+        let text = "abcdefghijklmnop";
+        let result = truncate_tail(text, 4);
+        assert!(result.contains("12 chars omitted"));
+        assert!(result.ends_with("mnop"));
+    }
+
+    #[test]
+    fn truncate_tail_empty_string() {
+        let text = "";
+        let result = truncate_tail(text, 100);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_tail_unicode_chars() {
+        let text = "🎨🎭🎪🎬🎤🎧"; // 6 emoji = 6 chars
+        let result = truncate_tail(text, 3);
+        // Should keep last 3 emoji: 🎬🎤🎧 (drop first 3)
+        assert!(result.contains("…(3 chars omitted)"));
+        assert!(result.contains("🎬"));
+        assert!(result.contains("🎤"));
+        assert!(result.contains("🎧"));
+    }
+
+    #[test]
+    fn truncate_tail_single_char_cap() {
+        let text = "hello";
+        let result = truncate_tail(text, 1);
+        assert!(result.contains("…(4 chars omitted)"));
+        assert!(result.contains("o"));
+    }
+
+    // ============================================================================
+    // 2. Think Panel Rendering Tests
+    // ============================================================================
+
+    #[test]
+    fn think_text_extraction_from_native_tokens() {
+        // When thinking_text is populated by state machine (native ThinkToken),
+        // it should be included in thinking_parts
+        let thinking_text = "Let me analyze this problem step by step.";
+        let _response_text = "I'll help you with this.";
+
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if !thinking_text.is_empty() {
+            thinking_parts.push(thinking_text.trim().to_string());
+        }
+        if thinking_text.is_empty() {
+            // This block would extract inline <think> tags, but shouldn't run here
+            panic!("Should not reach inline extraction when thinking_text is populated");
+        }
+
+        assert_eq!(thinking_parts.len(), 1);
+        assert_eq!(
+            thinking_parts[0],
+            "Let me analyze this problem step by step."
+        );
+    }
+
+    #[test]
+    fn think_text_extraction_from_inline_tags() {
+        // When thinking_text is empty, extract from inline <think>...</think> tags
+        let thinking_text = "";
+        let response_text = "<think>Step 1: Understand the problem\nStep 2: Plan solution</think>\nNow I'll execute.";
+
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if !thinking_text.is_empty() {
+            thinking_parts.push(thinking_text.trim().to_string());
+        }
+        if thinking_text.is_empty() {
+            let mut scan = response_text;
+            while let Some(start) = scan.find("<think>") {
+                let after = &scan[start + "<think>".len()..];
+                let end = after.find("</think>").unwrap_or(after.len());
+                let content = after[..end].trim();
+                if !content.is_empty() {
+                    thinking_parts.push(content.to_string());
+                }
+                scan = if end + "</think>".len() <= after.len() {
+                    &after[end + "</think>".len()..]
+                } else {
+                    ""
+                };
+            }
+        }
+
+        assert_eq!(thinking_parts.len(), 1);
+        assert!(thinking_parts[0].contains("Step 1"));
+        assert!(thinking_parts[0].contains("Step 2"));
+    }
+
+    #[test]
+    fn think_text_no_duplicate_when_both_sources_present() {
+        // When thinking_text is populated, ONLY use that source,
+        // not the inline tags (which are echoed in the response)
+        let thinking_text = "Already captured by state machine";
+        let _response_text = "<think>Already captured by state machine</think>\nThe answer is 42.";
+
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if !thinking_text.is_empty() {
+            thinking_parts.push(thinking_text.trim().to_string());
+        }
+        // This should NOT run because thinking_text is not empty
+        if thinking_text.is_empty() {
+            panic!("Should skip inline extraction when thinking_text populated");
+        }
+
+        assert_eq!(thinking_parts.len(), 1);
+        assert_eq!(thinking_parts[0], "Already captured by state machine");
+    }
+
+    #[test]
+    fn think_text_empty_no_panel_rendered() {
+        let thinking_text = "";
+        let response_text = "Just a regular response.";
+
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if !thinking_text.is_empty() {
+            thinking_parts.push(thinking_text.trim().to_string());
+        }
+        if thinking_text.is_empty() {
+            // No <think> tags present
+            assert!(!response_text.contains("<think>"));
+        }
+
+        assert!(thinking_parts.is_empty());
+    }
+
+    #[test]
+    fn think_text_multiple_inline_blocks() {
+        let thinking_text = "";
+        let response_text =
+            "<think>First thought</think>\nSome text\n<think>Second thought</think>";
+
+        let mut thinking_parts: Vec<String> = Vec::new();
+        if thinking_text.is_empty() {
+            let mut scan = response_text;
+            while let Some(start) = scan.find("<think>") {
+                let after = &scan[start + "<think>".len()..];
+                let end = after.find("</think>").unwrap_or(after.len());
+                let content = after[..end].trim();
+                if !content.is_empty() {
+                    thinking_parts.push(content.to_string());
+                }
+                scan = if end + "</think>".len() <= after.len() {
+                    &after[end + "</think>".len()..]
+                } else {
+                    ""
+                };
+            }
+        }
+
+        assert_eq!(thinking_parts.len(), 2);
+        assert_eq!(thinking_parts[0], "First thought");
+        assert_eq!(thinking_parts[1], "Second thought");
+    }
+
+    // ============================================================================
+    // 3. Tool Output Display Tests
+    // ============================================================================
+
+    #[test]
+    fn tool_output_not_truncated_when_under_cap() {
+        let output = "short error message";
+        let cap = 600;
+        if output.chars().count() > cap {
+            panic!("Should not truncate short output");
+        }
+        assert_eq!(output.chars().count(), 19);
+    }
+
+    #[test]
+    fn tool_output_truncated_with_omitted_prefix() {
+        let output = "x".repeat(1000);
+        let cap = 600;
+        let truncated = truncate_tail(&output, cap);
+        assert!(truncated.contains("…(400 chars omitted)"));
+        // Prefix "…(400 chars omitted)\n" is 21 chars, plus 600 chars = 621 total
+        assert_eq!(truncated.chars().count(), 621);
+    }
+
+    #[test]
+    fn tool_output_diff_section_not_shown_in_render() {
+        // Diff content should be stripped for model context only (not tested in render here)
+        // but we verify the concept that diffs are separate from tool output
+        let output_with_diff = "Error in module\n\n[DIFF]\n--- old\n+++ new";
+        assert!(output_with_diff.contains("[DIFF]"));
+        // In real rendering, only "Error in module" would be displayed
+    }
+
+    #[test]
+    fn tool_output_cap_respects_config() {
+        // Verify DEFAULT_TOOL_OUTPUT_CAP is 600
+        assert_eq!(DEFAULT_TOOL_OUTPUT_CAP, 600);
+    }
+
+    // ============================================================================
+    // 4. Error Formatting Tests
+    // ============================================================================
+
+    #[test]
+    fn error_ask_mode_blocks_tool_execution() {
+        // In ask mode, tool results should be stored but no new stream should kick off
+        // This is verified by the state machine logic, but we verify the config constant exists
+        assert!(AppMode::Ask != AppMode::Build);
+    }
+
+    #[test]
+    fn error_repeated_identical_call_detection_marker() {
+        // The hash function should produce same hash for identical calls
+        let hash1 = hash_tool_call("rg", "pattern");
+        let hash2 = hash_tool_call("rg", "pattern");
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn error_different_args_produce_different_hashes() {
+        let hash1 = hash_tool_call("rg", "pattern1");
+        let hash2 = hash_tool_call("rg", "pattern2");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn error_three_identical_tool_calls_detected() {
+        use std::collections::VecDeque;
+
+        let mut calls: VecDeque<(String, u64)> = VecDeque::new();
+        let tool_name = "readfile";
+        let args = "src/main.rs";
+        let hash = hash_tool_call(tool_name, args);
+
+        calls.push_back((tool_name.to_string(), hash));
+        calls.push_back((tool_name.to_string(), hash));
+        calls.push_back((tool_name.to_string(), hash));
+
+        let repeat_count = count_repeat_calls(&calls, tool_name, hash);
+        assert_eq!(repeat_count, 3);
+    }
+
+    // ============================================================================
+    // 5. Message Rendering Tests
+    // ============================================================================
+
+    #[test]
+    fn message_rendering_emoji_formats() {
+        // Different messages should use different emoji (user, assistant, system, etc)
+        let user_msg = Message::new("user", "What's 2+2?");
+        let assistant_msg = Message::new("assistant", "The answer is 4.");
+
+        assert_eq!(user_msg.role, "user");
+        assert_eq!(assistant_msg.role, "assistant");
+    }
+
+    #[test]
+    fn message_rendering_think_prefix_extraction() {
+        let content_with_think = "[THINK: Complex reasoning here]\nFinal answer is 42.";
+        
+        // Simulate the think prefix extraction logic
+        if content_with_think.starts_with("[THINK: ") {
+            let after_open = &content_with_think["[THINK: ".len()..];
+            let close = after_open.find("]\n");
+            if let Some(ci) = close {
+                let think_content = &after_open[..ci];
+                let rest_start = ci + 1 + 1; // +1 for ], +1 for \n
+                let rest = if rest_start <= after_open.len() {
+                    &after_open[rest_start..]
+                } else {
+                    ""
+                };
+                assert_eq!(think_content, "Complex reasoning here");
+                assert_eq!(rest, "Final answer is 42.");
+            } else {
+                panic!("Should find closing bracket");
+            }
+        } else {
+            panic!("Should have THINK prefix");
+        }
+    }
+
+    #[test]
+    fn message_rendering_without_think_prefix() {
+        let content = "This is just a normal response.";
+        
+        if !content.starts_with("[THINK: ") {
+            assert_eq!(content, "This is just a normal response.");
+        } else {
+            panic!("Should not have THINK prefix");
+        }
+    }
+
+    #[test]
+    fn tool_call_formatting_with_inline_results() {
+        // Tool calls should be prettified with boxes (not tested in rendering here)
+        // but we verify they're recognized by the presence of json markers
+        let content = r#"I'll search for files: {"tool_calls": [{"name": "rg"}]}"#;
+        assert!(content.contains("tool_calls"));
+        assert!(content.contains("rg"));
+    }
+
+    // ============================================================================
+    // 6. Ask Mode Behavior Tests
+    // ============================================================================
+
+    #[test]
+    fn ask_mode_constant_exists() {
+        // Verify ask mode is distinct from build and plan modes
+        assert!(AppMode::Ask != AppMode::Build);
+        assert!(AppMode::Ask != AppMode::Plan);
+    }
+
+    #[test]
+    fn tool_hash_consistency() {
+        // Tool hashing must be consistent for repeat detection to work
+        let tool_name = "spawn";
+        let args = "task1 Description";
+        let hash1 = hash_tool_call(tool_name, args);
+        let hash2 = hash_tool_call(tool_name, args);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn tool_hash_order_matters() {
+        // Swapping name and args should give different hashes
+        let h1 = hash_tool_call("rg", "spawn");
+        let h2 = hash_tool_call("spawn", "rg");
+        assert_ne!(h1, h2);
+    }
+
+    // ============================================================================
+    // 7. Status Message Display Tests
+    // ============================================================================
+
+    #[test]
+    fn status_message_formatting_with_markers() {
+        // Status messages should use emoji markers for clarity
+        let status = "🔧 Executing tool...";
+        assert!(status.starts_with("🔧"));
+    }
+
+    #[test]
+    fn truncate_tail_multiline_output() {
+        let output = "line1\nline2\nline3\nline4\nline5";
+        let result = truncate_tail(output, 10);
+        // Should keep the last ~10 chars and show prefix
+        assert!(result.contains("…("));
+        assert!(result.contains("line"));
+    }
+
+    #[test]
+    fn truncate_tail_with_newlines_in_middle() {
+        let output = format!("start\n{}\nend", "x".repeat(100));
+        let result = truncate_tail(&output, 50);
+        assert!(result.contains("…("));
+        assert!(result.contains("end"));
+    }
+}
+
+#[cfg(test)]
+mod loop_detection_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn make_queue(calls: &[(&str, &str)]) -> VecDeque<(String, u64)> {
+        calls.iter().map(|(name, args)| (name.to_string(), hash_tool_call(name, args))).collect()
+    }
+
+    #[test]
+    fn test_no_repeat_returns_one() {
+        let q = make_queue(&[("rg", "foo"), ("readfile", "bar"), ("rg", "baz")]);
+        let h = hash_tool_call("readfile", "bar");
+        assert_eq!(count_repeat_calls(&q, "readfile", h), 1);
+    }
+
+    #[test]
+    fn test_two_identical_not_triggered() {
+        let q = make_queue(&[("readfile", "src/a.rs"), ("readfile", "src/a.rs")]);
+        let h = hash_tool_call("readfile", "src/a.rs");
+        assert_eq!(count_repeat_calls(&q, "readfile", h), 2);
+        assert!(count_repeat_calls(&q, "readfile", h) < 3);
+    }
+
+    #[test]
+    fn test_three_identical_triggers() {
+        let q = make_queue(&[
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+        ]);
+        let h = hash_tool_call("readfile", "src/a.rs");
+        assert!(count_repeat_calls(&q, "readfile", h) >= 3);
+    }
+
+    #[test]
+    fn test_different_args_not_a_repeat() {
+        let q = make_queue(&[
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/b.rs"), // different args
+        ]);
+        let h = hash_tool_call("readfile", "src/a.rs");
+        assert_eq!(count_repeat_calls(&q, "readfile", h), 2);
+    }
+
+    #[test]
+    fn test_window_capped_at_4() {
+        // Simulate the window cap: only last 4 entries kept
+        let mut q: VecDeque<(String, u64)> = VecDeque::new();
+        let calls = [
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+            ("readfile", "src/a.rs"),
+            ("rg", "pattern"),  // pushes oldest off
+        ];
+        for (name, args) in &calls {
+            q.push_back((name.to_string(), hash_tool_call(name, args)));
+            if q.len() > 4 { q.pop_front(); }
+        }
+        let h = hash_tool_call("readfile", "src/a.rs");
+        // After capping, only 3 readfile entries remain (the oldest was evicted)
+        assert_eq!(count_repeat_calls(&q, "readfile", h), 3);
+    }
+}

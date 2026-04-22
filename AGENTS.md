@@ -8,7 +8,7 @@ files without internet access.
 
 ```sh
 cargo build --release      # release binary → target/release/yggdra
-cargo test --lib           # 40 tests, must stay green
+cargo test --lib           # 264 tests, must stay green
 make install               # copies binary to ~/.local/bin/yggdra
 ```
 
@@ -19,10 +19,13 @@ Always run `cargo test --lib` after any change. Do not leave tests failing.
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | Entry point: session init, Ollama connect, launch App, CLI arg parsing |
-| `src/ui.rs` | TUI app (~1250 lines): event loop, rendering, command dispatch |
-| `src/agent.rs` | Agentic loop: tool calls, subagent spawning, steering, Qwen/Gemma format parsing |
+| `src/ui.rs` | TUI app (~6540 lines): event loop, rendering, command dispatch |
+| `src/agent.rs` | Agentic loop: tool calls, subagent spawning, steering, JSON/Qwen/Gemma format parsing |
 | `src/spawner.rs` | Hierarchical subagent execution (max depth 10) |
-| `src/tools.rs` | Tool implementations: rg, spawn, editfile, commit, python, ruste |
+| `src/tools.rs` | Tool implementations: rg, exec, editfile, setfile, commit, shell, python, ruste, spawn |
+| `src/notifications.rs` | Native OS notifications (macOS via osascript) |
+| `src/watcher.rs` | Filesystem watching for live config reload |
+| `src/knowledge_index.rs` | Offline doc indexing for the knowledge base |
 | `src/ollama.rs` | Ollama HTTP client (streaming + non-streaming) |
 | `src/message.rs` | SQLite-backed message buffer + scrollback |
 | `src/msglog.rs` | Async `.yggdra/log/YYYY/MM/DD/HHMM/SS-role.md` writer |
@@ -35,10 +38,11 @@ Always run `cargo test --lib` after any change. Do not leave tests failing.
 
 ## Key conventions
 
-- **Tool format**: `<|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>` (Qwen/Gemma format)
-  - Also supports legacy format: `[TOOL: name args]` (for backward compatibility)
-  - Parser: `agent::parse_tool_calls()` handles both formats
-- Subagent spawns: `<|tool>spawn_agent<|tool_sep>task_id<|tool_sep>description<|end_tool>`
+- **Tool format**: JSON tool calling is the default (OpenWebUI-style). Legacy formats kept for compat:
+  - Qwen/Gemma: `<|tool>name<|tool_sep>arg1<|tool_sep>arg2<|end_tool>`
+  - Bracket: `[TOOL: name args]`
+  - Parser: `agent::parse_tool_calls()` handles all three; takes a `CapabilityProfile`
+- Subagent spawns: `spawn` tool (renamed from `spawn_agent`); shell/process exec is `exec` (renamed from `spawn`)
 - Tool results injected as: `[TOOL_OUTPUT: name = result]`
 - Completion signal: `[DONE]`
 - Session data lives in `~/.yggdra/sessions/<uuid>/`
@@ -49,13 +53,24 @@ Always run `cargo test --lib` after any change. Do not leave tests failing.
 ## CLI Flags
 
 ```bash
-yggdra --ask       # Start in ask-only mode (read-only, no file modifications)
-yggdra --build     # Start in build mode (autonomous execution)
-yggdra --plan      # Start in plan mode (interactive, default)
+yggdra --ask       # Ask mode: read-only, agent only answers questions
+yggdra --plan      # Plan mode: interactive (default)
+yggdra --build     # Build mode: autonomous execution, agent kicks itself
+yggdra --one       # One mode: like build, but stops + notifies when task is done
+yggdra --shell     # Shell-only capability profile (shell + setfile + commit)
 yggdra --help      # Show available options
 ```
 
 Mode is saved to `.yggdra/config.json` and persists between launches.
+Mode cycle order in the UI: Plan → Build → One → Ask → Plan.
+
+## Slash commands (selected)
+
+- `/one` — switch to One mode for a single autonomous task
+- `/abort` — kill stuck streams, async tasks, and tool execution
+- `/shell` — switch to ShellOnly capability profile
+- `/test_notification` — fire a test OS notification (verify macOS setup)
+- `/help`, `/models` — see in-app help
 
 ## Knowledge Base Access
 
@@ -79,7 +94,7 @@ The knowledge base contains 135,000+ files across 73 categories: spacecraft syst
 
 ## Constraints — never break these
 
-- **No internet**: the `spawn` tool blocks `/bin/`, `/usr/bin/`, `/usr/sbin/`
+- **No internet**: the `exec` tool blocks `/bin/`, `/usr/bin/`, `/usr/sbin/`
 - **No shell injection**: tool args are validated before execution
 - **No network code generation**: steering directives explicitly forbid it
 - `cargo test --lib` must pass before any commit
@@ -88,6 +103,6 @@ The knowledge base contains 135,000+ files across 73 categories: spacecraft syst
 
 - `OllamaClient` derives `Clone` (reqwest::Client is Arc-backed — safe)
 - Module named `msglog` not `log` (conflicts with Rust std log crate)
-- `spawn` resolves binaries via PATH — bare names like `ls`, `cat` work fine
+- `exec` resolves binaries via PATH — bare names like `ls`, `cat` work fine
 - `execute_simple()` is for subagents: identical to `execute_with_tools()` but no spawning (prevents recursive async futures)
 - `cached_message_count` must be updated after every `add_and_persist` call or the UI won't redraw

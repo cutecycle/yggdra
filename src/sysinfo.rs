@@ -18,7 +18,7 @@ pub struct SystemInfo {
     pub git_branch: Option<String>,
     /// Git remote URL (if available)
     pub git_remote: Option<String>,
-    /// Number of unstaged changes in git
+    /// Number of unstaged changes in git (collected but not injected into prompt to preserve KV cache)
     pub git_changes: usize,
 }
 
@@ -58,14 +58,9 @@ impl SystemInfo {
             lines.push(format!("Available tools: {}", self.tools.join(", ")));
         }
 
-        // Add git info if available
+        // Add git info if available (no change count — keeps prompt cache-stable)
         if let Some(branch) = &self.git_branch {
-            let status = if self.git_changes > 0 {
-                format!(" [{} changes]", self.git_changes)
-            } else {
-                " [clean]".to_string()
-            };
-            lines.push(format!("Git branch: {}{}", branch, status));
+            lines.push(format!("Git branch: {}", branch));
             if let Some(remote) = &self.git_remote {
                 lines.push(format!("Git remote: {}", remote));
             }

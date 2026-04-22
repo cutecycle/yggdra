@@ -1,0 +1,12 @@
+{
+  "tools": {},
+  "llm_requests": 0,
+  "prompt_tokens": 0,
+  "gen_tokens": 0,
+  "avg_tok_per_s_x100": 0,
+  "sessions": 1,
+  "last_active_unix": 1776825427,
+  "uptime_seconds": 0,
+  "context_trims": 0,
+  "compressions": 0
+}

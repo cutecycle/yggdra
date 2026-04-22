@@ -26,7 +26,7 @@ mod watcher;
 use anyhow::Result;
 use session::Session;
 use ui::App;
-use config::AppMode;
+use config::{AppMode, CapabilityProfile};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,20 +34,30 @@ async fn main() -> Result<()> {
     #[cfg(unix)]
     unsafe { libc::setpgid(0, 0); }
 
+    // Shell-only is the default profile. Use --standard to get the full tool set.
+    let binary_name = std::env::args().next().unwrap_or_default();
+    let mut shell_only = !binary_name.ends_with("yggdra-std");
+
     // Parse CLI arguments for mode override
     let mut mode_override: Option<AppMode> = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--ask" => mode_override = Some(AppMode::Ask),
-            "--build" => mode_override = Some(AppMode::Build),
-            "--plan" => mode_override = Some(AppMode::Plan),
+            "--ask"        => mode_override = Some(AppMode::Ask),
+            "--build"      => mode_override = Some(AppMode::Build),
+            "--plan"       => mode_override = Some(AppMode::Plan),
+            "--one"        => mode_override = Some(AppMode::One),
+            "--shell-only" => shell_only = true,
+            "--standard"   => shell_only = false,
             "--help" | "-h" => {
                 eprintln!("Usage: yggdra [OPTIONS]");
                 eprintln!("Options:");
-                eprintln!("  --ask       Start in ask-only mode");
-                eprintln!("  --build     Start in build mode");
-                eprintln!("  --plan      Start in plan mode (default)");
-                eprintln!("  --help      Show this help message");
+                eprintln!("  --ask         Start in ask-only mode");
+                eprintln!("  --build       Start in build mode");
+                eprintln!("  --plan        Start in plan mode (default)");
+                eprintln!("  --one         Start in one-off task mode (auto-completes with notification)");
+                eprintln!("  --standard    Use full tool set (editfile, rg, commit…)");
+                eprintln!("  --shell-only  Restrict agent to shell tool only (default)");
+                eprintln!("  --help        Show this help message");
                 return Ok(());
             }
             _ => {}
@@ -86,13 +96,17 @@ async fn main() -> Result<()> {
     }
 
     let (config, probe_client) = config::Config::load_with_smart_model().await;
-    let config = if let Some(mode) = mode_override {
+    let config = {
         let mut c = config;
-        c.mode = mode;
-        eprintln!("🔧 CLI override: mode={}", mode);
+        if let Some(mode) = mode_override {
+            c.mode = mode;
+            eprintln!("🔧 CLI override: mode={}", mode);
+        }
+        if shell_only {
+            c.profile = CapabilityProfile::ShellOnly;
+            eprintln!("🐚 Shell-only mode: agent restricted to shell tool");
+        }
         c
-    } else {
-        config
     };
 
     // Ensure config file is created on every startup, regardless of mode
@@ -171,6 +185,11 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // Detect native context length for the selected model (best-effort; silently skips on error).
+    if let Some(ref client) = ollama_client {
+        client.fetch_native_ctx().await;
+    }
 
     let mut app = App::new(config, session, ollama_client, agents_md, config_watcher_rx);
     let result = app.run().await;

@@ -126,9 +126,9 @@ impl Tool for RipgrepTool {
 
 // ===== Spawn Tool (spawn) =====
 
-pub struct SpawnTool;
+pub struct ExecTool;
 
-impl SpawnTool {
+impl ExecTool {
     /// Blocked absolute paths to prevent shell takeover
     fn is_absolute_dangerous_path(path: &str) -> bool {
         let dangerous_prefixes = ["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"];
@@ -164,14 +164,14 @@ impl SpawnTool {
     }
 }
 
-impl Tool for SpawnTool {
+impl Tool for ExecTool {
     fn name(&self) -> &str {
-        "spawn"
+        "exec"
     }
 
     fn validate_input(&self, args: &str) -> Result<()> {
         if args.is_empty() {
-            return Err(anyhow!("spawn: empty arguments"));
+            return Err(anyhow!("exec: empty arguments"));
         }
         
         // Detect shell-only patterns and provide recovery hints
@@ -189,61 +189,39 @@ impl Tool for SpawnTool {
             };
             
             return Err(anyhow!(
-                "❌ spawn: cannot handle {} — spawn executes directly without a shell.\n\
-                 These patterns require shell interpretation:\n\
-                 • Redirects: spawn \"cmd > file\" ✗ (spawn doesn't support)\n\
-                 • Pipes: spawn \"cmd1 | cmd2\" ✗ (spawn doesn't support)\n\
-                 • Chains: spawn \"cmd1 && cmd2\" ✗ (spawn doesn't support)\n\
-                 \n\
-                 To fix: Use the python tool for shell pipelines, or call spawn multiple times.\n\
-                 Example: python -c \"import subprocess; subprocess.run('cmd1 | cmd2', shell=True)\"",
+                "❌ exec: cannot handle {} — exec runs directly without a shell.\n\
+                 Use the `shell` tool for pipelines and redirects:\n\
+                 {{\"name\": \"shell\", \"parameters\": {{\"command\": \"cmd1 | cmd2\"}}}}",
                 pattern
             ));
         }
         
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.is_empty() {
-            return Err(anyhow!("spawn: no binary specified"));
+            return Err(anyhow!("exec: no binary specified"));
         }
         let binary = parts[0];
 
         if Self::is_shell_interpreter(binary) {
-            // Provide helpful recovery hint: show user what they likely tried vs. what to do instead
-            let recovery = if args.contains("-c") {
-                // They tried bash/sh -c 'command', suggest running directly
-                format!(
-                    "\nTo fix: run the command directly (or use python for shell patterns).\n\
-                     ✗ Wrong:  spawn \"bash -c 'git status'\"\n\
-                     ✓ Right:  spawn \"git status\"\n\
-                     \n\
-                     For pipes/redirects/chains, use python instead:\n\
-                     python -c \"import subprocess; subprocess.run('cmd1 | cmd2', shell=True)\""
-                )
-            } else {
-                "Shell interpreter is blocked for security. Run commands directly with spawn.".to_string()
-            };
-            
             return Err(anyhow!(
-                "❌ spawn: shell interpreter '{}' is blocked — use specific commands instead.\n{}",
-                binary, recovery
+                "❌ exec: shell interpreter '{}' is blocked.\n\
+                 Use the `shell` tool instead: {{\"name\": \"shell\", \"parameters\": {{\"command\": \"...\"}}}}",
+                binary
             ));
         }
 
         if Self::is_absolute_dangerous_path(binary) {
             return Err(anyhow!(
-                "❌ spawn: absolute path '{}' is blocked for safety.\n\
-                 Use the command name instead (binary resolves via PATH).\n\
-                 ✗ Wrong:  spawn \"/usr/bin/python3 script.py\"\n\
-                 ✓ Right:  spawn \"python3 script.py\"",
+                "❌ exec: absolute path '{}' is blocked for safety.\n\
+                 Use the command name directly (resolves via PATH).",
                 binary
             ));
         }
 
         if Self::resolve_binary(binary).is_none() {
             return Err(anyhow!(
-                "❌ spawn: binary '{}' not found in PATH.\n\
-                 Try: spawn \"which {}\" to debug, or check if the binary is installed.",
-                binary, binary
+                "❌ exec: binary '{}' not found in PATH.",
+                binary
             ));
         }
 
@@ -258,9 +236,8 @@ impl Tool for SpawnTool {
         let child_args = &parsed[1..];
 
         let resolved = Self::resolve_binary(binary)
-            .ok_or_else(|| anyhow!("spawn: binary not found: {}", binary))?;
+            .ok_or_else(|| anyhow!("exec: binary not found: {}", binary))?;
 
-        // Always run from project root so relative paths work correctly
         let cwd = sandbox::project_root()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -271,29 +248,10 @@ impl Tool for SpawnTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| anyhow!("spawn: execution failed: {}", e))?;
-
-        // Poll with timeout — kill the process if it hangs past SPAWN_TIMEOUT_SECS
-        const SPAWN_TIMEOUT_SECS: u64 = 30;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(SPAWN_TIMEOUT_SECS);
-        loop {
-            match child.try_wait().map_err(|e| anyhow!("spawn: wait error: {}", e))? {
-                Some(_status) => break, // process finished
-                None => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        return Err(anyhow!(
-                            "spawn: command timed out after {}s (killed): {}",
-                            SPAWN_TIMEOUT_SECS, args
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-        }
+            .map_err(|e| anyhow!("exec: execution failed: {}", e))?;
 
         let output = child.wait_with_output()
-            .map_err(|e| anyhow!("spawn: failed to collect output: {}", e))?;
+            .map_err(|e| anyhow!("exec: failed to collect output: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -301,9 +259,178 @@ impl Tool for SpawnTool {
         if output.status.success() {
             Ok(stdout)
         } else {
-            Err(anyhow!("spawn: child process failed: {}\n{}", stdout, stderr))
+            Err(anyhow!("exec: child process failed: {}\n{}", stdout, stderr))
         }
     }
+}
+
+// ===== Shell Tool (shell) — sh -c with full pipeline support =====
+
+pub struct ShellTool;
+
+impl Tool for ShellTool {
+    fn name(&self) -> &str { "shell" }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow!("shell: empty command"));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        self.validate_input(args)?;
+
+        // Parse optional returnlines range encoded as `command\x00start-end`
+        let (raw_cmd, returnlines) = if let Some(idx) = args.find('\x00') {
+            let range = args[idx + 1..].trim();
+            (args[..idx].to_string(), Some(range.to_string()))
+        } else {
+            (args.to_string(), None)
+        };
+
+        // On macOS, BSD sed requires an empty extension with -i: `sed -i '' 's/...'`
+        // GNU-style `sed -i 's/...'` (no extension) fails. Auto-fix transparently.
+        #[cfg(target_os = "macos")]
+        let cmd = fix_macos_sed_inplace(&raw_cmd);
+        #[cfg(not(target_os = "macos"))]
+        let cmd = raw_cmd;
+
+        let cwd = sandbox::project_root()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("shell: failed to start: {}", e))?;
+
+        let output = child.wait_with_output()
+            .map_err(|e| anyhow!("shell: failed to collect output: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = if stderr.is_empty() {
+            stdout
+        } else if stdout.is_empty() {
+            stderr
+        } else {
+            format!("{}{}", stdout, stderr)
+        };
+
+        // Append git diff for human viewing — try unstaged first, fall back to last commit
+        let diff = {
+            // Try unstaged changes first (agent edited but hasn't committed yet)
+            let unstaged = Command::new("git")
+                .args(["diff", "--color=never", "--unified=3"])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let d = String::from_utf8_lossy(&o.stdout).into_owned();
+                    if d.trim().is_empty() { None } else { Some(d) }
+                });
+            if unstaged.is_some() {
+                unstaged
+            } else {
+                // Fall back to last commit diff (agent just committed)
+                Command::new("git")
+                    .args(["show", "--color=never", "--unified=3", "--stat", "HEAD"])
+                    .current_dir(&cwd)
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let d = String::from_utf8_lossy(&o.stdout).into_owned();
+                        if d.trim().is_empty() { None } else { Some(d) }
+                    })
+            }
+        };
+        let combined = if let Some(d) = diff {
+            if combined.trim().is_empty() {
+                format!("--- changes ---\n{}", d.trim_end())
+            } else {
+                format!("{}\n--- changes ---\n{}", combined.trim_end(), d.trim_end())
+            }
+        } else {
+            combined
+        };
+
+        // Apply returnlines slice if requested.
+        let combined = if let Some(range) = returnlines {
+            let all_lines: Vec<&str> = combined.lines().collect();
+            let total = all_lines.len();
+            let (start, end) = parse_line_range(&range, total);
+            let slice = all_lines[start..end].join("\n");
+            // 1-indexed in the header
+            format!("[lines {}-{} of {}]\n{}", start + 1, end, total, slice)
+        } else {
+            combined
+        };
+
+        Ok(combined)
+    }
+}
+
+/// Parse a line range string like "1-50", "50", or "50-" into (start_idx, end_idx) (0-indexed, exclusive end).
+/// Clamps to [0, total].
+fn parse_line_range(range: &str, total: usize) -> (usize, usize) {
+    let clamp = |n: usize| n.min(total);
+    if let Some((a, b)) = range.split_once('-') {
+        let start = a.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let end = if b.trim().is_empty() { total } else { clamp(b.trim().parse::<usize>().unwrap_or(total)) };
+        (start.min(total), end.max(start.min(total)))
+    } else if let Ok(n) = range.trim().parse::<usize>() {
+        // Single number: first N lines
+        (0, clamp(n))
+    } else {
+        (0, total)
+    }
+}
+
+/// On macOS, `sed -i 's/...'` fails — BSD sed requires an empty extension: `sed -i '' 's/...'`.
+/// This function transparently patches the command string when no extension is present.
+///
+/// Handles the two common patterns:
+///   sed -i 'script'   →  sed -i '' 'script'
+///   sed -i "script"   →  sed -i '' "script"
+/// Leaves these unchanged (extension already present):
+///   sed -i '' 'script'
+///   sed -i.bak 'script'
+fn fix_macos_sed_inplace(cmd: &str) -> String {
+    fix_sed_quote(fix_sed_quote(cmd.to_string(), b'\''), b'"')
+}
+
+fn fix_sed_quote(mut cmd: String, q: u8) -> String {
+    let pat: [u8; 8] = [b's', b'e', b'd', b' ', b'-', b'i', b' ', q];
+    let mut search_from = 0;
+    loop {
+        // Find the byte pattern in the remaining slice
+        let slice = cmd.as_bytes();
+        let found = slice[search_from..]
+            .windows(8)
+            .position(|w| w == pat)
+            .map(|p| search_from + p);
+        match found {
+            None => break,
+            Some(pos) => {
+                let quote_idx = pos + 7; // index of the opening quote
+                let next = cmd.as_bytes().get(quote_idx + 1).copied();
+                if next == Some(q) {
+                    // Already `''` or `""` — extension present, skip
+                    search_from = pos + 8;
+                } else {
+                    // No extension — insert `'' ` before the opening quote
+                    cmd.insert_str(quote_idx, "'' ");
+                    search_from = quote_idx + 4; // past inserted `'' ` + original quote
+                }
+            }
+        }
+    }
+    cmd
 }
 
 // ===== Editfile Tool (editfile) =====
@@ -457,7 +584,7 @@ impl Tool for EditfileTool {
         let path = sandbox::resolve(&raw_path);
 
         if !path.exists() {
-            return Err(anyhow!("editfile: {} does not exist (use writefile to create)", path.display()));
+            return Err(anyhow!("editfile: {} does not exist (use setfile to create)", path.display()));
         }
 
         let content = fs::read_to_string(&path)
@@ -484,19 +611,19 @@ impl Tool for EditfileTool {
     }
 }
 
-// ===== Writefile Tool (writefile) =====
+// ===== Setfile Tool (setfile) — complete overwrite =====
 
-pub struct WritefileTool;
+pub struct SetfileTool;
 
-impl Tool for WritefileTool {
+impl Tool for SetfileTool {
     fn name(&self) -> &str {
-        "writefile"
+        "setfile"
     }
 
     fn validate_input(&self, args: &str) -> Result<()> {
         let path = args.split('\x00').next().unwrap_or("").trim();
         if path.is_empty() {
-            return Err(anyhow!("writefile: empty file path"));
+            return Err(anyhow!("setfile: empty file path"));
         }
         sandbox::check_write(path)?;
         Ok(())
@@ -513,15 +640,60 @@ impl Tool for WritefileTool {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
-                    .map_err(|e| anyhow!("writefile: failed to create dirs for {}: {}", path.display(), e))?;
+                    .map_err(|e| anyhow!("setfile: failed to create dirs for {}: {}", path.display(), e))?;
             }
         }
 
         fs::write(&path, content)
-            .map_err(|e| anyhow!("writefile: failed to write {}: {}", path.display(), e))?;
+            .map_err(|e| anyhow!("setfile: failed to write {}: {}", path.display(), e))?;
 
         let line_count = content.lines().count();
-        Ok(format!("✅ wrote {} ({} lines)", path.display(), line_count))
+        let write_summary = format!("✅ wrote {} ({} lines)", path.display(), line_count);
+
+        // Auto-commit: stage and commit the file. Degrade silently if git unavailable.
+        let commit_note = match self.git_add_and_commit(&path) {
+            Ok(hash) => format!(" — committed {}", hash),
+            Err(_)   => String::new(),
+        };
+
+        Ok(format!("{}{}", write_summary, commit_note))
+    }
+}
+
+impl SetfileTool {
+    fn git_add_and_commit(&self, path: &std::path::Path) -> Result<String> {
+        // Stage this specific file
+        let add = Command::new("git")
+            .arg("add")
+            .arg(path)
+            .output()
+            .map_err(|e| anyhow!("git add failed: {}", e))?;
+        if !add.status.success() {
+            return Err(anyhow!("git add: {}", String::from_utf8_lossy(&add.stderr)));
+        }
+
+        let msg = format!("setfile: {}", path.display());
+        let commit = Command::new("git")
+            .args(["commit", "-m", &msg, "--", path.to_str().unwrap_or("")])
+            .output()
+            .map_err(|e| anyhow!("git commit failed: {}", e))?;
+
+        if commit.status.success() {
+            let out = String::from_utf8_lossy(&commit.stdout);
+            // Extract short hash from first line e.g. "[main abc1234] setfile: ..."
+            let hash = out.lines().next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(|s| s.trim_end_matches(']').to_string())
+                .unwrap_or_else(|| "ok".to_string());
+            Ok(hash)
+        } else {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            if stderr.contains("nothing to commit") || stderr.contains("nothing added") {
+                Ok("no-op".to_string())
+            } else {
+                Err(anyhow!("{}", stderr.trim()))
+            }
+        }
     }
 }
 
@@ -563,7 +735,7 @@ impl Tool for PatchfileTool {
 
         let path = sandbox::resolve(raw_path);
         if !path.exists() {
-            return Err(anyhow!("patchfile: {} does not exist (use writefile to create)", path.display()));
+            return Err(anyhow!("patchfile: {} does not exist (use setfile to create)", path.display()));
         }
 
         let content = fs::read_to_string(&path)
@@ -578,6 +750,9 @@ impl Tool for PatchfileTool {
 
         let end_clamped = end_line.min(total);
         let old_count = end_clamped.saturating_sub(start_line - 1);
+
+        // Capture old lines before splicing (for diff output)
+        let old_lines: Vec<&str> = lines[start_line.saturating_sub(1)..end_clamped.min(lines.len())].to_vec();
 
         // Build replacement: split new_text into lines
         let replacement: Vec<&str> = new_text.lines().collect();
@@ -598,10 +773,36 @@ impl Tool for PatchfileTool {
         fs::write(&path, &out)
             .map_err(|e| anyhow!("patchfile: failed to write {}: {}", path.display(), e))?;
 
-        Ok(format!(
-            "✅ patched {} (lines {}-{} → {} lines)",
-            path.display(), start_line, end_clamped, new_count
-        ))
+        // Build a context diff for the tool result
+        const CTX: usize = 3;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let ctx_start = start_line.saturating_sub(1).saturating_sub(CTX);
+        let ctx_end = end_clamped.min(all_lines.len());
+
+        let mut diff = format!(
+            "✅ patched {} @@ -{},{} +{},{} @@\n",
+            path.display(), start_line, old_count, start_line, new_count
+        );
+        // Context before
+        for (i, line) in all_lines[ctx_start..start_line.saturating_sub(1)].iter().enumerate() {
+            diff.push_str(&format!(" {:4}: {}\n", ctx_start + i + 1, line));
+        }
+        // Removed lines
+        for line in &old_lines {
+            diff.push_str(&format!("-      {}\n", line));
+        }
+        // Added lines
+        for line in &replacement {
+            diff.push_str(&format!("+      {}\n", line));
+        }
+        // Context after
+        let after_start = ctx_end;
+        let after_end = (ctx_end + CTX).min(all_lines.len());
+        for (i, line) in all_lines[after_start..after_end].iter().enumerate() {
+            diff.push_str(&format!(" {:4}: {}\n", after_start + i + 1, line));
+        }
+
+        Ok(diff.trim_end().to_string())
     }
 }
 
@@ -831,10 +1032,16 @@ pub struct ThinkTool;
 impl Tool for ThinkTool {
     fn name(&self) -> &str { "think" }
     fn validate_input(&self, _args: &str) -> Result<()> { Ok(()) }
-    fn execute(&self, _args: &str) -> Result<String> {
-        // Chain-of-thought tool — model uses this to reason out loud.
-        // We acknowledge it and let the model continue.
-        Ok("ok".to_string())
+    fn execute(&self, args: &str) -> Result<String> {
+        // Write this thought to .yggdra/thought.md — single active thought before next action.
+        let thought = args.trim();
+        let path = std::path::Path::new(".yggdra/thought.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, format!("{}\n", thought))
+            .map_err(|e| anyhow::anyhow!("could not write thought.md: {}", e))?;
+        Ok("thought recorded".to_string())
     }
 }
 
@@ -845,20 +1052,28 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create a new registry with all tools
-    pub fn new() -> Self {
+    /// Create a new registry. In ShellOnly profile, only the `shell` tool is registered.
+    pub fn new(profile: crate::config::CapabilityProfile) -> Self {
+        use crate::config::CapabilityProfile;
         let mut tools: std::collections::HashMap<String, Box<dyn Tool>> = std::collections::HashMap::new();
 
-        tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
-        tools.insert("spawn".to_string(), Box::new(SpawnTool) as Box<dyn Tool>);
-        tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
-        tools.insert("editfile".to_string(), Box::new(EditfileTool) as Box<dyn Tool>);
-        tools.insert("writefile".to_string(), Box::new(WritefileTool) as Box<dyn Tool>);
-        tools.insert("patchfile".to_string(), Box::new(PatchfileTool) as Box<dyn Tool>);
-        tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
-        tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
-        tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
-        tools.insert("think".to_string(), Box::new(ThinkTool) as Box<dyn Tool>);
+        tools.insert("shell".to_string(), Box::new(ShellTool) as Box<dyn Tool>);
+
+        if profile == CapabilityProfile::ShellOnly {
+            // ShellOnly allows shell + setfile + commit
+            tools.insert("setfile".to_string(), Box::new(SetfileTool) as Box<dyn Tool>);
+            tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
+        } else if profile == CapabilityProfile::Standard {
+            tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
+            tools.insert("exec".to_string(), Box::new(ExecTool) as Box<dyn Tool>);
+            tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
+            tools.insert("setfile".to_string(), Box::new(SetfileTool) as Box<dyn Tool>);
+            tools.insert("patchfile".to_string(), Box::new(PatchfileTool) as Box<dyn Tool>);
+            tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
+            tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
+            tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
+            tools.insert("think".to_string(), Box::new(ThinkTool) as Box<dyn Tool>);
+        }
 
         Self { tools }
     }
@@ -880,7 +1095,7 @@ impl ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::config::CapabilityProfile::Standard)
     }
 }
 
@@ -945,7 +1160,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_spawn_validation() {
-        let tool = SpawnTool;
+        let tool = ExecTool;
 
         // Absolute dangerous paths always blocked
         assert!(tool.validate_input("/bin/bash").is_err());
@@ -958,7 +1173,6 @@ mod tests {
         assert!(tool.validate_input("definitely_not_a_real_binary_xyzzy").is_err());
 
         // Common Unix tools on PATH should resolve fine
-        // (ls, cat, echo are on every POSIX system)
         assert!(tool.validate_input("ls").is_ok(), "ls should resolve via PATH");
         assert!(tool.validate_input("echo hello").is_ok(), "echo should resolve via PATH");
     }
@@ -967,12 +1181,12 @@ mod tests {
     #[cfg(unix)]
     fn test_spawn_path_resolution() {
         // resolve_binary("ls") should find something under /bin or /usr/bin
-        let resolved = SpawnTool::resolve_binary("ls");
+        let resolved = ExecTool::resolve_binary("ls");
         assert!(resolved.is_some(), "ls must be resolvable on any POSIX system");
         assert!(resolved.unwrap().exists());
 
         // Non-existent names should return None
-        assert!(SpawnTool::resolve_binary("xyzzy_no_such_binary").is_none());
+        assert!(ExecTool::resolve_binary("xyzzy_no_such_binary").is_none());
     }
 
     #[test]
@@ -1015,7 +1229,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_spawn_double_quoted_args() {
-        let tool = SpawnTool;
+        let tool = ExecTool;
 
         // echo with a double-quoted argument should preserve the full string
         let result = tool.execute(r#"echo "hello world""#).unwrap();
@@ -1086,25 +1300,68 @@ mod tests {
 
     #[test]
     fn test_tool_registry() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
         let tools = registry.list_tools();
         
         assert!(tools.contains(&"rg"));
-        assert!(tools.contains(&"spawn"));
+        assert!(tools.contains(&"exec"));
+        assert!(tools.contains(&"shell"));
         assert!(tools.contains(&"readfile"));
-        assert!(tools.contains(&"editfile")); // real edit tool
-        assert!(tools.contains(&"writefile"));
+        assert!(tools.contains(&"setfile"));
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"python"));
         assert!(tools.contains(&"ruste"));
         assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"think"));
-        assert_eq!(tools.len(), 10); // rg spawn readfile editfile writefile patchfile commit python ruste think
+        assert_eq!(tools.len(), 10); // rg exec shell readfile setfile patchfile commit python ruste think
     }
 
     #[test]
-    fn test_writefile_validation() {
-        let tool = WritefileTool;
+    fn test_fix_macos_sed_no_extension() {
+        // No extension → add `''`
+        assert_eq!(
+            fix_macos_sed_inplace("sed -i 's/old/new/g' file.rs"),
+            "sed -i '' 's/old/new/g' file.rs"
+        );
+    }
+
+    #[test]
+    fn test_fix_macos_sed_already_has_extension() {
+        // Already has `''` → leave alone
+        assert_eq!(
+            fix_macos_sed_inplace("sed -i '' 's/old/new/g' file.rs"),
+            "sed -i '' 's/old/new/g' file.rs"
+        );
+    }
+
+    #[test]
+    fn test_fix_macos_sed_named_extension() {
+        // Has a named extension like `.bak` → leave alone
+        assert_eq!(
+            fix_macos_sed_inplace("sed -i.bak 's/old/new/g' file.rs"),
+            "sed -i.bak 's/old/new/g' file.rs"
+        );
+    }
+
+    #[test]
+    fn test_fix_macos_sed_double_quote() {
+        // Double-quoted form without extension → add `''`
+        assert_eq!(
+            fix_macos_sed_inplace(r#"sed -i "s/old/new/g" file.rs"#),
+            r#"sed -i '' "s/old/new/g" file.rs"#
+        );
+    }
+
+    #[test]
+    fn test_fix_macos_sed_no_sed() {
+        // Non-sed command → leave alone
+        let cmd = "grep -r 'pattern' src/";
+        assert_eq!(fix_macos_sed_inplace(cmd), cmd);
+    }
+
+    #[test]
+    fn test_setfile_validation() {
+        let tool = SetfileTool;
 
         // Empty path fails
         assert!(tool.validate_input("\x00content").is_err());
@@ -1114,18 +1371,18 @@ mod tests {
     }
 
     #[test]
-    fn test_writefile_roundtrip() {
+    fn test_setfile_roundtrip() {
         use std::env;
         let dir = env::temp_dir();
-        let path = dir.join("yggdra_test_writefile.txt");
+        let path = dir.join("yggdra_test_setfile.txt");
         let path_str = path.to_str().unwrap();
 
-        let tool = WritefileTool;
+        let tool = SetfileTool;
         let content = "hello\nworld\n";
         let args = format!("{}\x00{}", path_str, content);
 
         let result = tool.execute(&args);
-        assert!(result.is_ok(), "writefile should succeed: {:?}", result);
+        assert!(result.is_ok(), "setfile should succeed: {:?}", result);
         assert!(result.unwrap().contains("2 lines"));
 
         let read_back = fs::read_to_string(&path).unwrap();
@@ -1135,13 +1392,13 @@ mod tests {
     }
 
     #[test]
-    fn test_writefile_creates_parent_dirs() {
+    fn test_setfile_creates_parent_dirs() {
         use std::env;
         let dir = env::temp_dir().join("yggdra_test_nested_dir");
         let path = dir.join("subdir").join("file.txt");
         let path_str = path.to_str().unwrap();
 
-        let tool = WritefileTool;
+        let tool = SetfileTool;
         let args = format!("{}\x00test content", path_str);
         let result = tool.execute(&args);
         assert!(result.is_ok(), "should create parent dirs: {:?}", result);
@@ -1151,87 +1408,12 @@ mod tests {
 
     #[test]
     fn test_registry_unknown_tool() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
         let result = registry.execute("nonexistent", "args");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
     }
 
-    #[test]
-    fn test_editfile_parse_args_standard() {
-        let args = "src/main.rs\x00fn old() {\x00fn new() {";
-        let parsed = EditfileTool::parse_args(args);
-        assert_eq!(parsed, Some(("src/main.rs".to_string(), "fn old() {".to_string(), "fn new() {".to_string())));
-    }
-
-    #[test]
-    fn test_editfile_parse_args_legacy() {
-        let args = "src/main.rs\nfn old() {\n---\nfn new() {";
-        let parsed = EditfileTool::parse_args(args);
-        assert_eq!(parsed, Some(("src/main.rs".to_string(), "fn old() {".to_string(), "fn new() {".to_string())));
-    }
-
-    #[test]
-    fn test_editfile_roundtrip() {
-        use std::env;
-        let path = env::temp_dir().join("yggdra_test_editfile.txt");
-        let path_str = path.to_str().unwrap();
-        fs::write(&path, "hello world\nfoo bar\n").unwrap();
-
-        let tool = EditfileTool;
-        let args = format!("{}\x00foo bar\x00baz qux", path_str);
-        let result = tool.execute(&args).expect("editfile should succeed");
-        assert!(result.contains("✅"), "result: {}", result);
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content, "hello world\nbaz qux\n");
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_editfile_not_found() {
-        use std::env;
-        let path = env::temp_dir().join("yggdra_test_editfile_nf.txt");
-        let path_str = path.to_str().unwrap();
-        fs::write(&path, "hello world\n").unwrap();
-
-        let tool = EditfileTool;
-        let args = format!("{}\x00does not exist\x00replacement", path_str);
-        let err = tool.execute(&args).unwrap_err().to_string();
-        assert!(err.contains("not found"), "error: {}", err);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_editfile_ambiguous() {
-        use std::env;
-        let path = env::temp_dir().join("yggdra_test_editfile_amb.txt");
-        let path_str = path.to_str().unwrap();
-        fs::write(&path, "foo\nfoo\n").unwrap();
-
-        let tool = EditfileTool;
-        let args = format!("{}\x00foo\x00bar", path_str);
-        let err = tool.execute(&args).unwrap_err().to_string();
-        assert!(err.contains("ambiguous"), "error: {}", err);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_editfile_empty_old_str() {
-        let tool = EditfileTool;
-        let args = "some/file.txt\x00\x00new content";
-        let err = tool.execute(args).unwrap_err().to_string();
-        assert!(err.contains("empty"), "error: {}", err);
-    }
-
-    #[test]
-    fn test_editfile_validation() {
-        let tool = EditfileTool;
-        // Bad format (missing separators) fails
-        assert!(tool.validate_input("no-separator-here").is_err());
-        // Valid format passes (sandbox containment is tested in sandbox::tests)
-        assert!(tool.validate_input("valid/path.rs\x00old\x00new").is_ok());
-    }
 
     // ===== Patchfile tests =====
 
@@ -1295,9 +1477,45 @@ mod tests {
 
     #[test]
     fn test_tool_registry_includes_patchfile() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
         let tools = registry.list_tools();
         assert!(tools.contains(&"patchfile"), "patchfile should be registered");
-        assert_eq!(tools.len(), 10); // rg spawn readfile editfile writefile patchfile commit python ruste think
+        assert_eq!(tools.len(), 10); // rg exec shell readfile setfile patchfile commit python ruste think
+    }
+
+    // ===== parse_line_range tests =====
+
+    #[test]
+    fn test_parse_line_range_normal() {
+        assert_eq!(parse_line_range("1-50", 100), (0, 50));
+        assert_eq!(parse_line_range("51-100", 100), (50, 100));
+        assert_eq!(parse_line_range("1-1", 10), (0, 1));
+    }
+
+    #[test]
+    fn test_parse_line_range_clamped() {
+        // End beyond total gets clamped
+        assert_eq!(parse_line_range("1-200", 50), (0, 50));
+        // Start beyond total: both clamp to total
+        assert_eq!(parse_line_range("99-200", 50), (50, 50));
+    }
+
+    #[test]
+    fn test_parse_line_range_single_number() {
+        // Single number = first N lines
+        assert_eq!(parse_line_range("20", 100), (0, 20));
+        assert_eq!(parse_line_range("200", 50), (0, 50)); // clamped
+    }
+
+    #[test]
+    fn test_parse_line_range_open_end() {
+        // "50-" means line 50 to end
+        assert_eq!(parse_line_range("50-", 100), (49, 100));
+    }
+
+    #[test]
+    fn test_parse_line_range_invalid_falls_back() {
+        // Garbage input → return everything
+        assert_eq!(parse_line_range("abc", 10), (0, 10));
     }
 }

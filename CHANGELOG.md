@@ -5,6 +5,40 @@ All notable changes to Yggdra will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-21
+
+### Added
+
+- `--one` mode for one-off tasks (autonomous + completion notification)
+- `setfile` tool: full-file overwrites (replaces editfile for whole-file rewrites; git-tracked)
+- `/abort` command: kill stuck streams, async tasks, and tool execution
+- `/test_notification` command: manually fire a test OS notification
+- `/shell` command and `--shell` capability profile (ShellOnly: agent restricted to shell + setfile + commit)
+- `notifications` module: native OS notifications (model done, errors, agent_says, task complete)
+- `watcher` module: live config reload via filesystem watching (`.yggdra/config.json`, `AGENTS.md`)
+- `knowledge_index` module: offline doc indexing
+- `battery`, `metrics`, `sysinfo`, `theme`, `epoch`, `dlog`, `stats`, `highlight`, `spawner` modules
+- 237 new tests (27 → 264)
+- Mode persistence to config (`~/.yggdra/config.json`)
+- Filesystem watching for live config reload
+
+### Changed
+
+- macOS notifications now use `osascript` (notify-rust silently fails on unbundled CLIs)
+- Tool format default switched to JSON tool calling (OpenWebUI-style); legacy `<|tool>` and `[TOOL:]` formats kept for compat
+- `spawn` tool renamed to `exec`; subagent spawn renamed to `spawn`
+- Mode cycling order: Plan → Build → One → Ask → Plan
+- `parse_tool_calls()` now takes `CapabilityProfile`
+
+### Fixed
+
+- Ask mode no longer continues autonomously after tool results / async task completion
+- Think panel duplication when both native ThinkToken events and inline `<think>` tags arrived
+- Render cache invalidation during streaming (thinking text now updates live)
+- Tool output truncation threshold raised 500 → 600 chars
+
+---
+
 ## [0.1.0] - 2024-04-11
 
 ### MVP Release
@@ -119,24 +153,14 @@ Built with Rust, leveraging the excellent Ollama, Ratatui, and SQLite projects.
 
 ## Future Releases
 
-### Planned for v0.2.0
-
-- [ ] Plugin system for custom tools
-- [ ] Agent mode with autonomous tool execution
-- [ ] Output syntax highlighting for code blocks
-- [ ] Streaming responses from Ollama
-- [ ] Cross-machine session sync (via git or cloud storage)
-- [ ] Config file support (TOML)
-- [ ] Command history and autocomplete
-
 ### Under Consideration
 
-- [ ] Web UI version (Leptos)
-- [ ] Mobile companion app
-- [ ] Integration with other LLMs (LM Studio, Vllm)
-- [ ] Fine-tuning workflow support
-- [ ] Persistent undo/redo for messages
-- [ ] Template library for common prompts
+- Web UI version (Leptos)
+- Mobile companion app
+- Integration with other LLMs (LM Studio, Vllm)
+- Fine-tuning workflow support
+- Persistent undo/redo for messages
+- Template library for common prompts
 
 ---
 

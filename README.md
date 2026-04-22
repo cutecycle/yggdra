@@ -59,39 +59,41 @@ yggdra                           # that's it
 
 ---
 
-## Three modes
+## Four modes
 
 | Flag | Mode | What it does |
 |------|------|-------------|
-| `--plan` | **Plan** (default) | Interactive back-and-forth. You drive, the model assists. |
-| `--build` | **Build** | Autonomous. Reads `AGENTS.md` and gets to work — no hand-holding. |
-| `--ask` | **Ask** | Read-only. The model can look but can't touch your files. |
+| `--ask` | **Ask** | Read-only. Answers questions, no autonomous actions, can't touch your files. |
+| `--plan` | **Plan** (default) | Interactive. Agent proposes; you drive. |
+| `--build` | **Build** | Autonomous. Agent kicks itself to keep working until you stop it. |
+| `--one` | **One** | Like Build, but stops with an OS notification when the task is complete (`[DONE]` or no tool calls in a turn). |
 
-Mode persists across sessions (saved to `.yggdra/config.json`), so you only
-set it once.
+Mode persists across sessions (saved to `~/.yggdra/config.json` or
+`.yggdra/config.json`), so you only set it once. Cycle in-app: Plan → Build →
+One → Ask.
 
 ---
 
 ## The toolbox
 
-The model doesn't just talk — it acts. Six built-in tools, all local:
+The model doesn't just talk — it acts. All local, no network:
 
 | Tool | What it does |
 |------|-------------|
 | **rg** | Ripgrep search across files |
-| **spawn** | Run local commands (ls, cat, etc. — no network binaries allowed) |
-| **editfile** | Read and write files |
+| **exec** | Run local commands (ls, cat, etc. — no network binaries allowed) |
+| **shell** | Run a shell command (restricted profile available via `--shell` / `/shell`) |
+| **editfile** | Read and write files (line-range edits) |
+| **setfile** | Full-file overwrite — git-tracked, the right tool for whole-file rewrites |
 | **commit** | Stage and commit with git |
 | **python** | Execute Python snippets |
 | **ruste** | Compile and run Rust snippets |
+| **spawn** | Spawn a child sub-agent (up to 10 levels deep) |
 
-Tools use a Qwen/Gemma-style format that the model emits naturally:
+Tool calls default to JSON (OpenWebUI-style). Legacy `<|tool>…<|end_tool>` and
+`[TOOL: …]` formats are still parsed for backward compatibility.
 
-```
-<|tool>rg<|tool_sep>TODO<|tool_sep>src/<|end_tool>
-```
-
-Results come back as `[TOOL_OUTPUT: rg = ...]` and the model keeps going.
+Results come back as `[TOOL_OUTPUT: name = ...]` and the model keeps going.
 
 ### Sub-agents
 
@@ -148,11 +150,44 @@ your knowledge base.
 | `OLLAMA_ENDPOINT` | `http://localhost:11434` | Where your Ollama lives |
 | `OLLAMA_MODEL` | auto-detect | Which model to use |
 
+Config files (`~/.yggdra/config.json` for global, `.yggdra/config.json` for
+per-project) override env vars and persist mode/model/endpoint between runs.
+Both are watched live — edit and the running TUI picks it up.
+
 ```bash
 export OLLAMA_ENDPOINT=http://10.0.0.5:11434   # tailnet box
 export OLLAMA_MODEL=qwen3:8b
 yggdra --build
 ```
+
+### OpenAI-compatible endpoints (OpenRouter, etc.)
+
+Yggdra speaks Ollama's API by default but works with any OpenAI-compatible
+server. Point `endpoint` in `~/.yggdra/config.json` at a local proxy — for
+example, an OpenRouter proxy on `http://localhost:11435` — and yggdra will
+talk to it like it's Ollama. Useful for hosted models when you're not strictly
+airgapped.
+
+---
+
+## Slash commands
+
+The usual: `/help`, `/models`, `/quit`. New in 0.2.0:
+
+- `/one` — switch to One mode for a single autonomous task
+- `/abort` — kill stuck streams, async tasks, and in-flight tool execution
+- `/shell` — switch to ShellOnly capability profile (shell + setfile + commit)
+- `/test_notification` — fire a test OS notification to verify your setup
+
+### macOS notifications
+
+yggdra uses `osascript` for native notifications (notify-rust silently fails on
+unbundled CLIs). To allow them:
+
+1. **System Settings → Notifications → Script Editor**
+2. Enable **Allow Notifications**
+
+Run `/test_notification` inside yggdra to confirm.
 
 ---
 

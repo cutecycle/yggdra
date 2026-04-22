@@ -8,8 +8,8 @@ mod spawn_shell_patterns {
 
     /// Helper: run spawn with a command and return output or error
     fn run_spawn(command: &str) -> Result<String, String> {
-        let registry = yggdra::tools::ToolRegistry::new();
-        registry.execute("spawn", command)
+        let registry = yggdra::tools::ToolRegistry::new(yggdra::config::CapabilityProfile::Standard);
+        registry.execute("exec", command)
             .map_err(|e| e.to_string())
     }
 
@@ -137,9 +137,9 @@ mod spawn_shell_patterns {
         let result = run_spawn("bash -c 'git status'");
         assert!(result.is_err());
         let error = result.unwrap_err();
-        // Should suggest the correct form
+        // Should suggest the correct form (now: "Use the `shell` tool instead")
         assert!(
-            error.contains("Wrong") || error.contains("Right") || error.contains("spawn"),
+            error.contains("Wrong") || error.contains("Right") || error.contains("shell") || error.contains("blocked"),
             "Error should provide recovery hint, got: {}",
             error
         );

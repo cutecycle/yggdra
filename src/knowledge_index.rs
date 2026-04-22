@@ -89,7 +89,7 @@ impl IndexBuilder {
 
             // Check size limit
             if self.total_size >= self.config.size_limit_bytes {
-                eprintln!("🌱 Knowledge index reached size limit ({:.1}GB)", 
+                crate::dlog!("🌱 Knowledge index reached size limit ({:.1}GB)", 
                     self.total_size as f64 / 1024.0 / 1024.0 / 1024.0);
                 break;
             }
@@ -216,14 +216,14 @@ pub fn start_indexing_task(config: Option<KnowledgeIndexConfig>) {
     let config = config.unwrap_or_default();
 
     if !config.enabled {
-        eprintln!("🌱 Knowledge indexing disabled");
+        crate::dlog!("🌱 Knowledge indexing disabled");
         return;
     }
 
     // Spawn background thread for indexing
     std::thread::spawn(move || {
         if let Err(e) = index_knowledge_base(&config) {
-            eprintln!("🌱 Knowledge indexing error: {}", e);
+            crate::dlog!("🌱 Knowledge indexing error: {}", e);
         }
     });
 }
@@ -233,7 +233,7 @@ fn index_knowledge_base(config: &KnowledgeIndexConfig) -> Result<(), Box<dyn std
     let cwd = std::env::current_dir()?;
     let knowledge_dir = cwd.join(".yggdra").join("knowledge");
 
-    eprintln!("🌱 Starting knowledge base indexing (size limit: {:.1}GB)", 
+    crate::dlog!("🌱 Starting knowledge base indexing (size limit: {:.1}GB)", 
         config.size_limit_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
 
     // Count total categories first
@@ -255,7 +255,7 @@ fn index_knowledge_base(config: &KnowledgeIndexConfig) -> Result<(), Box<dyn std
     let index_path = cwd.join(".yggdra").join("knowledge").join("INDEX.md");
 
     fs::write(&index_path, &index_content)?;
-    eprintln!("🌱 Knowledge index complete: {} categories indexed ({:.2}GB)", 
+    crate::dlog!("🌱 Knowledge index complete: {} categories indexed ({:.2}GB)", 
         builder.indexed_count,
         builder.total_size as f64 / 1024.0 / 1024.0 / 1024.0);
 

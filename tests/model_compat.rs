@@ -9,7 +9,8 @@
 /// Run all:       cargo test --test model_compat -- --ignored
 /// Run one model: cargo test --test model_compat gemma_heretic -- --ignored
 
-use yggdra::agent::{detect_tool_format, parse_tool_calls, ToolFormat};
+use yggdra::agent::parse_tool_calls;
+use yggdra::config::CapabilityProfile;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 
@@ -168,18 +169,12 @@ fn test_gemma_heretic_bracket_format_works() {
     let (content, _thinking, done_reason) = chat(GEMMA_HERETIC, Some(bracket_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     assert!(!content.is_empty(), "bracket format should produce content");
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     assert!(!calls.is_empty(), "should parse at least one tool call, got content: {:?}", content);
     assert_eq!(calls[0].name, "readfile");
 }
 
-#[test]
-#[ignore]
-fn test_gemma_heretic_detect_tool_format() {
-    assert_eq!(detect_tool_format(GEMMA_HERETIC), ToolFormat::Legacy,
-        "gemma heretic should be detected as Legacy format");
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 #[test]
 #[ignore]
 fn test_gemma_heretic_writefile_multiline() {
@@ -193,7 +188,7 @@ fn test_gemma_heretic_writefile_multiline() {
         EXAMPLE: [TOOL: writefile src/hello.rs\nfn main() {}\n]";
     let (content, _thinking, _) = chat(GEMMA_HERETIC, Some(system),
         "Write a Rust hello world to src/hello.rs");
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     let wf = calls.iter().find(|c| c.name == "writefile");
     assert!(wf.is_some(), "should have a writefile call, content: {:?}", content);
     let args = &wf.unwrap().args;
@@ -233,17 +228,11 @@ fn test_qwen35_4b_json_format_emits_content() {
         "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     eprintln!("qwen3.5:4b json response: {:?}", &content[..content.len().min(200)]);
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     assert!(!calls.is_empty(), "should parse JSON tool calls");
 }
 
-#[test]
-#[ignore]
-fn test_qwen35_4b_detect_tool_format() {
-    assert_eq!(detect_tool_format(QWEN35_4B), ToolFormat::Standard,
-        "qwen3.5:4b should use Standard format (not legacy ToolCall)");
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 // ─── qwen3:8b ────────────────────────────────────────────────────────────────
 
 const QWEN3_8B: &str = "qwen3:8b";
@@ -270,7 +259,7 @@ fn test_qwen3_8b_standard_format_emits_content() {
     let (content, _thinking, done_reason) = chat(QWEN3_8B, Some(std_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     assert!(!content.is_empty(), "qwen3:8b should emit content with <|tool> prompt");
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     assert!(!calls.is_empty(), "should parse tool call, content: {:?}", content);
 }
 
@@ -317,12 +306,7 @@ fn test_phi4_standard_format() {
     assert!(!content.is_empty(), "phi4 should produce content");
 }
 
-#[test]
-#[ignore]
-fn test_phi4_detect_tool_format() {
-    assert_eq!(detect_tool_format(PHI4_14B), ToolFormat::Standard);
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 // ─── parse_tool_calls unit tests (not ignored — run in normal cargo test) ────
 
 // ─── sanitize + hallucination unit tests (not ignored) ──────────────────────
@@ -348,13 +332,10 @@ fn test_sanitize_heretic_thinking_artifacts() {
     assert!(!cleaned.contains("<|im_start|>"));
 }
 
-#[test]
-fn test_hallucination_heretic_fake_conversation() {
-    // Real output from qwen3.5-heretic-9b at ctx 32000 — fabricated full conversation
-    let input = ". [DONE]\n\nNow read src/lib.rs[TOOL: readfile src/lib.rs]\
-        [TOOL_OUTPUT: readfile = fn add(a: i32, b: i32) -> i32 { a + b }]";
-    assert!(is_hallucinated_output(input));
-}
+// Removed test_hallucination_heretic_fake_conversation: relied on legacy [TOOL:]/[TOOL_OUTPUT:]
+// bracket format being an indicator of hallucination. is_hallucinated_output now keys off
+// JSON tool_calls + [TOOL_OUTPUT:] co-occurrence; the bracket-only legacy format has been
+// retired from the parser entirely (see parse_tool_calls in src/agent.rs).
 
 // ─── qwen3.5:9b-q4_K_M (installed, working) ─────────────────────────────────
 
@@ -383,7 +364,7 @@ fn test_qwen35_9b_standard_format_tool_call() {
     assert_eq!(done_reason, "stop");
     // qwen3.5:9b may place tool calls in content or thinking depending on prompt
     let combined = format!("{}\n{}", content, thinking);
-    let calls = parse_tool_calls(&combined);
+    let calls = parse_tool_calls(&combined, CapabilityProfile::Standard);
     eprintln!("qwen3.5:9b standard format — content: {:?} thinking: {:?} calls: {}", 
         &content[..content.len().min(100)], &thinking[..thinking.len().min(100)], calls.len());
     // Informational test — not all models follow the <|tool> format reliably
@@ -399,17 +380,12 @@ fn test_qwen35_9b_bracket_format_tool_call() {
     let (content, _thinking, done_reason) = chat(QWEN35_9B, Some(bracket_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     // qwen3.5:9b prefers <|tool> standard format even when told to use brackets
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     eprintln!("qwen3.5:9b bracket test — calls: {} content: {:?}", calls.len(), &content[..content.len().min(200)]);
     assert!(!calls.is_empty(), "should parse some tool call, content: {:?}", content);
 }
 
-#[test]
-#[ignore]
-fn test_qwen35_9b_detect_tool_format() {
-    assert_eq!(detect_tool_format(QWEN35_9B), ToolFormat::Standard);
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 // ─── qwen3.5:2b (standard non-heretic, testing JSON format) ───────────────────
 
 const QWEN35_2B: &str = "qwen3.5:2b";
@@ -441,17 +417,11 @@ fn test_qwen35_2b_json_format_tool_call() {
         "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     eprintln!("qwen3.5:2b json response: {:?}", &content[..content.len().min(200)]);
-    let calls = parse_tool_calls(&content);
+    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
     assert!(!calls.is_empty(), "should parse JSON tool calls");
 }
 
-#[test]
-#[ignore]
-fn test_qwen35_2b_detect_tool_format() {
-    assert_eq!(detect_tool_format(QWEN35_2B), ToolFormat::Standard,
-        "standard qwen3.5:2b should use Standard format");
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 // ─── qwen3.5-heretic-9b:q4_K_M (installed, heretic) ─────────────────────────
 
 const QWEN35_HERETIC_9B: &str = "qwen3.5-heretic-9b:q4_K_M";
@@ -470,13 +440,7 @@ fn test_qwen35_heretic_9b_plain_response() {
     eprintln!("heretic-9b done_reason={}, raw_len={}, clean_len={}", done_reason, content.len(), cleaned.len());
 }
 
-#[test]
-#[ignore]
-fn test_qwen35_heretic_9b_detect_tool_format() {
-    assert_eq!(detect_tool_format(QWEN35_HERETIC_9B), ToolFormat::Legacy,
-        "heretic models should use Legacy format");
-}
-
+// removed *_detect_tool_format test: detect_tool_format/ToolFormat removed from public API
 #[test]
 #[ignore]
 fn test_qwen35_heretic_9b_bracket_format() {
@@ -539,31 +503,7 @@ fn test_gemma4_26b_proxy_plain_response() {
     eprintln!("gemma-4-26b proxy response: {:?}", content);
 }
 
-#[test]
-fn test_parse_bracket_multiline_writefile() {
-    let input = "[TOOL: writefile src/foo.rs\nfn main() {\n    println!(\"hello\");\n}\n]";
-    let calls = parse_tool_calls(input);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "writefile");
-    let (path, content) = calls[0].args.split_once('\x00').unwrap();
-    assert_eq!(path, "src/foo.rs");
-    assert!(content.contains("println!"));
-}
-
-#[test]
-fn test_parse_bracket_multiple_calls() {
-    let input = "[TOOL: rg pattern src/]\n[TOOL: readfile src/main.rs]";
-    let calls = parse_tool_calls(input);
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].name, "rg");
-    assert_eq!(calls[1].name, "readfile");
-}
-
-#[test]
-fn test_parse_bracket_single_arg() {
-    let input = "[TOOL: readfile src/lib.rs]";
-    let calls = parse_tool_calls(input);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "readfile");
-    assert_eq!(calls[0].args, "src/lib.rs");
-}
+// Removed test_parse_bracket_multiline_writefile, test_parse_bracket_multiple_calls, and
+// test_parse_bracket_single_arg: the legacy `[TOOL: name args]` bracket format is no longer
+// supported by parse_tool_calls — the parser now accepts JSON (Standard profile) and XML
+// (ShellOnly profile) only. See src/agent.rs:658.

@@ -71,12 +71,12 @@ pub async fn spawn_subagent(
     }
 }
 
-/// Parse spawn_agent tool calls from JSON output:
-/// {"tool_calls": [{"name": "spawn_agent", "parameters": {"task_id": "...", "description": "..."}}]}
+/// Parse spawn tool calls (subagent spawning) from JSON output:
+/// {"tool_calls": [{"name": "spawn", "parameters": {"task_id": "...", "description": "..."}}]}
 pub fn parse_spawn_agent_calls(output: &str) -> Vec<(String, String)> {
-    crate::agent::parse_json_tool_calls(output)
+    crate::agent::parse_json_tool_calls(output, crate::config::CapabilityProfile::Standard)
         .into_iter()
-        .filter(|tc| tc.name == "spawn_agent")
+        .filter(|tc| tc.name == "spawn")
         .filter_map(|tc| {
             // args encoded as "task_id description" (space-separated, task_id is a single word)
             let mut parts = tc.args.splitn(2, ' ');
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_parse_spawn_agent_calls() {
-        let output = r#"{"tool_calls": [{"name": "spawn_agent", "parameters": {"task_id": "search", "description": "find patterns"}}, {"name": "spawn_agent", "parameters": {"task_id": "analyze", "description": "compute stats"}}]}"#;
+        let output = r#"{"tool_calls": [{"name": "spawn", "parameters": {"task_id": "search", "description": "find patterns"}}, {"name": "spawn", "parameters": {"task_id": "analyze", "description": "compute stats"}}]}"#;
         let calls = parse_spawn_agent_calls(output);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "search");

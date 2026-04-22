@@ -20,12 +20,18 @@ build:
 install: build
 	@mkdir -p $(BINDIR)
 	install -m 755 $(TARGET) $(BINDIR)/$(BINARY)
-	@echo "✅ Installed to $(BINDIR)/$(BINARY)"
+	install -m 755 target/release/yggdra-shell $(BINDIR)/yggdra-shell
+	@echo "✅ Installed to $(BINDIR)/$(BINARY) and $(BINDIR)/yggdra-shell"
 	@echo "   Make sure $(BINDIR) is on your PATH."
 	@if ! echo "$$PATH" | grep -q "$(BINDIR)"; then \
 		echo "   Add this to your shell profile:"; \
 		echo "     export PATH=\"$(BINDIR):\$$PATH\""; \
 	fi
+
+install-shell: build
+	@mkdir -p $(BINDIR)
+	install -m 755 target/release/yggdra-shell $(BINDIR)/yggdra-shell
+	@echo "✅ Installed yggdra-shell to $(BINDIR)/yggdra-shell"
 
 uninstall:
 	rm -f $(BINDIR)/$(BINARY)

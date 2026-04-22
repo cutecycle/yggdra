@@ -11,6 +11,17 @@ pub struct AgentsConfig {
     pub params: ModelParams,
 }
 
+/// Tool capability profile — controls which tools are available to the agent.
+/// `Standard` is the default full-featured mode.
+/// `ShellOnly` restricts the agent to a single `shell` tool for experimentation.
+/// Not serialized — set at startup from CLI flag or binary name.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CapabilityProfile {
+    #[default]
+    Standard,
+    ShellOnly,
+}
+
 /// Application mode
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +29,7 @@ pub enum AppMode {
     Ask,
     Build,
     Plan,
+    One,
 }
 
 impl Default for AppMode {
@@ -32,6 +44,7 @@ impl std::fmt::Display for AppMode {
             AppMode::Ask => write!(f, "ask"),
             AppMode::Build => write!(f, "build"),
             AppMode::Plan => write!(f, "plan"),
+            AppMode::One => write!(f, "one"),
         }
     }
 }
@@ -43,6 +56,7 @@ impl std::str::FromStr for AppMode {
             "ask" => Ok(AppMode::Ask),
             "build" => Ok(AppMode::Build),
             "plan" => Ok(AppMode::Plan),
+            "one" => Ok(AppMode::One),
             _ => Err(format!("Unknown mode: {}", s)),
         }
     }
@@ -71,10 +85,10 @@ pub struct Config {
     pub model: String,
     /// Context window size in tokens (None = use model default)
     pub context_window: Option<u32>,
-    /// Max chars per tool output injected into context (None = 3000).
+    /// Max chars per tool output injected into context (None = unlimited).
     /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
     pub tool_output_cap: Option<usize>,
-    /// Application mode: ask, build, or plan
+    /// Application mode: ask, build, plan, or one
     #[serde(default)]
     pub mode: AppMode,
     /// Knowledge index configuration
@@ -86,6 +100,9 @@ pub struct Config {
     /// UI visual settings
     #[serde(default)]
     pub ui_settings: UISettings,
+    /// Capability profile — not persisted, set at startup from binary name or --shell-only flag
+    #[serde(skip)]
+    pub profile: CapabilityProfile,
 }
 
 /// Knowledge index settings
@@ -118,7 +135,7 @@ impl Default for KnowledgeIndexSettings {
 
 /// Model sampling parameters — all fields optional so unset fields don't override Ollama defaults.
 /// Precedence (highest first): runtime override → config.json → AGENTS.md defaults.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -134,10 +151,34 @@ pub struct ModelParams {
     /// Context window size forwarded to Ollama as num_ctx
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
-    /// Max chars per tool output injected into context (None = 4000).
+    /// Max chars per tool output injected into context (None = unlimited).
     /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output_cap: Option<usize>,
+    /// Enable chain-of-thought thinking (supported by QwQ, DeepSeek-R1, etc.).
+    /// Passed as a top-level `think` field in Ollama requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Reasoning effort level for models that support it (e.g. "low", "medium", "high", "xhigh").
+    /// Forwarded to Ollama as options.reasoning_effort; ignored by models that don't support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for ModelParams {
+    fn default() -> Self {
+        Self {
+            temperature: Some(0.9),
+            top_k: None,
+            top_p: None,
+            repeat_penalty: None,
+            num_predict: Some(-1), // -1 = unlimited (Ollama default can be as low as 128)
+            num_ctx: None,
+            tool_output_cap: None,
+            think: None,
+            reasoning_effort: Some("xhigh".to_string()),
+        }
+    }
 }
 
 impl ModelParams {
@@ -150,6 +191,8 @@ impl ModelParams {
             && self.num_predict.is_none()
             && self.num_ctx.is_none()
             && self.tool_output_cap.is_none()
+            && self.think.is_none()
+            && self.reasoning_effort.is_none()
     }
 
     /// Merge: self wins for any field set; base fills the rest.
@@ -162,6 +205,8 @@ impl ModelParams {
             num_predict: self.num_predict.or(base.num_predict),
             num_ctx: self.num_ctx.or(base.num_ctx),
             tool_output_cap: self.tool_output_cap.or(base.tool_output_cap),
+            think: self.think.or(base.think),
+            reasoning_effort: self.reasoning_effort.clone().or_else(|| base.reasoning_effort.clone()),
         }
     }
 
@@ -222,7 +267,29 @@ impl ModelParams {
                 self.tool_output_cap = Some(v);
                 Ok(format!("tool_output_cap = {} chars", v))
             }
-            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, reset", other)),
+            "think" => {
+                let v: bool = match value.trim().to_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => return Err(format!("think: expected true/false, got '{}'", value)),
+                };
+                self.think = Some(v);
+                Ok(format!("think = {}", v))
+            }
+            "reasoning_effort" => {
+                let v = value.trim().to_lowercase();
+                match v.as_str() {
+                    "low" | "medium" | "high" | "xhigh" | "none" => {},
+                    _ => return Err(format!("reasoning_effort: expected low/medium/high/xhigh/none, got '{}'", value)),
+                }
+                if v == "none" {
+                    self.reasoning_effort = None;
+                    return Ok("reasoning_effort cleared".to_string());
+                }
+                self.reasoning_effort = Some(v.clone());
+                Ok(format!("reasoning_effort = {}", v))
+            }
+            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, think, reasoning_effort, reset", other)),
         }
     }
 
@@ -255,6 +322,8 @@ impl ModelParams {
         if let Some(v) = self.num_predict  { parts.push(format!("num_predict={}", v)); }
         if let Some(v) = self.num_ctx      { parts.push(format!("num_ctx={}", v)); }
         if let Some(v) = self.tool_output_cap { parts.push(format!("tool_output_cap={}", v)); }
+        if let Some(v) = self.think           { parts.push(format!("think={}", v)); }
+        if let Some(ref v) = self.reasoning_effort { parts.push(format!("reasoning_effort={}", v)); }
         if parts.is_empty() { "defaults".to_string() } else { parts.join(" ") }
     }
 }
@@ -276,25 +345,38 @@ struct FileConfig {
 
 impl FileConfig {
     fn load() -> Self {
-        let base_dir = std::env::current_dir()
-            .unwrap_or_default()
-            .join(".yggdra");
-        
-        // Try JSON first (preferred format)
-        let json_path = base_dir.join("config.json");
-        if let Ok(contents) = std::fs::read_to_string(&json_path) {
-            if let Ok(config) = serde_json::from_str::<Self>(&contents) {
-                return config;
+        let cwd = std::env::current_dir().ok();
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok();
+
+        // Priority 1: project-local .yggdra/config.json (matches what the watcher watches)
+        if let Some(ref cwd) = cwd {
+            let local_json = cwd.join(".yggdra").join("config.json");
+            if let Ok(contents) = std::fs::read_to_string(&local_json) {
+                if let Ok(config) = serde_json::from_str::<Self>(&contents) {
+                    return config;
+                }
             }
         }
-        
-        // Fall back to TOML
-        let toml_path = base_dir.join("config.toml");
-        if let Ok(contents) = std::fs::read_to_string(&toml_path) {
-            toml::from_str(&contents).unwrap_or_default()
-        } else {
-            Self::default()
+
+        // Priority 2: global ~/.yggdra/config.json (fallback / first-run)
+        if let Some(home) = home {
+            let global_base = std::path::PathBuf::from(home).join(".yggdra");
+            let json_path = global_base.join("config.json");
+            if let Ok(contents) = std::fs::read_to_string(&json_path) {
+                if let Ok(config) = serde_json::from_str::<Self>(&contents) {
+                    return config;
+                }
+            }
+            // Fall back to TOML (legacy)
+            let toml_path = global_base.join("config.toml");
+            if let Ok(contents) = std::fs::read_to_string(&toml_path) {
+                return toml::from_str(&contents).unwrap_or_default();
+            }
         }
+
+        Self::default()
     }
 }
 
@@ -309,6 +391,7 @@ impl Default for Config {
             knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
             ui_settings: UISettings::default(),
+            profile: CapabilityProfile::Standard,
         }
     }
 }
@@ -339,7 +422,7 @@ impl Config {
         let params = file.params;
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params, ui_settings }
+        Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params, ui_settings, profile: CapabilityProfile::Standard }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -383,14 +466,21 @@ impl Config {
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params: file.params, ui_settings };
+        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::Standard };
         (cfg, validated_client)
     }
 
-    /// Persist config to .yggdra/config.json (creates dir if needed)
+    /// Persist config to .yggdra/config.json in the current project directory.
+    /// Falls back to ~/.yggdra/config.json if cwd is unavailable.
     pub fn save(&self) -> std::io::Result<()> {
-        let dir = std::env::current_dir()?
-            .join(".yggdra");
+        let dir = if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(".yggdra")
+        } else {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"))?;
+            std::path::PathBuf::from(home).join(".yggdra")
+        };
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("config.json");
         let json_str = serde_json::to_string_pretty(self)
@@ -515,6 +605,34 @@ impl AgentsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appmode_one_display() {
+        assert_eq!(format!("{}", AppMode::One), "one");
+    }
+
+    #[test]
+    fn appmode_one_from_str() {
+        use std::str::FromStr;
+        assert_eq!(AppMode::from_str("one").unwrap(), AppMode::One);
+        assert_eq!(AppMode::from_str("ONE").unwrap(), AppMode::One);
+    }
+
+    #[test]
+    fn appmode_one_serde_roundtrip() {
+        let m = AppMode::One;
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"one\"");
+        let parsed: AppMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, AppMode::One);
+    }
+
+    #[test]
+    fn appmode_one_distinct_from_others() {
+        assert_ne!(AppMode::One, AppMode::Build);
+        assert_ne!(AppMode::One, AppMode::Plan);
+        assert_ne!(AppMode::One, AppMode::Ask);
+    }
 
     #[test]
     fn test_parse_valid_models_section() {

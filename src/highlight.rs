@@ -332,11 +332,12 @@ fn tokenize(line: &str, profile: &LangProfile) -> Vec<(TokenKind, String)> {
             let start = i;
             i += 1;
             while i < len && chars[i] != quote {
-                if chars[i] == '\\' { i += 1; } // skip escaped char
+                if chars[i] == '\\' && i + 1 < len { i += 1; } // skip escaped char
                 i += 1;
             }
             if i < len { i += 1; } // closing quote
-            tokens.push((TokenKind::String, chars[start..i].iter().collect()));
+            let end = i.min(len);
+            tokens.push((TokenKind::String, chars[start..end].iter().collect()));
             continue;
         }
 
