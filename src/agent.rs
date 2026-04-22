@@ -1282,12 +1282,16 @@ impl Agent {
                 let mut child_config = self.config.clone();
                 child_config.current_depth += 1;
                 
+                // Calculate remaining spawn depth: (max - current), max is typically 10
+                let remaining_depth = (self.config.max_recursion_depth as u32).saturating_sub(self.config.current_depth as u32);
+                
                 let subagent_result = crate::spawner::spawn_subagent(
                     "agent",
                     task_id,
                     task_desc,
                     &self.config.endpoint,
                     child_config,
+                    remaining_depth,
                 ).await;
 
                 let injection = match subagent_result {

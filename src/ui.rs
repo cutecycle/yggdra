@@ -2011,7 +2011,7 @@ impl App {
                 .with_project_context(project_ctx)
                 .with_token_tx(token_tx);
             let result = crate::spawner::spawn_subagent(
-                "ui", &task_id, &task_desc, &endpoint, config,
+                "ui", &task_id, &task_desc, &endpoint, config, 10,
             ).await;
             let agent_result = result.unwrap_or_else(|e| crate::spawner::AgentResult {
                 agent_id: format!("ui/{}", task_id),
