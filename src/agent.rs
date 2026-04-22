@@ -1250,8 +1250,8 @@ impl Agent {
                 continue;
             }
 
-            // Execute tools — set_params handled locally, others via registry
-            let mut tool_results = String::new();
+            // Execute tools with real-time injection: inject each result immediately after execution
+            // instead of batching all results together. This allows the agent to make faster decisions.
             for call in tool_calls {
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
@@ -1269,10 +1269,15 @@ impl Agent {
                 } else {
                     result
                 };
-                tool_results.push_str(&format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result));
+                // Inject result immediately for real-time feedback
+                let injection = format!("[TOOL_OUTPUT: {} = {}]\n", call.name, result);
+                messages.push(OllamaMessage {
+                    role: "user".to_string(),
+                    content: injection,
+                });
             }
 
-            // Spawn subagents (in parallel, but we'll await them sequentially for simplicity)
+            // Spawn subagents with real-time injection
             for (task_id, task_desc) in &spawn_calls {
                 let mut child_config = self.config.clone();
                 child_config.current_depth += 1;
@@ -1285,34 +1290,27 @@ impl Agent {
                     child_config,
                 ).await;
 
-                match subagent_result {
-                    Ok(result) => {
-                        tool_results.push_str(&format!("{}\n", result.to_injection()));
-                    }
-                    Err(e) => {
-                        tool_results.push_str(&format!(
-                            "[SUBAGENT_ERROR: {} = {}]\n",
-                            task_id, e
-                        ));
-                    }
-                }
+                let injection = match subagent_result {
+                    Ok(result) => result.to_injection(),
+                    Err(e) => format!("[SUBAGENT_ERROR: {} = {}]\n", task_id, e),
+                };
+                messages.push(OllamaMessage {
+                    role: "user".to_string(),
+                    content: injection,
+                });
             }
 
-            // Inject tool and subagent results with steering
+            // Inject steering directive for final tool/subagent execution round
             let steering = if !spawn_calls.is_empty() {
                 SteeringDirective::custom(&crate::spawner::AgentResult::return_steering())
             } else {
                 SteeringDirective::tool_response()
             };
-            let injection = format!(
-                "Execution results:\n{}\n{}",
-                tool_results,
-                steering.format_for_system_prompt()
-            );
-
+            let steering_injection = steering.format_for_system_prompt();
+            
             messages.push(OllamaMessage {
                 role: "user".to_string(),
-                content: injection,
+                content: steering_injection,
             });
 
             // Check if done after tools executed

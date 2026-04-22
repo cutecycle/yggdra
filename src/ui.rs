@@ -263,6 +263,16 @@ fn fuzzy_score(query: &str, target: &str) -> i32 {
 }
 
 /// RAII guard to restore terminal state on drop (including panics/errors)
+///
+/// CRITICAL ORDERING: This guard MUST be created AFTER terminal initialization succeeds.
+/// If TerminalGuard::new() is called before Terminal::new(), then any error during
+/// Terminal::new() will cause the guard to drop with raw mode already enabled but
+/// the terminal never initialized, leaving the terminal in an inconsistent state.
+///
+/// Correct order:
+/// 1. Initialize terminal via Terminal::new()
+/// 2. Create TerminalGuard (enables raw mode + alternate screen)
+/// 3. On drop: disables raw mode and leaves alternate screen
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -853,11 +863,15 @@ impl App {
 
     /// Run the TUI — main event loop with streaming support
     pub async fn run(&mut self) -> Result<()> {
-        let _guard = TerminalGuard::new()?;
-
+        // CRITICAL: Initialize terminal FIRST (before creating TerminalGuard).
+        // This ensures proper error recovery: if Terminal::new() fails, we never
+        // enable raw mode, avoiding inconsistent terminal state.
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
+
+        // NOW create guard (enables raw mode + alternate screen) AFTER terminal is initialized
+        let _guard = TerminalGuard::new()?;
 
         // In Build mode, fire a kick prompt to orient the agent.
         // One mode waits for the user to specify their task first.
@@ -2148,7 +2162,7 @@ impl App {
                 // In Ask-only mode, detect and revert any file changes
                 if self.mode == AppMode::Ask {
                     // Skip file-change check for read-only tools
-                    let is_readonly = matches!(result.tool_name.as_str(), "rg" | "exec" | "shell");
+                    let is_readonly = matches!(result.tool_name.as_str(), "rg" | "exec" | "shell" | "readfile");
                     
                     if !is_readonly {
                         if let Ok(output) = std::process::Command::new("git")
