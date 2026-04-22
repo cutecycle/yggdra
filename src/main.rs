@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
             Some(ollama::OllamaClient::new_with_existing(probe, &config.model))
         }
     } else {
-        match ollama::OllamaClient::new(&config.endpoint, &config.model).await {
+        match ollama::OllamaClient::new_with_key(&config.endpoint, &config.model, config.api_key.as_deref()).await {
             Ok(client) => Some(client),
             Err(_) => {
                 notifications::error_occurred("Ollama connection failed").await;

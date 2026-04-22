@@ -91,6 +91,9 @@ pub struct Config {
     /// Application mode: ask, build, plan, or one
     #[serde(default)]
     pub mode: AppMode,
+    /// API key for OpenAI-compatible endpoints (optional, can also use env vars)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Knowledge index configuration
     #[serde(default)]
     pub knowledge_index: KnowledgeIndexSettings,
@@ -350,6 +353,7 @@ struct FileConfig {
     context_window: Option<u32>,
     tool_output_cap: Option<usize>,
     mode: Option<String>,
+    api_key: Option<String>,
     knowledge_index: Option<KnowledgeIndexSettings>,
     #[serde(default)]
     params: ModelParams,
@@ -402,6 +406,7 @@ impl Default for Config {
             context_window: None,
             tool_output_cap: None,
             mode: AppMode::Plan,
+            api_key: None,
             knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
             ui_settings: UISettings::default(),
@@ -432,11 +437,16 @@ impl Config {
             .and_then(|m| m.parse::<AppMode>().ok())
             .unwrap_or(AppMode::Plan);
 
+        // API key: file config, then OPENROUTER_API_KEY env, then OPENAI_API_KEY env
+        let api_key = file.api_key
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let params = file.params;
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params, ui_settings, profile: CapabilityProfile::Standard }
+        Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params, ui_settings, profile: CapabilityProfile::Standard }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -477,10 +487,15 @@ impl Config {
             .and_then(|m| m.parse::<AppMode>().ok())
             .unwrap_or(AppMode::Plan);
 
+        // API key: file config, then OPENROUTER_API_KEY env, then OPENAI_API_KEY env
+        let api_key = file.api_key
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::Standard };
+        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::Standard };
         (cfg, validated_client)
     }
 
