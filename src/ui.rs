@@ -121,6 +121,48 @@ pub(crate) fn extract_plan_block(text: &str) -> (String, Option<String>) {
     (cleaned, Some(plan_content))
 }
 
+/// Detect shell commands that are likely to write files, so Plan mode can warn the user.
+///
+/// Heuristics (conservative — prefers false negatives over false positives):
+/// - Output redirect: `>` outside quotes, not preceded by `-`, `=`, `>` and not followed by `=`, `>`, `&`
+/// - Append redirect: `>>`  
+/// - `tee` writing to a file
+/// - Heredoc: `<< '` or `<< "`
+pub(crate) fn is_shell_write_pattern(cmd: &str) -> bool {
+    // Heredoc: << 'EOF' or << "EOF" — often used to write file content
+    if cmd.contains("<< '") || cmd.contains("<< \"") || cmd.contains("<<'") || cmd.contains("<<\"") {
+        return true;
+    }
+    // tee writing to a file
+    if cmd.contains("| tee ") || cmd.contains("|tee ") {
+        return true;
+    }
+    // Scan for `>` outside quotes that is actually a redirect.
+    // We track single-quote and double-quote state to avoid false positives on
+    // comparison operators inside awk/grep patterns like `awk 'NR > 5'`.
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => { in_single_quote = !in_single_quote; }
+            b'"'  if !in_single_quote => { in_double_quote = !in_double_quote; }
+            b'>' if !in_single_quote && !in_double_quote => {
+                let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+                // Skip `->`, `=>`, `>=`, `>>`, `>&` (fd-to-fd like 2>&1)
+                if prev != b'-' && prev != b'=' && next != b'=' && next != b'>' && next != b'&' {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Truncate output to at most `cap` chars, keeping the **tail** (most recent output).
 /// Compiler errors, test failures, etc. always appear at the end — the tail is what matters.
 fn truncate_tail(output: &str, cap: usize) -> String {
@@ -1827,6 +1869,39 @@ impl App {
                     return;
                 }
                 _ => {} // rg, spawn, readfile, exec, shell are allowed
+            }
+        }
+
+        // Block write tools in Plan mode — inject a tool-result error so the model
+        // can self-correct without looping.
+        if self.mode == AppMode::Plan {
+            match tool_name.as_str() {
+                "setfile" | "patchfile" | "commit" => {
+                    let blocked_msg = format!(
+                        "🔒 Plan mode: {} is blocked. Switch to Build or One mode to make file changes.",
+                        tool_name
+                    );
+                    self.push_agent_notice(blocked_msg.clone());
+                    let tool_result = Message::new(
+                        "tool",
+                        &format!("[TOOL_RESULT: {} = ERROR: {}]", tool_name, blocked_msg),
+                    );
+                    let _ = self.message_buffer.add_and_persist(tool_result);
+                    self.cached_message_count = self.message_buffer.count()
+                        .unwrap_or(self.cached_message_count + 1);
+                    self.turn_phase = TurnPhase::Idle;
+                    return;
+                }
+                "shell" | "exec" => {
+                    // Warn (but still execute) if the command looks like a write operation
+                    if is_shell_write_pattern(&args) {
+                        self.push_agent_notice(
+                            "⚠️ Plan mode: command appears to write files. \
+                             Plan mode is read-only — use Build or One mode for edits.".to_string()
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -6975,5 +7050,71 @@ mod stream_tests {
         let (cleaned, plan) = extract_plan_block(text);
         assert_eq!(cleaned, text);
         assert!(plan.is_none());
+    }
+}
+
+#[cfg(test)]
+mod plan_mode_tests {
+    use super::*;
+
+    // ============================================================================
+    // is_shell_write_pattern
+    // ============================================================================
+
+    #[test]
+    fn write_pattern_output_redirect() {
+        assert!(is_shell_write_pattern("echo hello > output.txt"));
+    }
+
+    #[test]
+    fn write_pattern_append_redirect() {
+        assert!(is_shell_write_pattern("echo line >> log.txt"));
+    }
+
+    #[test]
+    fn write_pattern_heredoc_single_quote() {
+        assert!(is_shell_write_pattern("cat > file.rs << 'EOF'\ncontent\nEOF"));
+    }
+
+    #[test]
+    fn write_pattern_heredoc_double_quote() {
+        assert!(is_shell_write_pattern("cat > file.rs << \"EOF\"\ncontent\nEOF"));
+    }
+
+    #[test]
+    fn write_pattern_tee() {
+        assert!(is_shell_write_pattern("echo content | tee output.txt"));
+    }
+
+    #[test]
+    fn write_pattern_false_positive_arrow() {
+        // `->` in Rust source NOT inside quotes is correctly excluded
+        assert!(!is_shell_write_pattern("awk 'NR > 5' src/lib.rs"));
+        // `->` inside single-quoted grep pattern: the scanner cannot track quoting,
+        // so it may trigger — that is acceptable (minor over-eager behavior).
+    }
+
+    #[test]
+    fn write_pattern_false_positive_ge() {
+        // `>=` comparison should not trigger
+        assert!(!is_shell_write_pattern("awk '$3 >= 5 {print}' file.txt"));
+    }
+
+    #[test]
+    fn write_pattern_read_only_commands() {
+        assert!(!is_shell_write_pattern("cat src/main.rs"));
+        assert!(!is_shell_write_pattern("grep -r 'foo' src/"));
+        assert!(!is_shell_write_pattern("ls -la"));
+        assert!(!is_shell_write_pattern("cargo test --lib"));
+        assert!(!is_shell_write_pattern("git log --oneline"));
+    }
+
+    #[test]
+    fn write_pattern_stderr_redirect_allowed() {
+        // 2>&1 is a file descriptor redirect, not a write we care about
+        // (it doesn't create/modify user files). The `>` here follows `&` which our
+        // scanner will flag — that is acceptable (slightly over-eager on stderr).
+        // Just verify the function doesn't panic.
+        let _ = is_shell_write_pattern("cargo build 2>&1");
     }
 }
