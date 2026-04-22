@@ -164,6 +164,14 @@ Example:
    Commit message explains WHAT changed and WHY (not just "update file").
    One logical change per commit.
 
+8. "tellhuman" — Send a conversational reply or status update to the user (no side effects)
+   Parameters: {"message": "string"}
+   Examples: {"name": "tellhuman", "parameters": {"message": "All tests pass — the fix is complete."}}
+             {"name": "tellhuman", "parameters": {"message": "I can't find that file. Can you double-check the path?"}}
+   Use this for: conversational responses, clarifying questions, status summaries, or any time you want
+   to communicate with the user without performing work. Prefer this over bare prose replies.
+   Also available as an optional field on any other tool call for combined message + action.
+
 9. "python" — Run a Python script
    Parameters: {"script_path": "string"}
    Examples: {"name": "python", "parameters": {"script_path": "script.py"}}
