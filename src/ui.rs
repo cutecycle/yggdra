@@ -551,6 +551,9 @@ pub struct App {
     plan_understood: bool,
     /// Endpoint type for display in status bar (e.g., "Ollama", "OpenRouter", "llama.cpp")
     endpoint_type: String,
+    /// When true, the next draw loop iteration will clear the terminal first to recover
+    /// from rendering corruption (e.g., after connection errors with raw escape sequences).
+    needs_full_redraw: bool,
 }
 
 impl App {
@@ -713,6 +716,7 @@ impl App {
             render_cache_exchange_end: 0,
             plan_understood: false,
             endpoint_type,
+            needs_full_redraw: false,
         }
     }
 
@@ -1017,6 +1021,10 @@ impl App {
                 self.build_render_cache(current_width);
             }
 
+            if self.needs_full_redraw {
+                let _ = terminal.clear();
+                self.needs_full_redraw = false;
+            }
             terminal.draw(|f| self.draw(f))?;
 
             // Build-mode idle watchdog + bookkeeping
@@ -1192,7 +1200,9 @@ impl App {
                     return;
                 }
                 Ok(StreamEvent::Error(e)) => {
-                    self.notify(format!("❌ Stream error: {}", e));
+                    let clean_error = sanitize_for_display(&e, 300);
+                    self.notify(format!("❌ Stream error: {}", clean_error));
+                    self.needs_full_redraw = true;
                     self.streaming_text.clear();
                     self.thinking_text.clear();
                     self.in_think_block = false;
@@ -3054,7 +3064,14 @@ impl App {
     /// Use for errors, warnings, and significant state changes.
     fn notify(&mut self, text: impl Into<String>) {
         let s: String = text.into();
-        self.status_message = s.clone();
+        // Status bar gets truncated version to avoid layout overflow;
+        // full message still goes to the system event log.
+        self.status_message = if s.len() > 200 {
+            let boundary = floor_char_boundary(&s, 200);
+            format!("{}…", &s[..boundary])
+        } else {
+            s.clone()
+        };
         self.push_system_event(s);
     }
 
@@ -5384,6 +5401,8 @@ impl App {
 
     /// Convert technical errors to user-friendly messages
     fn friendly_error(&self, error: &str) -> String {
+        // Sanitize first to strip ANSI escapes and non-printable chars
+        let error = &sanitize_for_display(error, 500);
         if error.contains("refused") || error.contains("connection refused") {
             format!("Proxy/Ollama is offline. Make sure the proxy is running on {} or Ollama on http://localhost:11434", self.config.endpoint)
         } else if error.contains("model") && error.contains("not found") {
@@ -6509,6 +6528,28 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     let mut i = max;
     while i > 0 && !s.is_char_boundary(i) { i -= 1; }
     i
+}
+
+/// Strip ANSI escape sequences, non-printable characters, and truncate for safe TUI display.
+fn sanitize_for_display(text: &str, max_len: usize) -> String {
+    let mut clean = String::with_capacity(text.len().min(max_len + 64));
+    let mut in_escape = false;
+    for ch in text.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() { in_escape = false; }
+            continue;
+        }
+        if ch == '\x1b' { in_escape = true; continue; }
+        // Keep newlines but strip other control characters
+        if ch.is_control() && ch != '\n' { continue; }
+        clean.push(ch);
+    }
+    if clean.len() > max_len {
+        let boundary = floor_char_boundary(&clean, max_len);
+        format!("{}…", &clean[..boundary])
+    } else {
+        clean
+    }
 }
 
 /// Render the subagent panel content from a list of visible entries.
