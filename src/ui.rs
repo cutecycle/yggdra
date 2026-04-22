@@ -407,6 +407,8 @@ pub struct App {
     render_cache_theme: crate::theme::ThemeKind,
     /// exchange_idx after the last cached message (so streaming text picks up the right band)
     render_cache_exchange_end: usize,
+    /// True when the agent declared [UNDERSTOOD] in Plan mode; cleared when One mode launches.
+    plan_understood: bool,
 }
 
 impl App {
@@ -552,6 +554,7 @@ impl App {
             render_cache_width: 0,
             render_cache_theme: crate::theme::ThemeKind::Dark,
             render_cache_exchange_end: 0,
+            plan_understood: false,
         }
     }
 
@@ -725,8 +728,9 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        // In Build/One mode, always fire a kick prompt to orient the agent
-        if matches!(self.mode, AppMode::Build | AppMode::One) {
+        // In Build mode, fire a kick prompt to orient the agent.
+        // One mode waits for the user to specify their task first.
+        if self.mode == AppMode::Build {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
@@ -1184,6 +1188,17 @@ impl App {
             response_text
         };
 
+        // Extract <plan>...</plan> block: write to .yggdra/plan.md and strip from stored text
+        let response_text = self.extract_and_write_plan(response_text);
+
+        // Detect [UNDERSTOOD] in Plan mode — agent is ready to execute
+        if self.mode == AppMode::Plan && response_text.contains("[UNDERSTOOD]") {
+            self.plan_understood = true;
+            self.status_message = "💡 Agent is ready — press Enter to execute".to_string();
+            tokio::spawn(crate::notifications::agent_says("💡 Plan understood — press Enter to execute"));
+            self.render_cache_dirty = true;
+        }
+
         // Persist assistant message
         let model_msg = Message::new("assistant", &response_text);
         if let Err(e) = self.message_buffer.add_and_persist(model_msg) {
@@ -1205,10 +1220,11 @@ impl App {
         // Warn if context window is filling up
         self.check_context_pressure();
 
-        // Also extract spawn (subagent) from JSON-parsed tool calls (if any)
+        // Also extract spawn (subagent) from JSON-parsed tool calls (any with __SPAWN__ prefix)
         for tc in &tool_calls {
-            if tc.name == "spawn" {
-                let mut parts = tc.args.splitn(2, ' ');
+            if tc.name == "spawn" && tc.args.starts_with("__SPAWN__") {
+                let rest = &tc.args["__SPAWN__".len()..];
+                let mut parts = rest.splitn(2, ' ');
                 let task_id = parts.next().unwrap_or("task").to_string();
                 let desc = parts.next().unwrap_or("").to_string();
                 if !spawn_calls.iter().any(|(id, _)| id == &task_id) {
@@ -1216,9 +1232,10 @@ impl App {
                 }
             }
         }
-        // Filter spawn (subagent) out of tool_calls so it's not double-dispatched
+        // Filter only subagent spawns (__SPAWN__ prefix) out of tool_calls.
+        // Command spawns (no prefix) stay and are dispatched to ExecTool.
         let tool_calls: Vec<_> = tool_calls.into_iter()
-            .filter(|tc| tc.name != "spawn")
+            .filter(|tc| !(tc.name == "spawn" && tc.args.starts_with("__SPAWN__")))
             .collect();
 
         // Fire-and-forget gap reflection: only on final prose responses (no tool calls).
@@ -1567,15 +1584,27 @@ impl App {
             } else if matches!(self.mode, AppMode::Build | AppMode::One) {
                 // Build/One mode: auto-continue — detect stuck and hint, but never pause
                 self.consecutive_empty_kicks += 1;
-                if self.consecutive_empty_kicks >= 3 {
-                    self.push_agent_notice(
-                        "⚠️ No tool calls in last 3 responses. If you are done, summarize results. \
-                         If not done, emit a tool call to continue.".to_string()
-                    );
-                    self.consecutive_empty_kicks = 0;
-                }
                 if self.mode == AppMode::One {
-                    // One-mode: a turn with no tool calls means the task is complete.
+                    if self.tool_iteration_count == 0 {
+                        // Model hasn't called any tools yet on this task.
+                        // Kick it up to 3 times; after that, complete rather than looping forever.
+                        if self.consecutive_empty_kicks >= 3 {
+                            self.push_agent_notice(
+                                "⚠️ Three responses without tool calls — completing One mode.".to_string()
+                            );
+                            self.complete_one_mode("model unresponsive");
+                            self.turn_phase = TurnPhase::Idle;
+                            self.tool_iteration_count = 0;
+                            self.streaming_text.clear();
+                            self.thinking_text.clear();
+                            self.in_think_block = false;
+                            self.stream_rx = None;
+                            return;
+                        }
+                        self.inject_continue_kick();
+                        return;
+                    }
+                    // Tools were used at some point — a plain-text response means done.
                     self.complete_one_mode("no tool calls");
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
@@ -1584,6 +1613,14 @@ impl App {
                     self.in_think_block = false;
                     self.stream_rx = None;
                     return;
+                }
+                // Build mode: warn every 3 empty responses, then keep going
+                if self.consecutive_empty_kicks >= 3 {
+                    self.push_agent_notice(
+                        "⚠️ No tool calls in last 3 responses. If you are done, summarize results. \
+                         If not done, emit a tool call to continue.".to_string()
+                    );
+                    self.consecutive_empty_kicks = 0;
                 }
                 self.inject_continue_kick();
                 return;
@@ -2150,6 +2187,51 @@ impl App {
         self.render_cache_dirty = true;
     }
 
+    /// Launch One mode after agent declared [UNDERSTOOD]: switch mode, kick, clear flag.
+    fn launch_plan_understood(&mut self) {
+        self.plan_understood = false;
+        self.input_buffer.clear();
+        self.mode = crate::config::AppMode::One;
+        self.config.mode = self.mode;
+        let _ = self.config.save();
+        self.push_system_event("🎯 Launching One mode — executing plan".to_string());
+        self.inject_continue_kick();
+        self.render_cache_dirty = true;
+    }
+
+    /// Extract `<plan>…</plan>` from a response, write contents to `.yggdra/plan.md`,
+    /// and return the text with the block removed (clean display and storage).
+    fn extract_and_write_plan(&mut self, text: String) -> String {
+        let start_tag = "<plan>";
+        let end_tag = "</plan>";
+        let start = match text.find(start_tag) {
+            Some(i) => i,
+            None => return text,
+        };
+        let end = match text.find(end_tag) {
+            Some(i) => i,
+            None => return text,
+        };
+        if end <= start { return text; }
+
+        let plan_content = text[start + start_tag.len()..end].trim().to_string();
+        let plan_path = std::path::Path::new(".yggdra/plan.md");
+        match std::fs::write(plan_path, &plan_content) {
+            Ok(_) => self.push_system_event("📋 Plan updated → .yggdra/plan.md".to_string()),
+            Err(e) => self.notify(format!("⚠️ Could not write plan.md: {}", e)),
+        }
+
+        // Strip the block, collapsing surrounding whitespace neatly
+        let before = text[..start].trim_end();
+        let after = text[end + end_tag.len()..].trim_start();
+        match (before.is_empty(), after.is_empty()) {
+            (true,  true)  => String::new(),
+            (true,  false) => after.to_string(),
+            (false, true)  => before.to_string(),
+            (false, false) => format!("{}\n{}", before, after),
+        }
+    }
+
     /// Check if the async gap reflection query has completed; record and surface if so
     fn check_gap_result(&mut self) {
         let rx = match self.gap_rx.as_mut() {
@@ -2508,6 +2590,31 @@ impl App {
                  ---\n\
                  🎯 AGENTS.md is already in context — start working immediately."
             );
+            // Plan mode: inject <plan> and [UNDERSTOOD] instructions
+            if self.mode == AppMode::Plan {
+                let threshold = self.effective_params().ambiguity_threshold.unwrap_or(0);
+                base.push_str(&format!(
+                    "\n---\n\
+                     PLAN MODE — you maintain .yggdra/plan.md:\n\
+                     Whenever your understanding of the plan evolves, end your response with:\n\
+                     <plan>\n\
+                     ## Goal\n\
+                     One sentence describing the objective.\n\
+                     ## Steps\n\
+                     - [ ] pending step\n\
+                     - [x] completed step\n\
+                     ## Notes\n\
+                     Key constraints or decisions.\n\
+                     </plan>\n\
+                     yggdra writes .yggdra/plan.md automatically. Omit if plan hasn't changed.\n\
+                     \n\
+                     UNDERSTOOD SIGNAL: When your ambiguity about what to do is ≤{t} (current threshold={t}),\n\
+                     declare readiness by writing [UNDERSTOOD] in your response.\n\
+                     The human will be notified; when they press Enter, execution begins in One mode.\n\
+                     If threshold is 0, only declare [UNDERSTOOD] when fully certain.\n",
+                    t = threshold
+                ));
+            }
             // Inject recent context / memory / thoughts
             let recent = self.recent_messages_block();
             if !recent.is_empty() { base.push_str("\n---\n"); base.push_str(&recent); }
@@ -2877,8 +2984,14 @@ impl App {
             };
             let stream_content = ratatui::text::Text::from(stream_text);
             let height = text_height_static(&stream_content, area_width);
+            // Use muted colour when showing the thinking phase (thinking text present, no response yet)
+            let in_thinking_phase = !self.thinking_text.is_empty() && self.streaming_text.is_empty();
             let stream_style = if self.theme.kind == crate::theme::ThemeKind::Dark {
-                Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
+                if in_thinking_phase {
+                    Style::default().fg(Color::Rgb(140, 150, 170)).add_modifier(Modifier::ITALIC).bg(tint)
+                } else {
+                    Style::default().fg(Color::Rgb(220, 230, 240)).bg(tint)
+                }
             } else {
                 Style::default().bg(tint)
             };
@@ -3292,9 +3405,9 @@ impl App {
             Some(r) => format!("⚡ {:.1} tok/s", r),
             None => String::new(),
         };
-        // Countdown to next auto-request: shown when on battery, build/one mode, idle
+        // Countdown to next auto-request: shown when on battery, build mode, idle
         let countdown_text = if self.on_battery == BatteryState::OnBattery
-            && matches!(self.mode, AppMode::Build | AppMode::One)
+            && self.mode == AppMode::Build
             && self.turn_phase == TurnPhase::Idle
         {
             const KICK_SECS: u64 = 5;
@@ -3311,7 +3424,9 @@ impl App {
         let power_segment = parts.join(" ");
 
         let width = chunks[5].width as usize;
-        let status = if width >= 60 && !power_segment.is_empty() {
+        let status = if self.plan_understood {
+            "💡 Agent is ready — press Enter to execute in One mode".to_string()
+        } else if width >= 60 && !power_segment.is_empty() {
             format!(
                 "🔢 {} | {} | 💬 {} | {}",
                 &self.session.id[..8],
@@ -3745,6 +3860,11 @@ impl App {
 
         // Validate input
         if command.is_empty() {
+            // If agent declared [UNDERSTOOD], empty Enter launches One mode execution
+            if self.plan_understood {
+                self.launch_plan_understood();
+                return;
+            }
             self.status_message = "ℹ️ Please enter a message or command. Type /help for commands.".to_string();
             self.input_buffer.clear();
             return;
@@ -5018,8 +5138,9 @@ impl App {
             self.stall_notice_sent = true;
         }
 
-        // Watchdog: if Build/One mode has been idle for 5+ seconds, re-kick
-        if matches!(self.mode, AppMode::Build | AppMode::One)
+        // Watchdog: if Build mode has been idle for 5+ seconds, re-kick.
+        // One mode does not auto-kick — it waits for user input.
+        if self.mode == AppMode::Build
             && self.turn_phase == TurnPhase::Idle
             && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
             && self.ollama_client.is_some()
@@ -5061,7 +5182,12 @@ impl App {
         // Render the think block as a dim collapsible section
         let has_think = think_prefix.is_some();
         if let Some(ref think) = think_prefix {
-            let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+            let think_color = if is_dark {
+                Color::Rgb(140, 150, 170) // readable slate-grey in dark mode
+            } else {
+                Color::Rgb(100, 110, 130) // darker for light mode
+            };
+            let dim = Style::default().fg(think_color).add_modifier(Modifier::ITALIC);
             let think_lines: Vec<&str> = think.lines().collect();
             // Header line with emoji
             lines.push(RLine::from(vec![

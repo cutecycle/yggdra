@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
             "--ask"        => mode_override = Some(AppMode::Ask),
             "--build"      => mode_override = Some(AppMode::Build),
             "--plan"       => mode_override = Some(AppMode::Plan),
-            "--one"        => mode_override = Some(AppMode::One),
+            "--one"        => { mode_override = Some(AppMode::One); shell_only = false; }
             "--shell-only" => shell_only = true,
             "--standard"   => shell_only = false,
             "--help" | "-h" => {
@@ -160,7 +160,12 @@ async fn main() -> Result<()> {
     };
     knowledge_index::start_indexing_task(Some(index_config));
     
-    let session = Session::load_or_create()?;
+    // One mode uses ephemeral sessions — each invocation is a fresh start.
+    let session = if config.mode == AppMode::One {
+        Session::create_ephemeral()?
+    } else {
+        Session::load_or_create()?
+    };
 
     // Load AGENTS.md: global ~/AGENTS.md first, then project-local appended
     let global_agents = dirs::home_dir()

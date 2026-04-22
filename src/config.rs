@@ -163,6 +163,10 @@ pub struct ModelParams {
     /// Forwarded to Ollama as options.reasoning_effort; ignored by models that don't support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// How much ambiguity the agent tolerates before declaring [UNDERSTOOD] in Plan mode.
+    /// 0 = must be fully certain; higher = can proceed with some remaining questions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguity_threshold: Option<u32>,
 }
 
 impl Default for ModelParams {
@@ -177,6 +181,7 @@ impl Default for ModelParams {
             tool_output_cap: None,
             think: None,
             reasoning_effort: Some("xhigh".to_string()),
+            ambiguity_threshold: None,
         }
     }
 }
@@ -193,6 +198,7 @@ impl ModelParams {
             && self.tool_output_cap.is_none()
             && self.think.is_none()
             && self.reasoning_effort.is_none()
+            && self.ambiguity_threshold.is_none()
     }
 
     /// Merge: self wins for any field set; base fills the rest.
@@ -207,6 +213,7 @@ impl ModelParams {
             tool_output_cap: self.tool_output_cap.or(base.tool_output_cap),
             think: self.think.or(base.think),
             reasoning_effort: self.reasoning_effort.clone().or_else(|| base.reasoning_effort.clone()),
+            ambiguity_threshold: self.ambiguity_threshold.or(base.ambiguity_threshold),
         }
     }
 
@@ -289,7 +296,13 @@ impl ModelParams {
                 self.reasoning_effort = Some(v.clone());
                 Ok(format!("reasoning_effort = {}", v))
             }
-            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, think, reasoning_effort, reset", other)),
+            "ambiguity_threshold" => {
+                let v: u32 = value.trim().parse()
+                    .map_err(|_| format!("ambiguity_threshold: expected unsigned int, got '{}'", value))?;
+                self.ambiguity_threshold = Some(v);
+                Ok(format!("ambiguity_threshold = {}", v))
+            }
+            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, think, reasoning_effort, ambiguity_threshold, reset", other)),
         }
     }
 
@@ -324,6 +337,7 @@ impl ModelParams {
         if let Some(v) = self.tool_output_cap { parts.push(format!("tool_output_cap={}", v)); }
         if let Some(v) = self.think           { parts.push(format!("think={}", v)); }
         if let Some(ref v) = self.reasoning_effort { parts.push(format!("reasoning_effort={}", v)); }
+        if let Some(v) = self.ambiguity_threshold { parts.push(format!("ambiguity_threshold={}", v)); }
         if parts.is_empty() { "defaults".to_string() } else { parts.join(" ") }
     }
 }

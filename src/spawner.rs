@@ -73,13 +73,14 @@ pub async fn spawn_subagent(
 
 /// Parse spawn tool calls (subagent spawning) from JSON output:
 /// {"tool_calls": [{"name": "spawn", "parameters": {"task_id": "...", "description": "..."}}]}
+/// Subagent spawns are identified by the __SPAWN__ prefix in the formatted args.
 pub fn parse_spawn_agent_calls(output: &str) -> Vec<(String, String)> {
     crate::agent::parse_json_tool_calls(output, crate::config::CapabilityProfile::Standard)
         .into_iter()
-        .filter(|tc| tc.name == "spawn")
+        .filter(|tc| tc.name == "spawn" && tc.args.starts_with("__SPAWN__"))
         .filter_map(|tc| {
-            // args encoded as "task_id description" (space-separated, task_id is a single word)
-            let mut parts = tc.args.splitn(2, ' ');
+            let rest = &tc.args["__SPAWN__".len()..];
+            let mut parts = rest.splitn(2, ' ');
             let task_id = parts.next()?.to_string();
             let description = parts.next().unwrap_or("").to_string();
             if task_id.is_empty() { None } else { Some((task_id, description)) }

@@ -178,11 +178,18 @@ Example:
     Use this before every other tool call. One sentence: what you are about to do and why.
     The file is overwritten each time — it is your single active thought, not a log.
 
-12. "spawn" — Spawn a subagent to handle a subtask autonomously
-    Parameters: {"task_id": "string", "description": "string"}
-    Examples: {"name": "spawn", "parameters": {"task_id": "write-tests", "description": "Write unit tests for src/tools.rs"}}
+12. "spawn" — Two uses depending on parameters:
+    A) COMMAND: run a command directly (like exec). Use "command" parameter.
+       Parameters: {"command": "string"}
+       Examples: {"name": "spawn", "parameters": {"command": "cargo test --lib"}}
+                 {"name": "spawn", "parameters": {"command": "ls -la"}}
+    B) SUBAGENT: spawn a parallel subagent to handle a subtask autonomously. Use "task_id" + "description".
+       Parameters: {"task_id": "string", "description": "string"}
+       Examples: {"name": "spawn", "parameters": {"task_id": "write-tests", "description": "Write unit tests for src/tools.rs"}}
+                 {"name": "spawn", "parameters": {"task_id": "build-check", "description": "Run cargo build and report errors"}}
+    Subagents run in parallel — spawn multiple for async flow, then collect results.
 
-exec accepts bare names via PATH (git, cargo, python3); use shell for sh -c pipelines.
+exec and spawn (command form) both accept bare names via PATH (git, cargo, python3); use shell for sh -c pipelines.
 
 Every tool response begins with one sentence explaining what you are doing and why.
 Write the explanation FIRST, then the JSON on the next line.
@@ -535,9 +542,15 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
             }
         }
         "spawn" => {
-            let task_id = get_str("task_id");
-            let desc = get_str("description");
-            format!("{} {}", task_id, desc)
+            if params.get("task_id").is_some() {
+                // Subagent spawn: prefix with __SPAWN__ so dispatcher routes to spawner
+                let task_id = get_str("task_id");
+                let desc = get_str("description");
+                format!("__SPAWN__{} {}", task_id, desc)
+            } else {
+                // Command spawn: same format as exec (run the command directly)
+                get_str("command")
+            }
         }
         "commit" => get_str("message"),
         "python" => get_str("script_path"),
@@ -873,6 +886,13 @@ impl Agent {
             .map(|s| s.format_for_agent())
             .unwrap_or_else(|_| "SYSTEM INFO: (unavailable)".to_string());
 
+        // Current local time to the minute
+        let time_str = {
+            use chrono::Local;
+            format!("TIME: {}", Local::now().format("%H:%M %Z"))
+        };
+        let sysinfo = format!("{}\n{}", sysinfo, time_str);
+
         let tools = json_tool_descriptions(profile);
 
         let prompt = if profile == CapabilityProfile::ShellOnly {
@@ -926,6 +946,12 @@ impl Agent {
                 project_ctx = self.config.project_context,
             )
         } else {
+            let one_mode_section = if self.config.app_mode == AppMode::One {
+                "\n\n⚡ ONE MODE — async-first task execution:\n                 You are executing a single user-specified task. Default to async parallelism:\n                 1. Break the task into independent subtasks immediately.\n                 2. spawn each subtask as a parallel subagent with task_id + description.\n                 3. Continue coordination while subagents run in parallel.\n                 4. Collect [AGENT_RESULT: task_id = ...] injections and synthesize.\n                 5. When all done, emit [DONE].\n                 Prefer spawn over sequential execution — parallelism is free here.\n"
+                .to_string()
+            } else {
+                String::new()
+            };
             format!(
                 "You are an agentic assistant with access to tools and subagent spawning.\n\
                  \n\
@@ -936,7 +962,8 @@ impl Agent {
                  Use relative paths (e.g. src/foo.rs) — they resolve to the project root automatically.\n\
                  Write only within the project root.\n\
                  \n\
-                 {tools}\n\
+                 {tools}\
+                 {one_mode}\n\
                  \n\
                  OFFLINE KNOWLEDGE BASE:\n\
                  The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories.\n\
@@ -965,6 +992,7 @@ impl Agent {
                 sysinfo = sysinfo,
                 root    = root_line,
                 tools   = tools,
+                one_mode = one_mode_section,
                 project_ctx = self.config.project_context,
             )
         };

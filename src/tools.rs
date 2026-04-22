@@ -650,18 +650,22 @@ impl Tool for SetfileTool {
         let line_count = content.lines().count();
         let write_summary = format!("✅ wrote {} ({} lines)", path.display(), line_count);
 
-        // Auto-commit: stage and commit the file. Degrade silently if git unavailable.
-        let commit_note = match self.git_add_and_commit(&path) {
-            Ok(hash) => format!(" — committed {}", hash),
-            Err(_)   => String::new(),
+        // Auto-commit: stage and commit the file. Capture diff before commit.
+        let (commit_note, diff_output) = match self.git_add_and_commit(&path) {
+            Ok((hash, diff)) => (format!(" — committed {}", hash), diff),
+            Err(_)           => (String::new(), String::new()),
         };
 
-        Ok(format!("{}{}", write_summary, commit_note))
+        if diff_output.is_empty() {
+            Ok(format!("{}{}", write_summary, commit_note))
+        } else {
+            Ok(format!("{}{}\n{}", write_summary, commit_note, diff_output))
+        }
     }
 }
 
 impl SetfileTool {
-    fn git_add_and_commit(&self, path: &std::path::Path) -> Result<String> {
+    fn git_add_and_commit(&self, path: &std::path::Path) -> Result<(String, String)> {
         // Stage this specific file
         let add = Command::new("git")
             .arg("add")
@@ -671,6 +675,17 @@ impl SetfileTool {
         if !add.status.success() {
             return Err(anyhow!("git add: {}", String::from_utf8_lossy(&add.stderr)));
         }
+
+        // Capture staged diff before committing
+        let diff_out = Command::new("git")
+            .args(["diff", "--cached", "--unified=3", "--color=never", "--", path.to_str().unwrap_or("")])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        // Trim the diff to keep output reasonable (first 60 lines)
+        let diff_trimmed = diff_out.lines().take(60).collect::<Vec<_>>().join("\n");
 
         let msg = format!("setfile: {}", path.display());
         let commit = Command::new("git")
@@ -685,11 +700,11 @@ impl SetfileTool {
                 .and_then(|l| l.split_whitespace().nth(1))
                 .map(|s| s.trim_end_matches(']').to_string())
                 .unwrap_or_else(|| "ok".to_string());
-            Ok(hash)
+            Ok((hash, diff_trimmed))
         } else {
             let stderr = String::from_utf8_lossy(&commit.stderr);
             if stderr.contains("nothing to commit") || stderr.contains("nothing added") {
-                Ok("no-op".to_string())
+                Ok(("no-op".to_string(), String::new()))
             } else {
                 Err(anyhow!("{}", stderr.trim()))
             }
@@ -1066,6 +1081,9 @@ impl ToolRegistry {
         } else if profile == CapabilityProfile::Standard {
             tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
             tools.insert("exec".to_string(), Box::new(ExecTool) as Box<dyn Tool>);
+            // "spawn" is both a command-exec alias (spawn git log) and a subagent launcher
+            // (spawn with task_id/description). The dispatcher disambiguates by args prefix.
+            tools.insert("spawn".to_string(), Box::new(ExecTool) as Box<dyn Tool>);
             tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
             tools.insert("setfile".to_string(), Box::new(SetfileTool) as Box<dyn Tool>);
             tools.insert("patchfile".to_string(), Box::new(PatchfileTool) as Box<dyn Tool>);
@@ -1313,11 +1331,7 @@ mod tests {
         assert!(tools.contains(&"ruste"));
         assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"think"));
-        assert_eq!(tools.len(), 10); // rg exec shell readfile setfile patchfile commit python ruste think
-    }
-
-    #[test]
-    fn test_fix_macos_sed_no_extension() {
+        assert_eq!(tools.len(), 11); // rg exec spawn shell readfile setfile patchfile commit python ruste think {
         // No extension → add `''`
         assert_eq!(
             fix_macos_sed_inplace("sed -i 's/old/new/g' file.rs"),
@@ -1480,7 +1494,7 @@ mod tests {
         let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
         let tools = registry.list_tools();
         assert!(tools.contains(&"patchfile"), "patchfile should be registered");
-        assert_eq!(tools.len(), 10); // rg exec shell readfile setfile patchfile commit python ruste think
+        assert_eq!(tools.len(), 11); // rg exec spawn shell readfile setfile patchfile commit python ruste think
     }
 
     // ===== parse_line_range tests =====
