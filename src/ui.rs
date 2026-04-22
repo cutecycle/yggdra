@@ -35,6 +35,84 @@ type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 const MAX_TOOL_ITERATIONS: usize = 30;
 const DEFAULT_TOOL_OUTPUT_CAP: usize = 600;
 
+/// What the app should do at the end of a streaming turn with no parsed tool calls.
+///
+/// Extracted as a pure function so the loop-prevention logic is independently testable
+/// without constructing the full `App` struct.
+#[derive(Debug, PartialEq)]
+pub(crate) enum StreamEndAction {
+    /// Normal interactive response — persist and go idle.
+    Persist,
+    /// Inject another continue-kick to keep the autonomous loop running.
+    Kick,
+    /// One mode: the task is considered complete.
+    CompleteOne(&'static str),
+}
+
+/// Decide what to do when a streaming turn ends with no tool calls.
+///
+/// * `has_text` — `streaming_text` is non-empty after the turn.
+/// * `mode` — current app mode.
+/// * `tool_iteration_count` — how many tool→re-stream cycles completed this task.
+/// * `consecutive_empty_kicks` — kicks WITHOUT tool calls so far (before this turn).
+pub(crate) fn decide_stream_end(
+    has_text: bool,
+    mode: AppMode,
+    tool_iteration_count: usize,
+    consecutive_empty_kicks: u32,
+) -> StreamEndAction {
+    // After this turn, kicks-without-tools becomes consecutive_empty_kicks + 1.
+    let kicks_after = consecutive_empty_kicks + 1;
+    match mode {
+        AppMode::Plan | AppMode::Ask => StreamEndAction::Persist,
+        AppMode::Build => StreamEndAction::Kick,
+        AppMode::One => {
+            if !has_text {
+                // Model produced only thinking tokens (or nothing) — kick up to 3 times.
+                if kicks_after >= 3 {
+                    StreamEndAction::CompleteOne("empty responses")
+                } else {
+                    StreamEndAction::Kick
+                }
+            } else if tool_iteration_count > 0 {
+                // Tools were used at some point; plain-text response = task done.
+                StreamEndAction::CompleteOne("no tool calls")
+            } else {
+                // No tools used yet — nudge the model to start working, up to 3 times.
+                if kicks_after >= 3 {
+                    StreamEndAction::CompleteOne("model unresponsive")
+                } else {
+                    StreamEndAction::Kick
+                }
+            }
+        }
+    }
+}
+
+/// Parse a `<plan>…</plan>` block out of a response string.
+///
+/// Returns `(cleaned_text, Some(plan_content))` when a block is found, or
+/// `(original_text, None)` when there is none.  The block is stripped from
+/// the returned text so it does not clutter the chat history.
+pub(crate) fn extract_plan_block(text: &str) -> (String, Option<String>) {
+    const START: &str = "<plan>";
+    const END: &str = "</plan>";
+    let start = match text.find(START) { Some(i) => i, None => return (text.to_string(), None) };
+    let end   = match text.find(END)   { Some(i) => i, None => return (text.to_string(), None) };
+    if end <= start { return (text.to_string(), None); }
+
+    let plan_content = text[start + START.len()..end].trim().to_string();
+    let before = text[..start].trim_end();
+    let after  = text[end + END.len()..].trim_start();
+    let cleaned = match (before.is_empty(), after.is_empty()) {
+        (true,  true)  => String::new(),
+        (true,  false) => after.to_string(),
+        (false, true)  => before.to_string(),
+        (false, false) => format!("{}\n{}", before, after),
+    };
+    (cleaned, Some(plan_content))
+}
+
 /// Truncate output to at most `cap` chars, keeping the **tail** (most recent output).
 /// Compiler errors, test failures, etc. always appear at the end — the tail is what matters.
 fn truncate_tail(output: &str, cap: usize) -> String {
@@ -1129,8 +1207,26 @@ impl App {
             self.stream_rx = None;
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
-            if matches!(self.mode, AppMode::Build | AppMode::One) {
-                self.inject_continue_kick();
+            let action = decide_stream_end(false, self.mode, 0, self.consecutive_empty_kicks);
+            self.consecutive_empty_kicks += 1;
+            match action {
+                StreamEndAction::CompleteOne(reason) => {
+                    self.push_agent_notice(
+                        format!("⚠️ Three empty responses (thinking only) — completing One mode.")
+                    );
+                    self.complete_one_mode(reason);
+                }
+                StreamEndAction::Kick => {
+                    if self.consecutive_empty_kicks >= 3 {
+                        self.push_agent_notice(
+                            "⚠️ Three empty responses. If you are done, summarize. \
+                             If not, emit a tool call.".to_string()
+                        );
+                        self.consecutive_empty_kicks = 0;
+                    }
+                    self.inject_continue_kick();
+                }
+                StreamEndAction::Persist => {}
             }
             return;
         }
@@ -1581,51 +1677,35 @@ impl App {
                     self.tool_iteration_count
                 ));
                 // Do NOT reset counter or stop — let the agent continue
-            } else if matches!(self.mode, AppMode::Build | AppMode::One) {
-                // Build/One mode: auto-continue — detect stuck and hint, but never pause
+            } else {
+                let action = decide_stream_end(true, self.mode, self.tool_iteration_count, self.consecutive_empty_kicks);
                 self.consecutive_empty_kicks += 1;
-                if self.mode == AppMode::One {
-                    if self.tool_iteration_count == 0 {
-                        // Model hasn't called any tools yet on this task.
-                        // Kick it up to 3 times; after that, complete rather than looping forever.
+                match action {
+                    StreamEndAction::CompleteOne(reason) => {
+                        self.complete_one_mode(reason);
+                        self.turn_phase = TurnPhase::Idle;
+                        self.tool_iteration_count = 0;
+                        self.streaming_text.clear();
+                        self.thinking_text.clear();
+                        self.in_think_block = false;
+                        self.stream_rx = None;
+                        return;
+                    }
+                    StreamEndAction::Kick => {
                         if self.consecutive_empty_kicks >= 3 {
                             self.push_agent_notice(
-                                "⚠️ Three responses without tool calls — completing One mode.".to_string()
+                                "⚠️ No tool calls in last 3 responses. If you are done, summarize. \
+                                 If not, emit a tool call.".to_string()
                             );
-                            self.complete_one_mode("model unresponsive");
-                            self.turn_phase = TurnPhase::Idle;
-                            self.tool_iteration_count = 0;
-                            self.streaming_text.clear();
-                            self.thinking_text.clear();
-                            self.in_think_block = false;
-                            self.stream_rx = None;
-                            return;
+                            self.consecutive_empty_kicks = 0;
                         }
                         self.inject_continue_kick();
                         return;
                     }
-                    // Tools were used at some point — a plain-text response means done.
-                    self.complete_one_mode("no tool calls");
-                    self.turn_phase = TurnPhase::Idle;
-                    self.tool_iteration_count = 0;
-                    self.streaming_text.clear();
-                    self.thinking_text.clear();
-                    self.in_think_block = false;
-                    self.stream_rx = None;
-                    return;
+                    StreamEndAction::Persist => {
+                        self.status_message = "✅ Response complete".to_string();
+                    }
                 }
-                // Build mode: warn every 3 empty responses, then keep going
-                if self.consecutive_empty_kicks >= 3 {
-                    self.push_agent_notice(
-                        "⚠️ No tool calls in last 3 responses. If you are done, summarize results. \
-                         If not done, emit a tool call to continue.".to_string()
-                    );
-                    self.consecutive_empty_kicks = 0;
-                }
-                self.inject_continue_kick();
-                return;
-            } else {
-                self.status_message = "✅ Response complete".to_string();
             }
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
@@ -2202,33 +2282,16 @@ impl App {
     /// Extract `<plan>…</plan>` from a response, write contents to `.yggdra/plan.md`,
     /// and return the text with the block removed (clean display and storage).
     fn extract_and_write_plan(&mut self, text: String) -> String {
-        let start_tag = "<plan>";
-        let end_tag = "</plan>";
-        let start = match text.find(start_tag) {
-            Some(i) => i,
-            None => return text,
-        };
-        let end = match text.find(end_tag) {
-            Some(i) => i,
-            None => return text,
-        };
-        if end <= start { return text; }
-
-        let plan_content = text[start + start_tag.len()..end].trim().to_string();
-        let plan_path = std::path::Path::new(".yggdra/plan.md");
-        match std::fs::write(plan_path, &plan_content) {
-            Ok(_) => self.push_system_event("📋 Plan updated → .yggdra/plan.md".to_string()),
-            Err(e) => self.notify(format!("⚠️ Could not write plan.md: {}", e)),
-        }
-
-        // Strip the block, collapsing surrounding whitespace neatly
-        let before = text[..start].trim_end();
-        let after = text[end + end_tag.len()..].trim_start();
-        match (before.is_empty(), after.is_empty()) {
-            (true,  true)  => String::new(),
-            (true,  false) => after.to_string(),
-            (false, true)  => before.to_string(),
-            (false, false) => format!("{}\n{}", before, after),
+        let (cleaned, plan) = extract_plan_block(&text);
+        if let Some(content) = plan {
+            let plan_path = std::path::Path::new(".yggdra/plan.md");
+            match std::fs::write(plan_path, &content) {
+                Ok(_) => self.push_system_event("📋 Plan updated → .yggdra/plan.md".to_string()),
+                Err(e) => self.notify(format!("⚠️ Could not write plan.md: {}", e)),
+            }
+            cleaned
+        } else {
+            text
         }
     }
 
@@ -6693,5 +6756,166 @@ mod loop_detection_tests {
         let h = hash_tool_call("readfile", "src/a.rs");
         // After capping, only 3 readfile entries remain (the oldest was evicted)
         assert_eq!(count_repeat_calls(&q, "readfile", h), 3);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    // ============================================================================
+    // decide_stream_end — One mode
+    // ============================================================================
+
+    #[test]
+    fn one_empty_text_first_kick_returns_kick() {
+        let action = decide_stream_end(false, AppMode::One, 0, 0);
+        assert_eq!(action, StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn one_empty_text_second_kick_returns_kick() {
+        let action = decide_stream_end(false, AppMode::One, 0, 1);
+        assert_eq!(action, StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn one_empty_text_third_kick_completes() {
+        let action = decide_stream_end(false, AppMode::One, 0, 2);
+        assert_eq!(action, StreamEndAction::CompleteOne("empty responses"));
+    }
+
+    #[test]
+    fn one_has_text_no_tools_no_prior_tools_first_kick() {
+        let action = decide_stream_end(true, AppMode::One, 0, 0);
+        assert_eq!(action, StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn one_has_text_no_tools_no_prior_tools_third_kick_completes() {
+        let action = decide_stream_end(true, AppMode::One, 0, 2);
+        assert_eq!(action, StreamEndAction::CompleteOne("model unresponsive"));
+    }
+
+    #[test]
+    fn one_has_text_no_tools_after_tools_used_completes() {
+        let action = decide_stream_end(true, AppMode::One, 3, 0);
+        assert_eq!(action, StreamEndAction::CompleteOne("no tool calls"));
+    }
+
+    #[test]
+    fn one_has_text_no_tools_after_tools_many_kicks_still_completes() {
+        let action = decide_stream_end(true, AppMode::One, 5, 99);
+        assert_eq!(action, StreamEndAction::CompleteOne("no tool calls"));
+    }
+
+    // ============================================================================
+    // decide_stream_end — Build mode
+    // ============================================================================
+
+    #[test]
+    fn build_empty_text_always_kicks() {
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 0),  StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 10), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn build_has_text_no_tools_always_kicks() {
+        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 0), StreamEndAction::Kick);
+    }
+
+    // ============================================================================
+    // decide_stream_end — Plan / Ask mode
+    // ============================================================================
+
+    #[test]
+    fn plan_empty_text_persists() {
+        assert_eq!(decide_stream_end(false, AppMode::Plan, 0, 0), StreamEndAction::Persist);
+    }
+
+    #[test]
+    fn ask_has_text_persists() {
+        assert_eq!(decide_stream_end(true, AppMode::Ask, 0, 5), StreamEndAction::Persist);
+    }
+
+    #[test]
+    fn plan_has_text_persists() {
+        assert_eq!(decide_stream_end(true, AppMode::Plan, 3, 0), StreamEndAction::Persist);
+    }
+
+    // ============================================================================
+    // extract_plan_block — parsing
+    // ============================================================================
+
+    #[test]
+    fn plan_block_extracted_and_stripped() {
+        let text = "Here is my plan.\n<plan>\n## Goal\nBuild foo.\n</plan>\nLet me know.";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(plan.as_deref(), Some("## Goal\nBuild foo."));
+        assert_eq!(cleaned, "Here is my plan.\nLet me know.");
+    }
+
+    #[test]
+    fn plan_block_only_content() {
+        let text = "<plan>\n## Goal\nJust this.\n</plan>";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(plan.as_deref(), Some("## Goal\nJust this."));
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn plan_block_no_tag_returns_original() {
+        let text = "No plan here.";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(cleaned, "No plan here.");
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn plan_block_missing_end_tag_returns_original() {
+        let text = "Hello <plan>incomplete";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(cleaned, text);
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn plan_block_missing_start_tag_returns_original() {
+        let text = "Hello </plan>";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(cleaned, text);
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn plan_block_whitespace_trimmed() {
+        let text = "<plan>  \n  content  \n  </plan>";
+        let (_, plan) = extract_plan_block(text);
+        assert_eq!(plan.as_deref(), Some("content"));
+    }
+
+    #[test]
+    fn plan_block_before_text_only() {
+        let text = "Preamble.\n<plan>Goal: X</plan>";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(plan.as_deref(), Some("Goal: X"));
+        assert_eq!(cleaned, "Preamble.");
+    }
+
+    #[test]
+    fn plan_block_after_text_only() {
+        let text = "<plan>Goal: X</plan>\nEpilogue.";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(plan.as_deref(), Some("Goal: X"));
+        assert_eq!(cleaned, "Epilogue.");
+    }
+
+    #[test]
+    fn plan_block_inverted_tags_returns_original() {
+        let text = "</plan>junk<plan>";
+        let (cleaned, plan) = extract_plan_block(text);
+        assert_eq!(cleaned, text);
+        assert!(plan.is_none());
     }
 }
