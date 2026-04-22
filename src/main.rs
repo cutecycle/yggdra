@@ -5,6 +5,7 @@ mod epoch;
 mod gaps;
 mod highlight;
 mod knowledge_index;
+mod markdown;
 mod msglog;
 mod message;
 mod notifications;
