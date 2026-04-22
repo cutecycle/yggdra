@@ -1,4 +1,5 @@
 /// Configuration module: load Ollama endpoint and model from environment or .yggdra/config.toml
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -361,6 +362,66 @@ struct FileConfig {
     ui_settings: Option<UISettings>,
 }
 
+/// Validate that an endpoint is a localhost/loopback address.
+/// Only allows 127.0.0.1, localhost, [::1], or 127.x.x.x addresses.
+pub fn validate_endpoint(endpoint: &str) -> Result<()> {
+    // Parse the URL
+    let url = url::Url::parse(endpoint)
+        .map_err(|_| anyhow::anyhow!("Invalid endpoint URL: {}", endpoint))?;
+
+    // Only allow http and https schemes
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(anyhow::anyhow!(
+            "Endpoint must use http:// or https:// scheme, got: {}",
+            scheme
+        ));
+    }
+
+    // Extract host
+    let host = url
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("Endpoint has no host: {}", endpoint))?;
+
+    // Check if host is localhost or loopback
+    match host {
+        url::Host::Ipv4(ip) => {
+            // Allow 127.x.x.x (loopback range)
+            if ip.octets()[0] == 127 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "Endpoint must be a localhost address (127.x.x.x), got: {}",
+                    ip
+                ))
+            }
+        }
+        url::Host::Ipv6(ip) => {
+            // Allow ::1 (IPv6 loopback)
+            if ip.is_loopback() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "Endpoint must be localhost (::1), got: {}",
+                    ip
+                ))
+            }
+        }
+        url::Host::Domain(domain) => {
+            let lower = domain.to_lowercase();
+            // Allow "localhost" and local domain variants
+            if lower == "localhost" || lower == "localhost.localdomain" {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "Endpoint domain must be 'localhost', got: {}",
+                    domain
+                ))
+            }
+        }
+    }
+}
+
 impl FileConfig {
     fn load() -> Self {
         let cwd = std::env::current_dir().ok();
@@ -423,6 +484,13 @@ impl Config {
             .ok()
             .or(file.endpoint)
             .unwrap_or_else(|| "http://localhost:11434".to_string());
+        
+        // Validate endpoint is localhost-only
+        if let Err(e) = validate_endpoint(&endpoint) {
+            eprintln!("Warning: Invalid endpoint configuration: {}", e);
+            eprintln!("Falling back to default: http://localhost:11434");
+        }
+        
         let model = std::env::var("OLLAMA_MODEL")
             .ok()
             .or(file.model)

@@ -8,7 +8,10 @@ pub mod knowledge_index;
 pub mod markdown;
 pub mod msglog;
 pub mod message;
+#[cfg(feature = "inference-only")]
+pub mod network;
 pub mod notifications;
+#[cfg(feature = "inference-only")]
 pub mod ollama;
 pub mod sandbox;
 pub mod session;
