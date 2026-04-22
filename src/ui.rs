@@ -3921,8 +3921,8 @@ impl App {
     /// delta = -1 goes to prev tool message, +1 goes to next.
     /// Rebuild project_context if it's stale (>60s old or forced).
     fn refresh_project_context(&mut self) {
-        // Budget: 5% of context window in chars, clamped to a reasonable range.
-        let max_chars = (self.effective_context_window() as usize / 5).clamp(2000, 20000);
+        // Budget: 5% of context window in chars, but always at least 10k to preserve multi-level tree depth.
+        let max_chars = (self.effective_context_window() as usize / 5).clamp(10000, 20000);
         self.project_context = build_project_context(max_chars);
         self.project_context_built = std::time::Instant::now();
     }
