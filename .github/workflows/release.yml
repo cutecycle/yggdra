@@ -66,18 +66,18 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          BINARY="target/${{ matrix.target }}/release/yggdra"
+          DIR="target/${{ matrix.target }}/release"
           ARCHIVE="yggdra-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+          tar -czf "$ARCHIVE" -C "$DIR" yggdra yggdra-shell
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package archive (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $binary = "target\${{ matrix.target }}\release\yggdra.exe"
+          $dir = "target\${{ matrix.target }}\release"
           $archive = "yggdra-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Compress-Archive -Path $binary -DestinationPath $archive
+          Compress-Archive -Path "$dir\yggdra.exe","$dir\yggdra-shell.exe" -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release asset
