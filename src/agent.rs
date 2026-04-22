@@ -608,7 +608,25 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
             Some(e) => e,
             None => break,
         };
-        let tool_name = after_open[..tool_end].trim().to_string();
+        let raw_tool_name = after_open[..tool_end].trim().to_string();
+
+        // Auto-remap unix command names → shell tool.
+        // Models frequently emit `<tool>cat</tool>` or `<tool>grep</tool>` instead of
+        // `<tool>shell</tool><command>cat ...</command>`.  Transparently fix this so
+        // the loop doesn't degenerate into endless format-error corrections.
+        const UNIX_COMMANDS: &[&str] = &[
+            "cat", "ls", "grep", "find", "head", "tail", "echo", "mkdir", "rm",
+            "mv", "cp", "touch", "chmod", "chown", "wc", "sort", "uniq", "cut",
+            "awk", "sed", "rg", "fd", "curl", "wget", "python", "python3", "node",
+            "cargo", "git", "make", "jq", "bat", "tree",
+        ];
+        let (tool_name, remap_prefix): (String, Option<String>) =
+            if !is_valid_tool(&raw_tool_name, profile) && UNIX_COMMANDS.contains(&raw_tool_name.as_str()) {
+                ("shell".to_string(), Some(raw_tool_name.clone()))
+            } else {
+                (raw_tool_name.clone(), None)
+            };
+
         if !is_valid_tool(&tool_name, profile) {
             search = &after_open[tool_end + "</tool>".len()..];
             continue;
@@ -630,7 +648,13 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
 
         let is_async = mode.as_deref() == Some("async");
 
-        // Build args depending on tool type
+        // Build args depending on tool type.
+        // If the model used a unix command name as tool_name, prepend it to the command.
+        let command = if let Some(ref prefix) = remap_prefix {
+            if command.is_empty() { prefix.clone() } else { format!("{} {}", prefix, command) }
+        } else {
+            command
+        };
         let args = match tool_name.as_str() {
             "shell" | "exec" if !command.is_empty() => {
                 if let Some(rl) = &returnlines {
@@ -1723,6 +1747,33 @@ The answer is 42.";
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "commit");
         assert_eq!(calls[0].args, "feat: add new tool");
+    }
+
+    #[test]
+    fn test_parse_xml_unix_command_remapped_to_shell() {
+        // Model erroneously uses `cat` as a tool name instead of `shell`
+        let xml = "<tool>cat</tool>\n<command>src/main.rs</command>\n<desc>read file</desc>";
+        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args, "cat src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_xml_unix_command_no_command_tag() {
+        // No <command> tag — just the remapped name becomes the command
+        let xml = "<tool>ls</tool>\n<desc>list files</desc>";
+        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args, "ls");
+    }
+
+    #[test]
+    fn test_parse_xml_unknown_tool_still_skipped() {
+        let xml = "<tool>foobar</tool>\n<command>do stuff</command>";
+        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        assert_eq!(calls.len(), 0);
     }
 
 }
