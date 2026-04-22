@@ -1747,6 +1747,7 @@ impl App {
                     self.mode = crate::config::AppMode::Ask;
                     let _ = self.config.save();
                     self.notify("🤖 Format loop — switched to Ask mode");
+                    self.needs_full_redraw = true;
                     self.turn_phase = TurnPhase::Idle;
                     self.stream_rx = None;
                     return;
@@ -1858,6 +1859,7 @@ impl App {
         self.tool_iteration_count = 0;
         self.consecutive_empty_kicks = 0;
         self.autokick_paused = false;
+        self.needs_full_redraw = true;
     }
 
     fn inject_continue_kick(&mut self) {
@@ -2453,6 +2455,7 @@ impl App {
         self.consecutive_empty_kicks = 0;
         self.autokick_paused = false;
         self.render_cache_dirty = true;
+        self.needs_full_redraw = true;
     }
 
     /// Launch One mode after agent declared [UNDERSTOOD]: switch mode, kick, clear flag.
@@ -2466,6 +2469,7 @@ impl App {
         self.push_system_event("🎯 Launching One mode — executing plan".to_string());
         self.inject_continue_kick();
         self.render_cache_dirty = true;
+        self.needs_full_redraw = true;
     }
 
     /// Extract `<plan>…</plan>` from a response, write contents to `.yggdra/plan.md`,
@@ -4154,6 +4158,7 @@ impl App {
         };
         self.notify(format!("Switched to {} mode", label));
         self.render_cache_dirty = true;
+        self.needs_full_redraw = true;
         if self.mode == AppMode::Ask {
             self.abort_active_turn();
         } else if matches!(self.mode, AppMode::Build | AppMode::One) && self.turn_phase == TurnPhase::Idle {
@@ -4236,11 +4241,13 @@ impl App {
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.notify("⚡ Switched to Build mode — autonomous execution");
+            self.needs_full_redraw = true;
         } else if command == "/one" {
             self.mode = AppMode::One;
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.render_cache_dirty = true;
+            self.needs_full_redraw = true;
             self.notify("🎯 Switched to One mode — autonomous, stops on completion");
             if self.turn_phase == TurnPhase::Idle && self.ollama_client.is_some() {
                 self.inject_continue_kick();
@@ -4250,12 +4257,14 @@ impl App {
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.notify("🧠 Switched to Plan mode — reflective & interactive");
+            self.needs_full_redraw = true;
         } else if command == "/ask" {
             self.mode = AppMode::Ask;
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.abort_active_turn();
             self.notify("🔍 Switched to Ask-only mode — read-only, no modifications");
+            self.needs_full_redraw = true;
         } else if command == "/mode" || command.starts_with("/mode ") {
             if let Some(arg) = command.strip_prefix("/mode ").map(|s| s.trim()) {
                 match arg {
@@ -4288,6 +4297,7 @@ impl App {
                 AppMode::One => "🎯 One",
             };
             self.notify(format!("Switched to {} mode", label));
+            self.needs_full_redraw = true;
         } else if command == "/test_notification" || command == "/notify_test" {
             tokio::spawn(async {
                 crate::notifications::agent_says("Test notification from yggdra — if you see this, OS notifications are working.").await;
@@ -6521,6 +6531,22 @@ fn build_git_and_todos() -> String {
         }
     }
     out
+}
+
+/// Public entry point for benchmarking `build_project_context`.
+/// Temporarily changes the working directory to `cwd`, runs the context
+/// builder, then restores the original directory.
+pub fn build_project_context_for_bench(cwd: &std::path::Path) -> String {
+    let original = std::env::current_dir().ok();
+    if std::env::set_current_dir(cwd).is_ok() {
+        let result = build_project_context(1_000_000);
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+        result
+    } else {
+        build_project_context(1_000_000)
+    }
 }
 
 fn floor_char_boundary(s: &str, max: usize) -> usize {
