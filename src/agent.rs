@@ -626,7 +626,7 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
             "cat", "ls", "grep", "find", "head", "tail", "echo", "mkdir", "rm",
             "mv", "cp", "touch", "chmod", "chown", "wc", "sort", "uniq", "cut",
             "awk", "sed", "rg", "fd", "curl", "wget", "python", "python3", "node",
-            "cargo", "git", "make", "jq", "bat", "tree",
+            "cargo", "git", "make", "jq", "bat", "tree", "sh", "bash",
         ];
         let (tool_name, remap_prefix): (String, Option<String>) =
             if !is_valid_tool(&raw_tool_name, profile) && UNIX_COMMANDS.contains(&raw_tool_name.as_str()) {
@@ -1775,6 +1775,22 @@ The answer is 42.";
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "ls");
+    }
+
+    #[test]
+    fn test_parse_xml_shell_names_remapped() {
+        // "sh" and "bash" should be remapped to "shell" tool
+        let xml_sh = "<tool>sh</tool>\n<command>ls</command>\n<desc>test</desc>";
+        let calls_sh = parse_xml_tool_calls(xml_sh, CapabilityProfile::ShellOnly);
+        assert_eq!(calls_sh.len(), 1);
+        assert_eq!(calls_sh[0].name, "shell");
+        assert_eq!(calls_sh[0].args, "sh ls");
+
+        let xml_bash = "<tool>bash</tool>\n<command>ls</command>\n<desc>test</desc>";
+        let calls_bash = parse_xml_tool_calls(xml_bash, CapabilityProfile::ShellOnly);
+        assert_eq!(calls_bash.len(), 1);
+        assert_eq!(calls_bash[0].name, "shell");
+        assert_eq!(calls_bash[0].args, "bash ls");
     }
 
     #[test]

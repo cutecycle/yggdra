@@ -1,33 +1,38 @@
 {
   "tools": {
-    "readfile": {
-      "calls": 1,
+    "setfile": {
+      "calls": 4,
       "failures": 0,
-      "output_bytes": 11323
+      "output_bytes": 7701
+    },
+    "shell": {
+      "calls": 330,
+      "failures": 2,
+      "output_bytes": 48874317
     },
     "think": {
       "calls": 2,
       "failures": 0,
       "output_bytes": 32
     },
-    "__batch__": {
-      "calls": 11,
+    "readfile": {
+      "calls": 1,
       "failures": 0,
-      "output_bytes": 35654
+      "output_bytes": 11323
     },
-    "shell": {
-      "calls": 30,
+    "__batch__": {
+      "calls": 27,
       "failures": 0,
-      "output_bytes": 168428
+      "output_bytes": 676169
     }
   },
-  "llm_requests": 51,
-  "prompt_tokens": 694366,
-  "gen_tokens": 24846,
+  "llm_requests": 467,
+  "prompt_tokens": 10647739,
+  "gen_tokens": 137510,
   "avg_tok_per_s_x100": 0,
-  "sessions": 8,
-  "last_active_unix": 1776880527,
-  "uptime_seconds": 1312,
+  "sessions": 16,
+  "last_active_unix": 1776889501,
+  "uptime_seconds": 9951,
   "context_trims": 0,
   "compressions": 0
 }
