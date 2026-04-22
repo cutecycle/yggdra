@@ -928,6 +928,14 @@ impl Agent {
         let tools = json_tool_descriptions(profile);
 
         let prompt = if profile == CapabilityProfile::ShellOnly {
+        // Load personal instructions from ~/AGENTS.md at runtime
+        let personal_instructions = std::fs::read_to_string(std::env::var("HOME").unwrap_or_default() + "/AGENTS.md")
+            .map(|s| format!("
+
+### PERSONAL INSTRUCTIONS
+{}", s))
+            .unwrap_or_default();
+
             format!(
                 "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
                  Use shell for all file reads, edits, searches, builds, and commits.\n\
@@ -978,6 +986,11 @@ impl Agent {
                 project_ctx = self.config.project_context,
             )
         } else {
+            // Load personal instructions from ~/AGENTS.md at runtime
+            let personal_instructions = std::fs::read_to_string(std::env::var("HOME").unwrap_or_default() + "/AGENTS.md")
+                .map(|s| format!("\n\n### PERSONAL INSTRUCTIONS\n{}", s))
+                .unwrap_or_default();
+
             let one_mode_section = if self.config.app_mode == AppMode::One {
                 "\n\n⚡ ONE MODE — async-first task execution:\n                 You are executing a single user-specified task. Default to async parallelism:\n                 1. Break the task into independent subtasks immediately.\n                 2. spawn each subtask as a parallel subagent with task_id + description.\n                 3. Continue coordination while subagents run in parallel.\n                 4. Collect [AGENT_RESULT: task_id = ...] injections and synthesize.\n                 5. When all done, emit [DONE].\n                 Prefer spawn over sequential execution — parallelism is free here.\n"
                 .to_string()
@@ -1019,13 +1032,14 @@ impl Agent {
                     200 lines, split into focused modules first.\n\
                  - When task is fully complete, respond with summary of results — no special marker needed.\n\
                  \n\
-                 {project_ctx}\n\
+                 {project_ctx}{personal_instructions}\n\
                  ⚠️ The file tree is live — go directly to relevant files.",
                 sysinfo = sysinfo,
                 root    = root_line,
                 tools   = tools,
                 one_mode = one_mode_section,
                 project_ctx = self.config.project_context,
+                personal_instructions = personal_instructions,
             )
         };
         SteeringDirective::custom(&prompt).format_for_system_prompt()

@@ -123,7 +123,7 @@ pub struct KnowledgeIndexSettings {
     pub battery_delay_ms: u64,
 }
 
-fn default_knowledge_enabled() -> bool { true }
+fn default_knowledge_enabled() -> bool { false }
 fn default_knowledge_size_gb() -> f64 { 0.02 } // 20MB default
 fn default_battery_delay_ms() -> u64 { 100 }
 
