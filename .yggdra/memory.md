@@ -108,3 +108,43 @@ Response length: 2048 characters
 ✓ 264/264 tests pass
 ✓ Building release binary...
 
+
+## NOTIFICATION TITLES WITH TASK GOAL — COMPLETE ✓
+
+**Implementation:**
+- send_task_completion(goal, tokens, response_len) now takes goal parameter
+- Goal extracted from app.input (user's task description)
+- Automatic title generation: "yggdra: [goal summary]"
+
+**Title Generation Algorithm:**
+1. Check if multiline → use first line only
+2. Check if > 50 chars → truncate to 47 + "..."
+3. Otherwise → use goal as-is
+4. Prefix with "yggdra: "
+
+**Example Notifications:**
+
+Input: "fix the bug in main.rs"
+→ Title: "yggdra: fix the bug in main.rs"
+→ Body: "Completed in One mode.\n\nTokens used: 512\nResponse length: 2048 characters"
+
+Input: "analyze entire codebase and suggest optimizations for performance and memory usage"
+→ Title: "yggdra: analyze entire codebase and suggest ..." (truncated)
+→ Body: "Completed in One mode.\n\nTokens used: 1024\nResponse length: 5120 characters"
+
+**Testing:**
+✓ All 264 tests pass
+✓ cargo build --release succeeds
+✓ make install to ~/.local/bin/yggdra
+✓ Ready for production use
+
+**Workflow:**
+1. User types task in input field
+2. Presses Enter or `/one` to activate One mode
+3. Agent processes task...
+4. Task completes with [DONE]
+5. Notification fires with goal + metrics
+6. User sees clear summary in notification center
+
+No additional configuration needed!
+
