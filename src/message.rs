@@ -12,6 +12,8 @@ pub struct Message {
     pub role: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
 }
 
 impl Message {
@@ -20,6 +22,8 @@ impl Message {
             role: role.into(),
             content: content.into(),
             timestamp: Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 }
@@ -29,6 +33,8 @@ struct MsgRow {
     role: String,
     content: String,
     ts: i64,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,12 +63,17 @@ impl MessageBuffer {
     }
 
     pub fn new(path: &PathBuf) -> Result<Self> {
-        // Derive scrollback path from messages path stem: foo.jsonl → foo_scrollback.jsonl
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let scrollback_path = path.with_file_name(format!("{}_scrollback.jsonl", stem));
         Self::ensure(path)?;
         Self::ensure(&scrollback_path)?;
-        Ok(Self { messages_path: path.clone(), scrollback_path })
+        Ok(Self {
+            messages_path: path.clone(),
+            scrollback_path,
+        })
     }
 
     pub fn from_db(path: &PathBuf) -> Result<Self> {
@@ -99,33 +110,60 @@ impl MessageBuffer {
             role: row.role,
             content: row.content,
             timestamp: DateTime::<Utc>::from_timestamp(row.ts, 0).unwrap_or_else(Utc::now),
+            prompt_tokens: row.prompt_tokens,
+            completion_tokens: row.completion_tokens,
         }
     }
 
     pub fn add_and_persist(&mut self, message: Message) -> Result<()> {
-        let row = MsgRow { role: message.role, content: message.content, ts: message.timestamp.timestamp() };
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.messages_path)?;
+        let row = MsgRow {
+            role: message.role,
+            content: message.content,
+            ts: message.timestamp.timestamp(),
+            prompt_tokens: message.prompt_tokens,
+            completion_tokens: message.completion_tokens,
+        };
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.messages_path)?;
         writeln!(f, "{}", serde_json::to_string(&row)?)?;
         Ok(())
     }
 
     pub fn add_multiple(&mut self, messages: &[Message]) -> Result<()> {
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.messages_path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.messages_path)?;
         for msg in messages {
-            let row = MsgRow { role: msg.role.clone(), content: msg.content.clone(), ts: msg.timestamp.timestamp() };
+            let row = MsgRow {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                ts: msg.timestamp.timestamp(),
+                prompt_tokens: msg.prompt_tokens,
+                completion_tokens: msg.completion_tokens,
+            };
             writeln!(f, "{}", serde_json::to_string(&row)?)?;
         }
         Ok(())
     }
 
     pub fn messages(&self) -> Result<Vec<Message>> {
-        Ok(Self::read_rows(&self.messages_path)?.into_iter().map(Self::row_to_msg).collect())
+        Ok(Self::read_rows(&self.messages_path)?
+            .into_iter()
+            .map(Self::row_to_msg)
+            .collect())
     }
 
     pub fn get_last_n(&self, n: usize) -> Result<Vec<Message>> {
         let rows = Self::read_rows(&self.messages_path)?;
         let start = rows.len().saturating_sub(n);
-        Ok(rows[start..].iter().cloned().map(|r| Self::row_to_msg(r)).collect())
+        Ok(rows[start..]
+            .iter()
+            .cloned()
+            .map(|r| Self::row_to_msg(r))
+            .collect())
     }
 
     pub fn count(&self) -> Result<usize> {
@@ -141,9 +179,17 @@ impl MessageBuffer {
         let count = rows.len();
         if count > 0 {
             let archived_at = Utc::now().timestamp();
-            let mut f = OpenOptions::new().create(true).append(true).open(&self.scrollback_path)?;
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.scrollback_path)?;
             for row in &rows {
-                let sb = ScrollbackRow { role: row.role.clone(), content: row.content.clone(), ts: row.ts, archived_at };
+                let sb = ScrollbackRow {
+                    role: row.role.clone(),
+                    content: row.content.clone(),
+                    ts: row.ts,
+                    archived_at,
+                };
                 writeln!(f, "{}", serde_json::to_string(&sb)?)?;
             }
             fs::write(&self.messages_path, "")?;
@@ -170,6 +216,8 @@ impl MessageBuffer {
                     role: row.role,
                     content: row.content,
                     timestamp: DateTime::<Utc>::from_timestamp(row.ts, 0).unwrap_or_else(Utc::now),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 };
                 results.push((msg, row.archived_at));
             }
@@ -184,7 +232,39 @@ impl MessageBuffer {
         }
         let file = fs::File::open(&self.scrollback_path)?;
         let reader = BufReader::new(file);
-        Ok(reader.lines().filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)).count())
+        Ok(reader
+            .lines()
+            .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+            .count())
+    }
+
+    pub fn all_messages(&self) -> Result<Vec<Message>> {
+        let mut msgs: Vec<(i64, Message)> = Vec::new();
+        if self.scrollback_path.exists() {
+            let file = fs::File::open(&self.scrollback_path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let row: ScrollbackRow = serde_json::from_str(&line)?;
+                let msg = Message {
+                    role: row.role,
+                    content: row.content,
+                    timestamp: DateTime::<Utc>::from_timestamp(row.ts, 0).unwrap_or_else(Utc::now),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                };
+                msgs.push((row.ts, msg));
+            }
+        }
+        for row in Self::read_rows(&self.messages_path)? {
+            let msg = Self::row_to_msg(row.clone());
+            msgs.push((row.ts, msg));
+        }
+        msgs.sort_by_key(|(ts, _)| *ts);
+        Ok(msgs.into_iter().map(|(_, m)| m).collect())
     }
 
     pub fn purge_kicks(&mut self) -> Result<usize> {
@@ -221,13 +301,12 @@ mod tests {
     fn test_add_single_message() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         let msg = Message::new("user", "Hello, world!");
-        buffer.add_and_persist(msg.clone()).expect("Failed to add message");
-
+        buffer
+            .add_and_persist(msg.clone())
+            .expect("Failed to add message");
         let count = buffer.count().expect("Failed to get count");
         assert_eq!(count, 1);
-
         let msgs = buffer.messages().expect("Failed to get messages");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
@@ -238,11 +317,15 @@ mod tests {
     fn test_add_multiple_messages_ordering() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
-        buffer.add_and_persist(Message::new("user", "First")).unwrap();
-        buffer.add_and_persist(Message::new("assistant", "Second")).unwrap();
-        buffer.add_and_persist(Message::new("user", "Third")).unwrap();
-
+        buffer
+            .add_and_persist(Message::new("user", "First"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("assistant", "Second"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("user", "Third"))
+            .unwrap();
         let msgs = buffer.messages().expect("Failed to get messages");
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "First");
@@ -254,18 +337,16 @@ mod tests {
     fn test_add_multiple_atomic_transaction() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         let messages = vec![
             Message::new("user", "Message 1"),
             Message::new("assistant", "Message 2"),
             Message::new("user", "Message 3"),
         ];
-
-        buffer.add_multiple(&messages).expect("Failed to add multiple");
-
+        buffer
+            .add_multiple(&messages)
+            .expect("Failed to add multiple");
         let count = buffer.count().expect("Failed to get count");
         assert_eq!(count, 3);
-
         let retrieved = buffer.messages().expect("Failed to get messages");
         assert_eq!(retrieved[1].role, "assistant");
     }
@@ -274,11 +355,11 @@ mod tests {
     fn test_get_last_n_messages() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         for i in 0..5 {
-            buffer.add_and_persist(Message::new("user", format!("Message {}", i))).unwrap();
+            buffer
+                .add_and_persist(Message::new("user", format!("Message {}", i)))
+                .unwrap();
         }
-
         let last_two = buffer.get_last_n(2).expect("Failed to get last 2");
         assert_eq!(last_two.len(), 2);
         assert_eq!(last_two[0].content, "Message 3");
@@ -296,12 +377,11 @@ mod tests {
     fn test_refresh_reads_from_disk() {
         let path = temp_path();
         let mut buffer1 = MessageBuffer::new(&path).expect("Failed to create buffer1");
-
-        buffer1.add_and_persist(Message::new("user", "Shared message")).unwrap();
-
+        buffer1
+            .add_and_persist(Message::new("user", "Shared message"))
+            .unwrap();
         let buffer2 = MessageBuffer::from_db(&path).expect("Failed to create buffer2");
         let refreshed = buffer2.refresh().expect("Failed to refresh");
-
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].content, "Shared message");
     }
@@ -310,14 +390,13 @@ mod tests {
     fn test_archive_to_scrollback() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         for i in 0..3 {
-            buffer.add_and_persist(Message::new("user", format!("Message {}", i))).unwrap();
+            buffer
+                .add_and_persist(Message::new("user", format!("Message {}", i)))
+                .unwrap();
         }
-
         let archived = buffer.archive_to_scrollback().expect("Failed to archive");
         assert_eq!(archived, 3);
-
         assert_eq!(buffer.count().unwrap(), 0);
         assert_eq!(buffer.scrollback_count().unwrap(), 3);
     }
@@ -326,13 +405,19 @@ mod tests {
     fn test_search_scrollback() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
-        buffer.add_and_persist(Message::new("user", "Find this keyword")).unwrap();
-        buffer.add_and_persist(Message::new("assistant", "Different content")).unwrap();
-        buffer.add_and_persist(Message::new("user", "Another message")).unwrap();
+        buffer
+            .add_and_persist(Message::new("user", "Find this keyword"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("assistant", "Different content"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("user", "Another message"))
+            .unwrap();
         buffer.archive_to_scrollback().unwrap();
-
-        let results = buffer.search_scrollback("keyword").expect("Failed to search");
+        let results = buffer
+            .search_scrollback("keyword")
+            .expect("Failed to search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.content, "Find this keyword");
     }
@@ -341,17 +426,21 @@ mod tests {
     fn test_purge_kicks() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
-        buffer.add_and_persist(Message::new("user", "Keep this")).unwrap();
-        buffer.add_and_persist(Message::new("kick", "Remove this")).unwrap();
-        buffer.add_and_persist(Message::new("kick", "Remove this too")).unwrap();
-        buffer.add_and_persist(Message::new("assistant", "Keep this too")).unwrap();
-
+        buffer
+            .add_and_persist(Message::new("user", "Keep this"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("kick", "Remove this"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("kick", "Remove this too"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("assistant", "Keep this too"))
+            .unwrap();
         assert_eq!(buffer.count().unwrap(), 4);
-
         let removed = buffer.purge_kicks().expect("Failed to purge");
         assert_eq!(removed, 2);
-
         assert_eq!(buffer.count().unwrap(), 2);
         let msgs = buffer.messages().unwrap();
         assert!(msgs.iter().all(|m| m.role != "kick"));
@@ -361,12 +450,13 @@ mod tests {
     fn test_delete_last_message() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
-        buffer.add_and_persist(Message::new("user", "First")).unwrap();
-        buffer.add_and_persist(Message::new("assistant", "Second")).unwrap();
-
+        buffer
+            .add_and_persist(Message::new("user", "First"))
+            .unwrap();
+        buffer
+            .add_and_persist(Message::new("assistant", "Second"))
+            .unwrap();
         buffer.delete_last().expect("Failed to delete last");
-
         let msgs = buffer.messages().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "First");
@@ -376,11 +466,11 @@ mod tests {
     fn test_concurrent_rapid_adds() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         for i in 0..10 {
-            buffer.add_and_persist(Message::new("user", format!("Rapid {}", i))).unwrap();
+            buffer
+                .add_and_persist(Message::new("user", format!("Rapid {}", i)))
+                .unwrap();
         }
-
         let msgs = buffer.messages().unwrap();
         assert_eq!(msgs.len(), 10);
         for (i, msg) in msgs.iter().enumerate() {
@@ -392,10 +482,10 @@ mod tests {
     fn test_large_content_persistence() {
         let path = temp_path();
         let mut buffer = MessageBuffer::new(&path).expect("Failed to create buffer");
-
         let large_content = "x".repeat(100_000);
-        buffer.add_and_persist(Message::new("user", large_content.clone())).unwrap();
-
+        buffer
+            .add_and_persist(Message::new("user", large_content.clone()))
+            .unwrap();
         let msgs = buffer.messages().unwrap();
         assert_eq!(msgs[0].content.len(), 100_000);
         assert_eq!(msgs[0].content, large_content);

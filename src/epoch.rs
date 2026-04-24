@@ -39,14 +39,17 @@ pub fn load_if_fresh(project_dir: &Path) -> Option<String> {
 /// Build a compact summary from a message slice.
 /// Scrub a text snippet so it does not reveal absolute paths or raw tool output.
 ///
-/// - Removes lines starting with `[TOOL_OUTPUT:`, `[TOOL_ERROR:`, or `[DONE]`
+/// - Removes lines starting with `[TOOL_OUTPUT:`, `[TOOL_ERROR:`, or `</done>`
 /// - Replaces absolute path segments (`/Users/…`, `/home/…`, `/tmp/…` etc.)
 ///   with just the last component so context is preserved without leaking CWD.
 fn sanitize_snippet(text: &str) -> String {
-    let filtered: String = text.lines()
+    let filtered: String = text
+        .lines()
         .filter(|l| {
             let t = l.trim_start();
-            !t.starts_with("[TOOL_OUTPUT:") && !t.starts_with("[TOOL_ERROR:") && !t.starts_with("[DONE]")
+            !t.starts_with("[TOOL_OUTPUT:")
+                && !t.starts_with("[TOOL_ERROR:")
+                && !t.starts_with("</done>")
         })
         .map(|l| redact_paths(l))
         .collect::<Vec<_>>()
@@ -65,9 +68,16 @@ fn redact_paths(line: &str) -> String {
         if bytes[i] == b'/' {
             // Check if this looks like an absolute path: /letter…
             let rest = &line[i..];
-            if rest.len() > 1 && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' || bytes[i + 1] == b'.') {
+            if rest.len() > 1
+                && (bytes[i + 1].is_ascii_alphabetic()
+                    || bytes[i + 1] == b'_'
+                    || bytes[i + 1] == b'.')
+            {
                 // Consume the whole path token
-                let end = rest.find(|c: char| !c.is_alphanumeric() && !matches!(c, '/' | '_' | '-' | '.' | '~'))
+                let end = rest
+                    .find(|c: char| {
+                        !c.is_alphanumeric() && !matches!(c, '/' | '_' | '-' | '.' | '~')
+                    })
                     .unwrap_or(rest.len());
                 let path = &rest[..end];
                 // Keep only the last component
@@ -92,13 +102,16 @@ pub fn build_summary(messages: &[Message]) -> Option<String> {
 
     // Collect the last few assistant messages (up to 5) as the "what happened".
     // Sanitize each snippet to remove paths and tool output blocks.
-    let assistant_snippets: Vec<String> = messages.iter()
+    let assistant_snippets: Vec<String> = messages
+        .iter()
         .filter(|m| m.role == "assistant" && !m.content.trim().is_empty())
         .rev()
         .take(5)
         .filter_map(|m| {
             let clean = sanitize_snippet(&m.content);
-            if clean.is_empty() { return None; }
+            if clean.is_empty() {
+                return None;
+            }
             let preview: String = clean.chars().take(200).collect();
             if clean.chars().count() > 200 {
                 Some(format!("- {}…", preview))
@@ -113,25 +126,37 @@ pub fn build_summary(messages: &[Message]) -> Option<String> {
 
     // Find the first substantive user message (the task framing).
     // Filter out kick/system messages (those starting with "New session started").
-    let first_user = messages.iter()
-        .find(|m| m.role == "user" && m.content.len() > 3
-            && !m.content.starts_with("New session started"))
+    let first_user = messages
+        .iter()
+        .find(|m| {
+            m.role == "user" && m.content.len() > 3 && !m.content.starts_with("New session started")
+        })
         .map(|m| {
             let clean = sanitize_snippet(&m.content);
             let preview: String = clean.chars().take(200).collect();
-            if clean.chars().count() > 200 { format!("{}…", preview) } else { preview }
+            if clean.chars().count() > 200 {
+                format!("{}…", preview)
+            } else {
+                preview
+            }
         })
         .unwrap_or_default();
 
     // Most recent user message (skipping kick messages)
-    let last_user = messages.iter()
+    let last_user = messages
+        .iter()
         .rev()
-        .find(|m| m.role == "user" && m.content.len() > 3
-            && !m.content.starts_with("New session started"))
+        .find(|m| {
+            m.role == "user" && m.content.len() > 3 && !m.content.starts_with("New session started")
+        })
         .map(|m| {
             let clean = sanitize_snippet(&m.content);
             let preview: String = clean.chars().take(200).collect();
-            if clean.chars().count() > 200 { format!("{}…", preview) } else { preview }
+            if clean.chars().count() > 200 {
+                format!("{}…", preview)
+            } else {
+                preview
+            }
         })
         .unwrap_or_default();
 
@@ -180,7 +205,10 @@ mod tests {
         let mut msgs = Vec::new();
         for i in 0..user_count {
             msgs.push(Message::new("user", &format!("user message {}", i)));
-            msgs.push(Message::new("assistant", &format!("assistant response {}", i)));
+            msgs.push(Message::new(
+                "assistant",
+                &format!("assistant response {}", i),
+            ));
         }
         msgs
     }
@@ -207,7 +235,10 @@ mod tests {
         let mut msgs = Vec::new();
         for i in 0..20 {
             msgs.push(Message::new("user", &"user text ".repeat(100)));
-            msgs.push(Message::new("assistant", &format!("response {} {}", i, "x".repeat(500))));
+            msgs.push(Message::new(
+                "assistant",
+                &format!("response {} {}", i, "x".repeat(500)),
+            ));
         }
         let summary = build_summary(&msgs).unwrap();
         assert!(summary.chars().count() <= MAX_SUMMARY_CHARS + 5);
@@ -240,7 +271,11 @@ mod tests {
     fn test_sanitize_removes_tool_output_lines() {
         let text = "I will read the file\n[TOOL_OUTPUT: readfile src/main.rs = fn main() {}]\ndone";
         let result = sanitize_snippet(text);
-        assert!(!result.contains("[TOOL_OUTPUT:"), "tool output must be stripped: {}", result);
+        assert!(
+            !result.contains("[TOOL_OUTPUT:"),
+            "tool output must be stripped: {}",
+            result
+        );
         assert!(result.contains("I will read the file"));
         assert!(result.contains("done"));
     }
@@ -249,8 +284,16 @@ mod tests {
     fn test_sanitize_redacts_absolute_paths() {
         let text = "edited /Users/alice/repo/src/main.rs successfully";
         let result = sanitize_snippet(text);
-        assert!(!result.contains("/Users/"), "absolute path must be redacted: {}", result);
-        assert!(result.contains("main.rs"), "filename should be preserved: {}", result);
+        assert!(
+            !result.contains("/Users/"),
+            "absolute path must be redacted: {}",
+            result
+        );
+        assert!(
+            result.contains("main.rs"),
+            "filename should be preserved: {}",
+            result
+        );
     }
 
     #[test]
@@ -258,20 +301,33 @@ mod tests {
         let text = "edited src/main.rs successfully";
         let result = sanitize_snippet(text);
         // Relative paths don't start with / so they pass through unchanged
-        assert!(result.contains("src"), "relative path content should be preserved: {}", result);
+        assert!(
+            result.contains("src"),
+            "relative path content should be preserved: {}",
+            result
+        );
     }
 
     #[test]
     fn test_build_summary_no_paths_in_output() {
         let mut msgs = Vec::new();
         // Simulate a session with absolute paths in messages
-        msgs.push(Message::new("user", "can you fix /Users/alice/project/src/lib.rs"));
+        msgs.push(Message::new(
+            "user",
+            "can you fix /Users/alice/project/src/lib.rs",
+        ));
         for i in 0..5 {
-            msgs.push(Message::new("assistant",
-                &format!("Editing /Users/alice/project/src/lib.rs line {}", i)));
+            msgs.push(Message::new(
+                "assistant",
+                &format!("Editing /Users/alice/project/src/lib.rs line {}", i),
+            ));
             msgs.push(Message::new("user", "continue"));
         }
         let summary = build_summary(&msgs).unwrap();
-        assert!(!summary.contains("/Users/"), "absolute path leaked into summary: {}", summary);
+        assert!(
+            !summary.contains("/Users/"),
+            "absolute path leaked into summary: {}",
+            summary
+        );
     }
 }

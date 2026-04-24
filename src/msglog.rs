@@ -167,6 +167,8 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-11T09:36:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            prompt_tokens: None,
+            completion_tokens: None,
         };
         let path = message_path(&base, &msg);
         let s = path.to_string_lossy();
@@ -193,6 +195,8 @@ mod tests {
             role: "tool/result".to_string(),
             content: "x".to_string(),
             timestamp: Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         };
         let path = message_path(&base, &msg);
         let name = path.file_name().unwrap().to_string_lossy();

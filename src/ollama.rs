@@ -400,7 +400,7 @@ async fn stream_openai(
                     };
 
                     if data == "[DONE]" {
-                        crate::dlog!("stream_openai: [DONE] received chunks={} content_chunks={} prompt_tokens={} gen_tokens={} had_thinking={}",
+                        crate::dlog!("stream_openai: </done> received chunks={} content_chunks={} prompt_tokens={} gen_tokens={} had_thinking={}",
                             chunks_seen, content_chunks, prompt_tokens, gen_tokens, had_thinking);
                         let _ = tx.send(StreamEvent::Done {
                             prompt_tokens,
@@ -449,7 +449,7 @@ async fn stream_openai(
             }
         }
     }
-    crate::dlog!("stream_openai: stream ended without [DONE] chunks={} content_chunks={}", chunks_seen, content_chunks);
+    crate::dlog!("stream_openai: stream ended without </done> chunks={} content_chunks={}", chunks_seen, content_chunks);
 
     let _ = tx.send(StreamEvent::Done {
         prompt_tokens,

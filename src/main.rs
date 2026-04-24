@@ -47,6 +47,10 @@ async fn main() -> Result<()> {
             "--build"      => mode_override = Some(AppMode::Build),
             "--plan"       => mode_override = Some(AppMode::Plan),
             "--one"        => mode_override = Some(AppMode::One),
+            "--test"          => {
+                mode_override = Some(AppMode::Build);
+                std::env::set_var("YGGDRA_TEST_MODE", "1");
+            }
             "--shell-only" => shell_only = true,
             "--standard"   => shell_only = false,
             "--help" | "-h" => {
@@ -56,6 +60,7 @@ async fn main() -> Result<()> {
                 eprintln!("  --build       Start in build mode");
                 eprintln!("  --plan        Start in plan mode (default)");
                 eprintln!("  --one         Start in one-off task mode (auto-completes with notification)");
+                eprintln!("  --test          Run in build mode using OpenRouter API for tests");
                 eprintln!("  --standard    Use full tool set (editfile, rg, commit…)");
                 eprintln!("  --shell-only  Restrict agent to shell tool only (default)");
                 eprintln!("  --help        Show this help message");
@@ -77,6 +82,24 @@ async fn main() -> Result<()> {
             .arg("init")
             .current_dir(&cwd)
             .output();
+    }
+
+    // Terraform: ensure .yggdra is ignored by git
+    let gitignore_path = cwd.join(".gitignore");
+    if gitignore_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
+            if !content.contains(".yggdra/") {
+                let _ = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&gitignore_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "\n.yggdra/")
+                    });
+            }
+        }
+    } else {
+        let _ = std::fs::write(gitignore_path, ".yggdra/\n");
     }
 
     // Terraform: if there are no commits yet, snapshot the current state.

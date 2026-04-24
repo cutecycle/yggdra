@@ -13,13 +13,10 @@ pub struct AgentsConfig {
 }
 
 /// Tool capability profile — controls which tools are available to the agent.
-/// `Standard` is the default full-featured mode.
-/// `ShellOnly` restricts the agent to a single `shell` tool for experimentation.
 /// Not serialized — set at startup from CLI flag or binary name.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CapabilityProfile {
     #[default]
-    Standard,
     ShellOnly,
 }
 
@@ -471,7 +468,7 @@ impl Default for Config {
             knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
             ui_settings: UISettings::default(),
-            profile: CapabilityProfile::Standard,
+            profile: CapabilityProfile::ShellOnly,
         }
     }
 }
@@ -484,12 +481,6 @@ impl Config {
             .ok()
             .or(file.endpoint)
             .unwrap_or_else(|| "http://localhost:11434".to_string());
-        
-        // Validate endpoint is localhost-only
-        if let Err(e) = validate_endpoint(&endpoint) {
-            eprintln!("Warning: Invalid endpoint configuration: {}", e);
-            eprintln!("Falling back to default: http://localhost:11434");
-        }
         
         let model = std::env::var("OLLAMA_MODEL")
             .ok()
@@ -514,7 +505,7 @@ impl Config {
         let params = file.params;
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params, ui_settings, profile: CapabilityProfile::Standard }
+        Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params, ui_settings, profile: CapabilityProfile::ShellOnly }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -563,7 +554,7 @@ impl Config {
         let knowledge_index = file.knowledge_index.unwrap_or_default();
         let ui_settings = file.ui_settings.unwrap_or_default();
 
-        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::Standard };
+        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::ShellOnly };
         (cfg, validated_client)
     }
 

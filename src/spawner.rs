@@ -155,19 +155,66 @@ pub async fn spawn_subagent(
 
 /// Parse spawn tool calls (subagent spawning) from JSON output:
 /// {"tool_calls": [{"name": "spawn", "parameters": {"task_id": "...", "description": "..."}}]}
-/// Subagent spawns are identified by the __SPAWN__ prefix in the formatted args.
+/// Parses directly without profile validation so spawn works regardless of active profile.
 pub fn parse_spawn_agent_calls(output: &str) -> Vec<(String, String)> {
-    crate::agent::parse_json_tool_calls(output, crate::config::CapabilityProfile::Standard)
-        .into_iter()
-        .filter(|tc| tc.name == "spawn" && tc.args.starts_with("__SPAWN__"))
+    // Extract the first {...} block that contains "tool_calls"
+    let json_candidate = {
+        let mut result = None;
+        let bytes = output.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'{' {
+                let slice = &output[i..];
+                if let Some(j) = find_matching_brace(slice) {
+                    let candidate = &slice[..j];
+                    if candidate.contains("tool_calls") && candidate.contains("spawn") {
+                        result = Some(candidate.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    };
+    let json_str = match json_candidate {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let tool_calls = match parsed.get("tool_calls").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    tool_calls.iter()
         .filter_map(|tc| {
-            let rest = &tc.args["__SPAWN__".len()..];
-            let mut parts = rest.splitn(2, ' ');
-            let task_id = parts.next()?.to_string();
-            let description = parts.next().unwrap_or("").to_string();
+            let name = tc.get("name")?.as_str()?;
+            if name != "spawn" { return None; }
+            let params = tc.get("parameters")?;
+            let task_id = params.get("task_id")?.as_str()?.to_string();
+            let description = params.get("description")?.as_str().unwrap_or("").to_string();
             if task_id.is_empty() { None } else { Some((task_id, description)) }
         })
         .collect()
+}
+
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape { escape = false; continue; }
+        if c == '\\' && in_string { escape = true; continue; }
+        if c == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        if c == '{' { depth += 1; }
+        else if c == '}' {
+            depth -= 1;
+            if depth == 0 { return Some(i + 1); }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

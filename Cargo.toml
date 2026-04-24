@@ -25,6 +25,11 @@ path = "src/main.rs"
 name = "yggdra-shell"
 path = "src/main.rs"
 
+[[bin]]
+name = "test_models"
+path = "src/bin/test_models.rs"
+required-features = ["inference-only"]
+
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }

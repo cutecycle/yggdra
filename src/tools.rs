@@ -1,12 +1,12 @@
 //! Tools system for agentic execution.
 //! Defines the Tool trait and implements 7 core tools for local execution.
 
+use crate::sandbox;
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use crate::sandbox;
-use regex::Regex;
 
 /// Split a string into shell-style arguments, respecting double and single quotes.
 /// Strips the outer quotes from quoted arguments.
@@ -72,7 +72,11 @@ impl Tool for RipgrepTool {
             args.splitn(2, '\x00').nth(1).unwrap_or("").trim()
         } else {
             let parts: Vec<&str> = args.split_whitespace().collect();
-            if parts.len() >= 2 { parts[1].trim_matches('"').trim_matches('\'') } else { "" }
+            if parts.len() >= 2 {
+                parts[1].trim_matches('"').trim_matches('\'')
+            } else {
+                ""
+            }
         };
         if !path.is_empty() {
             sandbox::check_read(path)?;
@@ -113,6 +117,8 @@ impl Tool for RipgrepTool {
             .arg("--color=never")
             .arg(pattern)
             .arg(path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|e| anyhow!("rg: execution failed (is ripgrep installed?): {}", e))?;
 
@@ -139,7 +145,10 @@ impl ExecTool {
     /// Shell interpreters that allow arbitrary code execution via `-c` flags.
     /// Blocking these prevents `spawn bash -c "cd /other && ..."` escapes.
     fn is_shell_interpreter(binary: &str) -> bool {
-        matches!(binary, "bash" | "sh" | "zsh" | "fish" | "dash" | "csh" | "tcsh" | "ksh")
+        matches!(
+            binary,
+            "bash" | "sh" | "zsh" | "fish" | "dash" | "csh" | "tcsh" | "ksh"
+        )
     }
 
     /// Resolve a binary name via PATH, returning the full path if found.
@@ -148,7 +157,11 @@ impl ExecTool {
         // Already an explicit path — check it directly
         if name.contains('/') {
             let p = std::path::Path::new(name);
-            return if p.exists() { Some(p.to_path_buf()) } else { None };
+            return if p.exists() {
+                Some(p.to_path_buf())
+            } else {
+                None
+            };
         }
 
         // Search each entry on PATH
@@ -174,9 +187,14 @@ impl Tool for ExecTool {
         if args.is_empty() {
             return Err(anyhow!("exec: empty arguments"));
         }
-        
+
         // Detect shell-only patterns and provide recovery hints
-        if args.contains('>') || args.contains('<') || args.contains('|') || args.contains("&&") || args.contains("||") {
+        if args.contains('>')
+            || args.contains('<')
+            || args.contains('|')
+            || args.contains("&&")
+            || args.contains("||")
+        {
             let pattern = if args.contains('>') {
                 "stdout redirect (>)"
             } else if args.contains('<') {
@@ -188,7 +206,7 @@ impl Tool for ExecTool {
             } else {
                 "OR chain (||)"
             };
-            
+
             return Err(anyhow!(
                 "❌ exec: cannot handle {} — exec runs directly without a shell.\n\
                  Use the `shell` tool for pipelines and redirects:\n\
@@ -196,7 +214,7 @@ impl Tool for ExecTool {
                 pattern
             ));
         }
-        
+
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.is_empty() {
             return Err(anyhow!("exec: no binary specified"));
@@ -220,10 +238,7 @@ impl Tool for ExecTool {
         }
 
         if Self::resolve_binary(binary).is_none() {
-            return Err(anyhow!(
-                "❌ exec: binary '{}' not found in PATH.",
-                binary
-            ));
+            return Err(anyhow!("❌ exec: binary '{}' not found in PATH.", binary));
         }
 
         Ok(())
@@ -251,7 +266,8 @@ impl Tool for ExecTool {
             .spawn()
             .map_err(|e| anyhow!("exec: execution failed: {}", e))?;
 
-        let output = child.wait_with_output()
+        let output = child
+            .wait_with_output()
             .map_err(|e| anyhow!("exec: failed to collect output: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -260,7 +276,11 @@ impl Tool for ExecTool {
         if output.status.success() {
             Ok(stdout)
         } else {
-            Err(anyhow!("exec: child process failed: {}\n{}", stdout, stderr))
+            Err(anyhow!(
+                "exec: child process failed: {}\n{}",
+                stdout,
+                stderr
+            ))
         }
     }
 }
@@ -270,7 +290,9 @@ impl Tool for ExecTool {
 pub struct ShellTool;
 
 impl Tool for ShellTool {
-    fn name(&self) -> &str { "shell" }
+    fn name(&self) -> &str {
+        "shell"
+    }
 
     fn validate_input(&self, args: &str) -> Result<()> {
         if args.is_empty() {
@@ -286,9 +308,14 @@ impl Tool for ShellTool {
 
         // Network tool blocking patterns
         let network_tools = vec![
-            "| nc ", "| ncat ", "| socat ", "| netcat ",
-            "| ssh ", "| telnet ",
-            "| curl ", "| wget ",
+            "| nc ",
+            "| ncat ",
+            "| socat ",
+            "| netcat ",
+            "| ssh ",
+            "| telnet ",
+            "| curl ",
+            "| wget ",
         ];
 
         for pattern in network_tools {
@@ -299,8 +326,14 @@ impl Tool for ShellTool {
 
         // Process substitution with network tools
         let process_subst_patterns = vec![
-            "<(curl", "<(wget", "<(nc ", "<(ssh ",
-            "bash <(curl", "bash <(wget", "sh <(curl", "sh <(wget",
+            "<(curl",
+            "<(wget",
+            "<(nc ",
+            "<(ssh ",
+            "bash <(curl",
+            "bash <(wget",
+            "sh <(curl",
+            "sh <(wget",
         ];
 
         for pattern in process_subst_patterns {
@@ -311,8 +344,7 @@ impl Tool for ShellTool {
 
         // Command substitution with network tools
         let cmd_subst_patterns = vec![
-            "$(curl", "$(wget", "$(nc ", "$(ssh ",
-            "`curl", "`wget", "`nc ", "`ssh ",
+            "$(curl", "$(wget", "$(nc ", "$(ssh ", "`curl", "`wget", "`nc ", "`ssh ",
         ];
 
         for pattern in cmd_subst_patterns {
@@ -327,9 +359,7 @@ impl Tool for ShellTool {
         }
 
         // SSH and SCP patterns
-        let ssh_patterns = vec![
-            "ssh ", "scp ", "sshpass ",
-        ];
+        let ssh_patterns = vec!["ssh ", "scp ", "sshpass "];
 
         for pattern in ssh_patterns {
             if cmd.starts_with(pattern) || cmd.contains(&format!(" {}", pattern)) {
@@ -347,7 +377,6 @@ impl Tool for ShellTool {
             // nc -l or ncat -l (listening sockets)
             r#"nc\s+-l"#,
             r#"ncat\s+-l"#,
-            
             // socat patterns
             r#"socat\s"#,
         ];
@@ -394,7 +423,8 @@ impl Tool for ShellTool {
             .spawn()
             .map_err(|e| anyhow!("shell: failed to start: {}", e))?;
 
-        let output = child.wait_with_output()
+        let output = child
+            .wait_with_output()
             .map_err(|e| anyhow!("shell: failed to collect output: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -417,7 +447,11 @@ impl Tool for ShellTool {
                 .ok()
                 .and_then(|o| {
                     let d = String::from_utf8_lossy(&o.stdout).into_owned();
-                    if d.trim().is_empty() { None } else { Some(d) }
+                    if d.trim().is_empty() {
+                        None
+                    } else {
+                        Some(d)
+                    }
                 });
             if unstaged.is_some() {
                 unstaged
@@ -430,7 +464,11 @@ impl Tool for ShellTool {
                     .ok()
                     .and_then(|o| {
                         let d = String::from_utf8_lossy(&o.stdout).into_owned();
-                        if d.trim().is_empty() { None } else { Some(d) }
+                        if d.trim().is_empty() {
+                            None
+                        } else {
+                            Some(d)
+                        }
                     })
             }
         };
@@ -466,7 +504,11 @@ fn parse_line_range(range: &str, total: usize) -> (usize, usize) {
     let clamp = |n: usize| n.min(total);
     if let Some((a, b)) = range.split_once('-') {
         let start = a.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
-        let end = if b.trim().is_empty() { total } else { clamp(b.trim().parse::<usize>().unwrap_or(total)) };
+        let end = if b.trim().is_empty() {
+            total
+        } else {
+            clamp(b.trim().parse::<usize>().unwrap_or(total))
+        };
         (start.min(total), end.max(start.min(total)))
     } else if let Ok(n) = range.trim().parse::<usize>() {
         // Single number: first N lines
@@ -550,16 +592,29 @@ impl Tool for ReadfileTool {
         // 2. Null-separated:          "path\x00start_or_empty\x00end_or_empty\x00search_term"
         let (raw_path, start_line, end_line, search_term) = if args.contains('\x00') {
             let mut parts = args.splitn(4, '\x00');
-            let path  = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'').to_string();
+            let path = parts
+                .next()
+                .unwrap_or("")
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             let start: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
-            let end:   Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
-            let search = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let end: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            let search = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             (path, start, end, search)
         } else {
             let mut parts = args.splitn(3, char::is_whitespace);
-            let path  = parts.next().unwrap_or("").trim_matches('"').trim_matches('\'').to_string();
+            let path = parts
+                .next()
+                .unwrap_or("")
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             let start: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
-            let end:   Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
+            let end: Option<usize> = parts.next().and_then(|s| s.trim().parse().ok());
             (path, start, end, None)
         };
 
@@ -576,41 +631,62 @@ impl Tool for ReadfileTool {
         // Search mode: filter to lines matching the term, include line numbers
         if let Some(ref term) = search_term {
             let lower_term = term.to_lowercase();
-            let matches: String = content.lines()
+            let matches: String = content
+                .lines()
                 .enumerate()
                 .filter(|(_, l)| l.to_lowercase().contains(lower_term.as_str()))
                 .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
                 .collect();
             let match_count = matches.lines().count();
             if matches.is_empty() {
-                return Ok(format!("📄 {} ({} lines): no matches for {:?}", resolved.display(), total_lines, term));
+                return Ok(format!(
+                    "📄 {} ({} lines): no matches for {:?}",
+                    resolved.display(),
+                    total_lines,
+                    term
+                ));
             }
             return Ok(format!(
                 "📄 {} — {} match(es) for {:?} (of {} lines):\n{}",
-                resolved.display(), match_count, term, total_lines, matches
+                resolved.display(),
+                match_count,
+                term,
+                total_lines,
+                matches
             ));
         }
 
         if let Some(start) = start_line {
             let start = start.max(1);
             let end = end_line.unwrap_or(start + 99).min(total_lines);
-            let selected: String = content.lines()
+            let selected: String = content
+                .lines()
                 .enumerate()
                 .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
                 .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
                 .collect();
             return Ok(format!(
                 "📄 {} (lines {}-{} of {}):\n{}",
-                resolved.display(), start, end, total_lines, selected
+                resolved.display(),
+                start,
+                end,
+                total_lines,
+                selected
             ));
         }
 
         // Full file — no truncation, line-numbered
-        let numbered: String = content.lines()
+        let numbered: String = content
+            .lines()
             .enumerate()
             .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
             .collect();
-        Ok(format!("📄 {} ({} lines):\n{}", resolved.display(), total_lines, numbered))
+        Ok(format!(
+            "📄 {} ({} lines):\n{}",
+            resolved.display(),
+            total_lines,
+            numbered
+        ))
     }
 }
 
@@ -621,20 +697,24 @@ pub struct EditfileTool;
 impl EditfileTool {
     /// Parse args into (path, old_str, new_str).
     ///
-    /// Standard format (from \x00 separator):  `path\x00old\x00new`
+    /// Format (from \x00 separator):  `path\x00old\x00new`
     /// Legacy bracket format:                   `path\nold\n---\nnew`
     fn parse_args(args: &str) -> Option<(String, String, String)> {
         if args.contains('\x00') {
             let mut parts = args.splitn(3, '\x00');
             let path = parts.next()?.trim().to_string();
-            let old  = parts.next()?.to_string();
-            let new  = parts.next()?.to_string();
+            let old = parts.next()?.to_string();
+            let new = parts.next()?.to_string();
             Some((path, old, new))
         } else {
             // Legacy: first line = path, remainder split on "\n---\n"
             let (path_line, rest) = args.split_once('\n')?;
             let (old, new) = rest.split_once("\n---\n")?;
-            Some((path_line.trim().to_string(), old.to_string(), new.to_string()))
+            Some((
+                path_line.trim().to_string(),
+                old.to_string(),
+                new.to_string(),
+            ))
         }
     }
 }
@@ -647,7 +727,11 @@ impl Tool for EditfileTool {
     fn validate_input(&self, args: &str) -> Result<()> {
         let path = match Self::parse_args(args) {
             Some((p, _, _)) => p,
-            None => return Err(anyhow!("editfile: expected format: path<sep>old_text<sep>new_text")),
+            None => {
+                return Err(anyhow!(
+                    "editfile: expected format: path<sep>old_text<sep>new_text"
+                ))
+            }
         };
         if path.is_empty() {
             return Err(anyhow!("editfile: empty file path"));
@@ -659,17 +743,22 @@ impl Tool for EditfileTool {
     fn execute(&self, args: &str) -> Result<String> {
         self.validate_input(args)?;
 
-        let (raw_path, old_str, new_str) = Self::parse_args(args)
-            .ok_or_else(|| anyhow!("editfile: could not parse arguments"))?;
+        let (raw_path, old_str, new_str) =
+            Self::parse_args(args).ok_or_else(|| anyhow!("editfile: could not parse arguments"))?;
 
         if old_str.is_empty() {
-            return Err(anyhow!("editfile: old_str is empty — cannot replace nothing"));
+            return Err(anyhow!(
+                "editfile: old_str is empty — cannot replace nothing"
+            ));
         }
 
         let path = sandbox::resolve(&raw_path);
 
         if !path.exists() {
-            return Err(anyhow!("editfile: {} does not exist (use setfile to create)", path.display()));
+            return Err(anyhow!(
+                "editfile: {} does not exist (use setfile to create)",
+                path.display()
+            ));
         }
 
         let content = fs::read_to_string(&path)
@@ -677,7 +766,10 @@ impl Tool for EditfileTool {
 
         let count = content.matches(old_str.as_str()).count();
         if count == 0 {
-            return Err(anyhow!("editfile: text not found in {} — read the file first to get exact text", path.display()));
+            return Err(anyhow!(
+                "editfile: text not found in {} — read the file first to get exact text",
+                path.display()
+            ));
         }
         if count > 1 {
             return Err(anyhow!("editfile: ambiguous — {} occurrences found in {} — include more context to be specific", count, path.display()));
@@ -692,7 +784,12 @@ impl Tool for EditfileTool {
 
         let diff = new_lines as i64 - old_lines as i64;
         let sign = if diff >= 0 { "+" } else { "" };
-        Ok(format!("✅ edited {} ({}{}  lines)", path.display(), sign, diff))
+        Ok(format!(
+            "✅ edited {} ({}{}  lines)",
+            path.display(),
+            sign,
+            diff
+        ))
     }
 }
 
@@ -724,8 +821,13 @@ impl Tool for SetfileTool {
         let path = sandbox::resolve(raw_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| anyhow!("setfile: failed to create dirs for {}: {}", path.display(), e))?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    anyhow!(
+                        "setfile: failed to create dirs for {}: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
             }
         }
 
@@ -742,7 +844,7 @@ impl Tool for SetfileTool {
         // Auto-commit: stage and commit the file. Capture diff before commit.
         let (commit_note, diff_output) = match self.git_add_and_commit(&path) {
             Ok((hash, diff)) => (format!(" — committed {}", hash), diff),
-            Err(_)           => (String::new(), String::new()),
+            Err(_) => (String::new(), String::new()),
         };
 
         if diff_output.is_empty() {
@@ -759,6 +861,8 @@ impl SetfileTool {
         let add = Command::new("git")
             .arg("add")
             .arg(path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|e| anyhow!("git add failed: {}", e))?;
         if !add.status.success() {
@@ -767,25 +871,39 @@ impl SetfileTool {
 
         // Capture staged diff before committing
         let diff_out = Command::new("git")
-            .args(["diff", "--cached", "--unified=3", "--color=never", "--", path.to_str().unwrap_or("")])
+            .args([
+                "diff",
+                "--cached",
+                "--unified=3",
+                "--color=never",
+                "--",
+                path.to_str().unwrap_or(""),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
+
         // Trim the diff to keep output reasonable (first 60 lines)
         let diff_trimmed = diff_out.lines().take(60).collect::<Vec<_>>().join("\n");
 
         let msg = format!("setfile: {}", path.display());
         let commit = Command::new("git")
             .args(["commit", "-m", &msg, "--", path.to_str().unwrap_or("")])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|e| anyhow!("git commit failed: {}", e))?;
 
         if commit.status.success() {
             let out = String::from_utf8_lossy(&commit.stdout);
             // Extract short hash from first line e.g. "[main abc1234] setfile: ..."
-            let hash = out.lines().next()
+            let hash = out
+                .lines()
+                .next()
                 .and_then(|l| l.split_whitespace().nth(1))
                 .map(|s| s.trim_end_matches(']').to_string())
                 .unwrap_or_else(|| "ok".to_string());
@@ -824,9 +942,17 @@ impl Tool for PatchfileTool {
 
         let mut parts = args.splitn(4, '\x00');
         let raw_path = parts.next().unwrap_or("").trim();
-        let start_line: usize = parts.next().unwrap_or("").trim().parse()
+        let start_line: usize = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
             .map_err(|_| anyhow!("patchfile: start_line must be a positive integer"))?;
-        let end_line: usize = parts.next().unwrap_or("").trim().parse()
+        let end_line: usize = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
             .map_err(|_| anyhow!("patchfile: end_line must be a positive integer"))?;
         let new_text = parts.next().unwrap_or("");
 
@@ -834,12 +960,19 @@ impl Tool for PatchfileTool {
             return Err(anyhow!("patchfile: start_line is 1-based, got 0"));
         }
         if end_line < start_line {
-            return Err(anyhow!("patchfile: end_line ({}) < start_line ({})", end_line, start_line));
+            return Err(anyhow!(
+                "patchfile: end_line ({}) < start_line ({})",
+                end_line,
+                start_line
+            ));
         }
 
         let path = sandbox::resolve(raw_path);
         if !path.exists() {
-            return Err(anyhow!("patchfile: {} does not exist (use setfile to create)", path.display()));
+            return Err(anyhow!(
+                "patchfile: {} does not exist (use setfile to create)",
+                path.display()
+            ));
         }
 
         let content = fs::read_to_string(&path)
@@ -849,14 +982,20 @@ impl Tool for PatchfileTool {
         let total = lines.len();
 
         if start_line > total + 1 {
-            return Err(anyhow!("patchfile: start_line {} exceeds file length {} in {}", start_line, total, path.display()));
+            return Err(anyhow!(
+                "patchfile: start_line {} exceeds file length {} in {}",
+                start_line,
+                total,
+                path.display()
+            ));
         }
 
         let end_clamped = end_line.min(total);
         let old_count = end_clamped.saturating_sub(start_line - 1);
 
         // Capture old lines before splicing (for diff output)
-        let old_lines: Vec<&str> = lines[start_line.saturating_sub(1)..end_clamped.min(lines.len())].to_vec();
+        let old_lines: Vec<&str> =
+            lines[start_line.saturating_sub(1)..end_clamped.min(lines.len())].to_vec();
 
         // Build replacement: split new_text into lines
         let replacement: Vec<&str> = new_text.lines().collect();
@@ -885,10 +1024,17 @@ impl Tool for PatchfileTool {
 
         let mut diff = format!(
             "✅ patched {} @@ -{},{} +{},{} @@\n",
-            path.display(), start_line, old_count, start_line, new_count
+            path.display(),
+            start_line,
+            old_count,
+            start_line,
+            new_count
         );
         // Context before
-        for (i, line) in all_lines[ctx_start..start_line.saturating_sub(1)].iter().enumerate() {
+        for (i, line) in all_lines[ctx_start..start_line.saturating_sub(1)]
+            .iter()
+            .enumerate()
+        {
             diff.push_str(&format!(" {:4}: {}\n", ctx_start + i + 1, line));
         }
         // Removed lines
@@ -923,7 +1069,7 @@ impl Tool for CommitTool {
         if args.is_empty() {
             return Err(anyhow!("commit: empty commit message"));
         }
-        
+
         // Check git is available
         Command::new("git")
             .arg("--version")
@@ -950,7 +1096,11 @@ impl Tool for CommitTool {
 
         if output.status.success() {
             // Extract commit hash from output
-            Ok(stdout.lines().next().unwrap_or("commit created").to_string())
+            Ok(stdout
+                .lines()
+                .next()
+                .unwrap_or("commit created")
+                .to_string())
         } else if stderr.contains("nothing to commit") {
             Ok("no changes to commit".to_string())
         } else {
@@ -995,30 +1145,22 @@ impl PythonTool {
         let regex_patterns = vec![
             // __import__('socket') or __import__("socket")
             r#"__import__\(['"](?:socket|urllib|requests|http|aiohttp|httpx|paramiko|ftplib|telnetlib)['"]\)"#,
-            
             // getattr(__builtins__, 'socket')
             r#"getattr\(__builtins__,\s*['"](?:socket|urllib|requests|http|aiohttp|httpx|paramiko|ftplib|telnetlib)['"]\)"#,
-            
             // importlib.import_module('socket')
             r#"importlib\.import_module\(['"](?:socket|urllib|requests|http|aiohttp|httpx|paramiko|ftplib|telnetlib)['"]\)"#,
-            
             // eval('import socket')
             r#"eval\(['"]import\s+(?:socket|urllib|requests|http|aiohttp|httpx|paramiko|ftplib|telnetlib)['"]\)"#,
-            
             // exec('import socket')
             r#"exec\(['"]import\s+(?:socket|urllib|requests|http|aiohttp|httpx|paramiko|ftplib|telnetlib)['"]\)"#,
-            
             // base64.b64decode pattern with socket-like patterns
             r#"base64\.b64decode\(['"]\w+['\"]\)"#,
-            
             // codecs.decode with rot13/other encoding
             r#"codecs\.decode\([^)]*(?:rot13|rot_13|rot-13)\)"#,
-            
             // .connect() or .socket() method calls (potential network socket usage)
             r#"\.connect\s*\("#,
             r#"\.socket\s*\("#,
             r#"\.getaddrinfo\s*\("#,
-            
             // URL operations
             r#"\.urlopen\s*\("#,
             r#"requests\.\w+\s*\("#,
@@ -1078,6 +1220,8 @@ impl Tool for PythonTool {
         }
 
         let output = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|e| anyhow!("python: execution failed: {}", e))?;
 
@@ -1130,16 +1274,12 @@ impl RusteTool {
         let regex_patterns = vec![
             // use std::net::{TcpStream, ...}
             r#"use\s+std::net::\s*\{[^}]*\}"#,
-            
             // use tokio::net::TcpStream
             r#"use\s+tokio::net::[^\s;]+"#,
-            
             // use hyper:: or similar async HTTP
             r#"use\s+(?:hyper|tonic|grpc)::"#,
-            
             // Type annotations like let x: TcpStream
             r#":\s*(?:TcpStream|UdpSocket|TcpListener|SocketAddr)"#,
-            
             // Method calls: .connect(), .bind(), .listen(), .send_to()
             r#"\.connect\s*\("#,
             r#"\.bind\s*\("#,
@@ -1194,6 +1334,8 @@ impl Tool for RusteTool {
             .arg(file_path)
             .arg("-o")
             .arg(&out_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|_| anyhow!("ruste: rustc not found in PATH"))?;
 
@@ -1204,6 +1346,8 @@ impl Tool for RusteTool {
 
         // Execute the binary
         let exec_result = Command::new(&out_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|e| anyhow!("ruste: execution failed: {}", e))?;
 
@@ -1226,8 +1370,12 @@ impl Tool for RusteTool {
 pub struct ThinkTool;
 
 impl Tool for ThinkTool {
-    fn name(&self) -> &str { "think" }
-    fn validate_input(&self, _args: &str) -> Result<()> { Ok(()) }
+    fn name(&self) -> &str {
+        "think"
+    }
+    fn validate_input(&self, _args: &str) -> Result<()> {
+        Ok(())
+    }
     fn execute(&self, args: &str) -> Result<String> {
         // Write this thought to .yggdra/thought.md — single active thought before next action.
         let thought = args.trim();
@@ -1248,38 +1396,27 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create a new registry. In ShellOnly profile, only the `shell` tool is registered.
-    pub fn new(profile: crate::config::CapabilityProfile) -> Self {
-        use crate::config::CapabilityProfile;
-        let mut tools: std::collections::HashMap<String, Box<dyn Tool>> = std::collections::HashMap::new();
-
+    /// Create a new registry: shell, setfile, patchfile, commit.
+    pub fn new(_profile: crate::config::CapabilityProfile) -> Self {
+        let mut tools: std::collections::HashMap<String, Box<dyn Tool>> =
+            std::collections::HashMap::new();
         tools.insert("shell".to_string(), Box::new(ShellTool) as Box<dyn Tool>);
-
-        if profile == CapabilityProfile::ShellOnly {
-            // ShellOnly allows shell + setfile + commit
-            tools.insert("setfile".to_string(), Box::new(SetfileTool) as Box<dyn Tool>);
-            tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
-        } else if profile == CapabilityProfile::Standard {
-            tools.insert("rg".to_string(), Box::new(RipgrepTool) as Box<dyn Tool>);
-            tools.insert("exec".to_string(), Box::new(ExecTool) as Box<dyn Tool>);
-            // "spawn" is both a command-exec alias (spawn git log) and a subagent launcher
-            // (spawn with task_id/description). The dispatcher disambiguates by args prefix.
-            tools.insert("spawn".to_string(), Box::new(ExecTool) as Box<dyn Tool>);
-            tools.insert("readfile".to_string(), Box::new(ReadfileTool) as Box<dyn Tool>);
-            tools.insert("setfile".to_string(), Box::new(SetfileTool) as Box<dyn Tool>);
-            tools.insert("patchfile".to_string(), Box::new(PatchfileTool) as Box<dyn Tool>);
-            tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
-            tools.insert("python".to_string(), Box::new(PythonTool) as Box<dyn Tool>);
-            tools.insert("ruste".to_string(), Box::new(RusteTool) as Box<dyn Tool>);
-            tools.insert("think".to_string(), Box::new(ThinkTool) as Box<dyn Tool>);
-        }
-
+        tools.insert(
+            "setfile".to_string(),
+            Box::new(SetfileTool) as Box<dyn Tool>,
+        );
+        tools.insert(
+            "patchfile".to_string(),
+            Box::new(PatchfileTool) as Box<dyn Tool>,
+        );
+        tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
         Self { tools }
     }
 
     /// Execute a tool by name with arguments
     pub fn execute(&self, tool_name: &str, args: &str) -> Result<String> {
-        let tool = self.tools
+        let tool = self
+            .tools
             .get(tool_name)
             .ok_or_else(|| anyhow!("unknown tool: {}", tool_name))?;
 
@@ -1294,7 +1431,7 @@ impl ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::new(crate::config::CapabilityProfile::Standard)
+        Self::new(crate::config::CapabilityProfile::ShellOnly)
     }
 }
 
@@ -1332,7 +1469,11 @@ mod tests {
         let tool = RipgrepTool;
         // validate_input should parse path correctly from null-separated format
         let result = tool.validate_input("pub enum.*Item\x00.");
-        assert!(result.is_ok(), "null-separated multi-word pattern must be valid: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "null-separated multi-word pattern must be valid: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1369,11 +1510,19 @@ mod tests {
         assert!(tool.validate_input("").is_err());
 
         // Non-existent binaries rejected
-        assert!(tool.validate_input("definitely_not_a_real_binary_xyzzy").is_err());
+        assert!(tool
+            .validate_input("definitely_not_a_real_binary_xyzzy")
+            .is_err());
 
         // Common Unix tools on PATH should resolve fine
-        assert!(tool.validate_input("ls").is_ok(), "ls should resolve via PATH");
-        assert!(tool.validate_input("echo hello").is_ok(), "echo should resolve via PATH");
+        assert!(
+            tool.validate_input("ls").is_ok(),
+            "ls should resolve via PATH"
+        );
+        assert!(
+            tool.validate_input("echo hello").is_ok(),
+            "echo should resolve via PATH"
+        );
     }
 
     #[test]
@@ -1381,7 +1530,10 @@ mod tests {
     fn test_spawn_path_resolution() {
         // resolve_binary("ls") should find something under /bin or /usr/bin
         let resolved = ExecTool::resolve_binary("ls");
-        assert!(resolved.is_some(), "ls must be resolvable on any POSIX system");
+        assert!(
+            resolved.is_some(),
+            "ls must be resolvable on any POSIX system"
+        );
         assert!(resolved.unwrap().exists());
 
         // Non-existent names should return None
@@ -1392,7 +1544,10 @@ mod tests {
     fn test_shell_split_basics() {
         // Simple whitespace splitting
         assert_eq!(shell_split("ls -la"), vec!["ls", "-la"]);
-        assert_eq!(shell_split("echo hello world"), vec!["echo", "hello", "world"]);
+        assert_eq!(
+            shell_split("echo hello world"),
+            vec!["echo", "hello", "world"]
+        );
 
         // Double-quoted args stay together
         assert_eq!(
@@ -1466,10 +1621,10 @@ mod tests {
     #[test]
     fn test_commit_validation() {
         let tool = CommitTool;
-        
+
         // Empty message fails
         assert!(tool.validate_input("").is_err());
-        
+
         // Non-empty message passes validation
         // (actual git execution would require a repo)
         assert!(tool.validate_input("test commit").is_ok());
@@ -1478,10 +1633,10 @@ mod tests {
     #[test]
     fn test_python_validation() {
         let tool = PythonTool;
-        
+
         // Empty path fails
         assert!(tool.validate_input("").is_err());
-        
+
         // Non-existent file fails
         assert!(tool.validate_input("/nonexistent/script.py").is_err());
     }
@@ -1489,31 +1644,25 @@ mod tests {
     #[test]
     fn test_ruste_validation() {
         let tool = RusteTool;
-        
+
         // Empty path fails
         assert!(tool.validate_input("").is_err());
-        
+
         // Non-existent file fails
         assert!(tool.validate_input("/nonexistent/script.rs").is_err());
     }
 
     #[test]
     fn test_tool_registry() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
         let tools = registry.list_tools();
-        
-        assert!(tools.contains(&"rg"));
-        assert!(tools.contains(&"exec"));
+
         assert!(tools.contains(&"shell"));
-        assert!(tools.contains(&"readfile"));
         assert!(tools.contains(&"setfile"));
-        assert!(tools.contains(&"commit"));
-        assert!(tools.contains(&"python"));
-        assert!(tools.contains(&"ruste"));
         assert!(tools.contains(&"patchfile"));
-        assert!(tools.contains(&"think"));
-        assert_eq!(tools.len(), 11); // rg exec spawn shell readfile setfile patchfile commit python ruste think {
-        // No extension → add `''`
+        assert!(tools.contains(&"commit"));
+        assert_eq!(tools.len(), 4); // shell setfile patchfile commit
+                                    // No extension → add `''`
         assert_eq!(
             fix_macos_sed_inplace("sed -i 's/old/new/g' file.rs"),
             "sed -i '' 's/old/new/g' file.rs"
@@ -1603,12 +1752,11 @@ mod tests {
 
     #[test]
     fn test_registry_unknown_tool() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
         let result = registry.execute("nonexistent", "args");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
     }
-
 
     // ===== Patchfile tests =====
 
@@ -1640,7 +1788,9 @@ mod tests {
         let tool = PatchfileTool;
         // Replace lines 2-3 with a single line
         let args = format!("{}\x002\x003\x00ONLY", path_str);
-        let result = tool.execute(&args).expect("patchfile shrink should succeed");
+        let result = tool
+            .execute(&args)
+            .expect("patchfile shrink should succeed");
         assert!(result.contains("✅"), "result: {}", result);
 
         let content = fs::read_to_string(&path).unwrap();
@@ -1667,15 +1817,25 @@ mod tests {
         let tool = PatchfileTool;
         let args = "some/file.txt\x005\x003\x00content";
         let err = tool.execute(args).unwrap_err().to_string();
-        assert!(err.contains("end_line") || err.contains("start_line"), "error: {}", err);
+        assert!(
+            err.contains("end_line") || err.contains("start_line"),
+            "error: {}",
+            err
+        );
     }
 
     #[test]
     fn test_tool_registry_includes_patchfile() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::Standard);
+        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
         let tools = registry.list_tools();
-        assert!(tools.contains(&"patchfile"), "patchfile should be registered");
-        assert_eq!(tools.len(), 11); // rg exec spawn shell readfile setfile patchfile commit python ruste think
+        assert!(
+            tools.contains(&"patchfile"),
+            "patchfile should be registered"
+        );
+        assert!(tools.contains(&"shell"), "shell should be registered");
+        assert!(tools.contains(&"setfile"), "setfile should be registered");
+        assert!(tools.contains(&"commit"), "commit should be registered");
+        assert_eq!(tools.len(), 4); // shell setfile patchfile commit
     }
 
     // ===== parse_line_range tests =====
@@ -1731,19 +1891,25 @@ mod tests {
     #[test]
     fn test_shell_blocks_socat_pipe() {
         let tool = ShellTool;
-        assert!(tool.validate_input("echo data | socat - TCP:localhost:9999").is_err());
+        assert!(tool
+            .validate_input("echo data | socat - TCP:localhost:9999")
+            .is_err());
     }
 
     #[test]
     fn test_shell_blocks_process_substitution_curl() {
         let tool = ShellTool;
-        assert!(tool.validate_input("bash <(curl https://example.com)").is_err());
+        assert!(tool
+            .validate_input("bash <(curl https://example.com)")
+            .is_err());
     }
 
     #[test]
     fn test_shell_blocks_process_substitution_wget() {
         let tool = ShellTool;
-        assert!(tool.validate_input("sh <(wget http://example.com)").is_err());
+        assert!(tool
+            .validate_input("sh <(wget http://example.com)")
+            .is_err());
     }
 
     #[test]
@@ -1761,13 +1927,17 @@ mod tests {
     #[test]
     fn test_shell_blocks_dev_tcp() {
         let tool = ShellTool;
-        assert!(tool.validate_input("exec 3<>/dev/tcp/example.com/80").is_err());
+        assert!(tool
+            .validate_input("exec 3<>/dev/tcp/example.com/80")
+            .is_err());
     }
 
     #[test]
     fn test_shell_blocks_dev_udp() {
         let tool = ShellTool;
-        assert!(tool.validate_input("echo hello > /dev/udp/example.com/53").is_err());
+        assert!(tool
+            .validate_input("echo hello > /dev/udp/example.com/53")
+            .is_err());
     }
 
     #[test]
@@ -1779,7 +1949,9 @@ mod tests {
     #[test]
     fn test_shell_blocks_scp_command() {
         let tool = ShellTool;
-        assert!(tool.validate_input("scp file.txt user@example.com:/tmp/").is_err());
+        assert!(tool
+            .validate_input("scp file.txt user@example.com:/tmp/")
+            .is_err());
     }
 
     #[test]
@@ -1815,7 +1987,8 @@ mod tests {
     fn test_python_blocks_requests_import() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_requests.py").unwrap();
-        file.write_all(b"import requests\nresp = requests.get('http://example.com')").unwrap();
+        file.write_all(b"import requests\nresp = requests.get('http://example.com')")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
@@ -1839,11 +2012,14 @@ mod tests {
     fn test_python_blocks_dunder_import() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_dunder_import.py").unwrap();
-        file.write_all(b"sock = __import__('socket').socket()").unwrap();
+        file.write_all(b"sock = __import__('socket').socket()")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
-        assert!(tool.validate_input("/tmp/yggdra_test_dunder_import.py").is_err());
+        assert!(tool
+            .validate_input("/tmp/yggdra_test_dunder_import.py")
+            .is_err());
         let _ = std::fs::remove_file("/tmp/yggdra_test_dunder_import.py");
     }
 
@@ -1851,7 +2027,8 @@ mod tests {
     fn test_python_blocks_getattr_builtins() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_getattr.py").unwrap();
-        file.write_all(b"sock = getattr(__builtins__, 'socket')").unwrap();
+        file.write_all(b"sock = getattr(__builtins__, 'socket')")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
@@ -1863,11 +2040,14 @@ mod tests {
     fn test_python_blocks_importlib() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_importlib.py").unwrap();
-        file.write_all(b"importlib.import_module('socket')").unwrap();
+        file.write_all(b"importlib.import_module('socket')")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
-        assert!(tool.validate_input("/tmp/yggdra_test_importlib.py").is_err());
+        assert!(tool
+            .validate_input("/tmp/yggdra_test_importlib.py")
+            .is_err());
         let _ = std::fs::remove_file("/tmp/yggdra_test_importlib.py");
     }
 
@@ -1887,7 +2067,8 @@ mod tests {
     fn test_python_blocks_connect_method() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_connect.py").unwrap();
-        file.write_all(b"sock.connect(('example.com', 80))").unwrap();
+        file.write_all(b"sock.connect(('example.com', 80))")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
@@ -1899,7 +2080,8 @@ mod tests {
     fn test_python_allows_normal_scripts() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_normal.py").unwrap();
-        file.write_all(b"import os\nprint('hello')\ndata = open('file.txt').read()").unwrap();
+        file.write_all(b"import os\nprint('hello')\ndata = open('file.txt').read()")
+            .unwrap();
         drop(file);
 
         let tool = PythonTool;
@@ -1911,7 +2093,8 @@ mod tests {
     fn test_ruste_blocks_tcpstream() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_tcp.rs").unwrap();
-        file.write_all(b"use std::net::TcpStream;\nlet stream = TcpStream::connect(addr)?;").unwrap();
+        file.write_all(b"use std::net::TcpStream;\nlet stream = TcpStream::connect(addr)?;")
+            .unwrap();
         drop(file);
 
         let tool = RusteTool;
@@ -1923,7 +2106,8 @@ mod tests {
     fn test_ruste_blocks_std_net() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_std_net.rs").unwrap();
-        file.write_all(b"use std::net::{TcpStream, TcpListener};").unwrap();
+        file.write_all(b"use std::net::{TcpStream, TcpListener};")
+            .unwrap();
         drop(file);
 
         let tool = RusteTool;
@@ -1963,7 +2147,9 @@ mod tests {
         drop(file);
 
         let tool = RusteTool;
-        assert!(tool.validate_input("/tmp/yggdra_test_rs_connect.rs").is_err());
+        assert!(tool
+            .validate_input("/tmp/yggdra_test_rs_connect.rs")
+            .is_err());
         let _ = std::fs::remove_file("/tmp/yggdra_test_rs_connect.rs");
     }
 
@@ -1983,7 +2169,8 @@ mod tests {
     fn test_ruste_allows_normal_code() {
         use std::io::Write;
         let mut file = std::fs::File::create("/tmp/yggdra_test_normal.rs").unwrap();
-        file.write_all(b"use std::fs::File;\nlet data = File::open('file.txt')?;").unwrap();
+        file.write_all(b"use std::fs::File;\nlet data = File::open('file.txt')?;")
+            .unwrap();
         drop(file);
 
         let tool = RusteTool;

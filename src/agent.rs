@@ -74,7 +74,7 @@ pub fn is_hallucinated_output(text: &str) -> bool {
     has_tool_call && has_tool_output
 }
 
-/// Canonical tool descriptions — XML format for ShellOnly, JSON for Standard.
+/// Tool descriptions in XML format (used in the system prompt).
 pub fn json_tool_descriptions(profile: crate::config::CapabilityProfile) -> String {
     use crate::config::CapabilityProfile;
     if profile == CapabilityProfile::ShellOnly {
@@ -444,7 +444,7 @@ fn extract_balanced_brackets(s: &str) -> Option<String> {
 fn is_valid_tool(name: &str, profile: crate::config::CapabilityProfile) -> bool {
     use crate::config::CapabilityProfile;
     if profile == CapabilityProfile::ShellOnly {
-        return matches!(name, "shell" | "setfile" | "commit");
+        return matches!(name, "shell" | "setfile" | "patchfile" | "commit");
     }
     matches!(
         name,
@@ -677,6 +677,13 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
                 let content = extract_tag_raw(block, "content").unwrap_or("").to_string();
                 format!("{}\x00{}", fpath, content)
             }
+            "patchfile" => {
+                let fpath = extract_tag(block, "path").unwrap_or("").to_string();
+                let start = extract_tag(block, "start_line").unwrap_or("0").to_string();
+                let end_l = extract_tag(block, "end_line").unwrap_or("0").to_string();
+                let new_text = extract_tag_raw(block, "new_text").unwrap_or("").to_string();
+                format!("{}\x00{}\x00{}\x00{}", fpath, start, end_l, new_text)
+            }
             "commit" => {
                 // <message>commit message</message>
                 extract_tag(block, "message").unwrap_or("").to_string()
@@ -699,30 +706,22 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
     calls
 }
 
-/// Parse tool calls from LLM output — XML first (ShellOnly), then JSON, then prose backtick fallback.
+/// Parse tool calls from LLM output — XML first, then JSON, then prose backtick fallback.
 pub fn parse_tool_calls(output: &str, profile: CapabilityProfile) -> Vec<ToolCall> {
-    // ShellOnly: prefer XML format (escape-free), fall through to JSON for backward compat
-    if profile == CapabilityProfile::ShellOnly {
-        let xml_calls = parse_xml_tool_calls(output, profile);
-        if !xml_calls.is_empty() { return xml_calls; }
-    }
+    // Now exclusively using XML format for maximum reliability and a clean harness.
+    let xml_calls = parse_xml_tool_calls(output, profile);
+    if !xml_calls.is_empty() { return xml_calls; }
 
-    let calls = parse_json_tool_calls(output, profile);
-    if !calls.is_empty() { return calls; }
-
-    // Prose fallback: model wrote `` `command` `` instead of any structured format.
-    // Only for ShellOnly where `shell` is the only valid tool anyway.
-    if profile == CapabilityProfile::ShellOnly {
-        if let Some(cmd) = extract_backtick_command(output) {
-            return vec![ToolCall {
-                name: "shell".to_string(),
-                args: cmd,
-                description: None,
-                async_mode: false,
-                async_task_id: None,
-                tellhuman: None,
-            }];
-        }
+    // Fallback to prose backticks for the absolute last resort
+    if let Some(cmd) = extract_backtick_command(output) {
+        return vec![ToolCall {
+            name: "shell".to_string(),
+            args: cmd,
+            description: None,
+            async_mode: false,
+            async_task_id: None,
+            tellhuman: None,
+        }];
     }
     Vec::new()
 }
@@ -809,7 +808,7 @@ impl AgentConfig {
             max_recursion_depth: 10,
             current_depth: 0,
             app_mode: AppMode::Plan,
-            profile: crate::config::CapabilityProfile::Standard,
+            profile: crate::config::CapabilityProfile::ShellOnly,
             token_tx: None,
             project_context: String::new(),
         }
@@ -905,7 +904,6 @@ impl Agent {
         }
     }
 
-    /// Format system prompt with steering directive for tool use and decomposition
     fn system_prompt_with_steering(&self) -> String {
         use crate::config::CapabilityProfile;
         let profile = self.config.profile;
@@ -913,12 +911,10 @@ impl Agent {
             .map(|p| format!("PROJECT ROOT: {}", p.display()))
             .unwrap_or_else(|| "PROJECT ROOT: (current directory)".to_string());
 
-        // Collect and format system metadata
         let sysinfo = SystemInfo::collect()
             .map(|s| s.format_for_agent())
             .unwrap_or_else(|_| "SYSTEM INFO: (unavailable)".to_string());
 
-        // Current local time to the minute
         let time_str = {
             use chrono::Local;
             format!("TIME: {}", Local::now().format("%H:%M %Z"))
@@ -927,117 +923,68 @@ impl Agent {
 
         let tools = json_tool_descriptions(profile);
 
-        let prompt = if profile == CapabilityProfile::ShellOnly {
-        // Load personal instructions from ~/AGENTS.md at runtime
         let personal_instructions = std::fs::read_to_string(std::env::var("HOME").unwrap_or_default() + "/AGENTS.md")
-            .map(|s| format!("
-
-### PERSONAL INSTRUCTIONS
-{}", s))
+            .map(|s| format!("\n\n### PERSONAL INSTRUCTIONS\n{}", s))
             .unwrap_or_default();
 
+        let prompt = if profile == CapabilityProfile::ShellOnly {
             format!(
                 "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
-                 Use shell for all file reads, edits, searches, builds, and commits.\n\
+                 Use shell for all file operations, builds, and commits.\n\
                  \n\
                  {sysinfo}\n\
                  \n\
                  {root}\n\
-                 All work must stay within this directory. Use relative paths.\n\
+                 Stay within this directory. Use relative paths.\n\
                  \n\
                  {tools}\n\
                  \n\
-                 WORKFLOW:\n\
-                 - Think:  BEFORE every tool call, write one thought to .yggdra/thought.md:\n\
-                           shell \"printf '%s\\n' 'I will X because Y' > .yggdra/thought.md\"\n\
-                           One sentence. Overwrite it each time — it represents your current thought only.\n\
-                 - Read:   shell \"cat src/foo.rs\" or \"sed -n '10,50p' src/foo.rs\"\n\
-                 - Search: shell \"rg 'pattern' src/\"\n\
-                 - Edit:   sed -i '' 's/old/new/g' file.rs          — in-place regex replace\n\
-                           awk '{{gsub(/old/,\"new\"); print}}' f > tmp && mv tmp f  — awk rewrite\n\
-                           vim -c '%s/old/new/g' -c 'wq' file.rs   — vim non-interactive\n\
-                           printf 'line1\\nline2\\n' > file.txt       — overwrite entire file\n\
-                 - Write:  shell \"printf '%s\\n' 'content' > path/to/file.txt\"\n\
-                 - Commit: shell \"git add -A && git commit -m 'message'\" after every change\n\
-                 - Build:  shell \"cargo test --lib 2>&1 | tail -20\"\n\
-                 - Knowledge: shell \"ls .yggdra/knowledge/\"                          — list categories\n\
-                              shell \"rg 'topic' .yggdra/knowledge/rust/ -l\"     — search docs\n\
-                              shell \"cat .yggdra/knowledge/rust/some-doc.md\"         — read a doc\n\
-                              135,000+ offline files across 50+ categories. Search before asking.\n\
-                 - Async: add \"mode\": \"async\" and \"task_id\": \"my-task\" to any shell/exec call\n\
-                          to run it in the background. You receive an immediate ack and continue.\n\
-                          The result is injected as [ASYNC_RESULT: my-task = ...] when done.\n\
-                          Output is also written to .yggdra/async/my-task.txt for inspection.\n\
-                          Example: {{\"name\": \"shell\", \"parameters\": {{\"command\": \"cargo test 2>&1\",\n\
-                                    \"description\": \"Run tests\", \"mode\": \"async\", \"task_id\": \"tests\"}}}}\n\
-                          Use async for: long builds, test suites, background installs.\n\
-                 \n\
-                  IMPORTANT:\n\
-                 - Always include a description field explaining what you are doing and why.\n\
-                 - FILE SIZE RULE: keep every source file under 200 lines. If an edit would exceed\n\
-                   200 lines, split the file into focused modules first.\n\
-                 - When done, summarize results.\n\
+                 DIRECTIVES:\n\
+                 - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
+                 - Constraints: Keep files < 200 lines. Use async for long tasks.\n\
+                 - Completion: Summarize results when finished.\n\
                  \n\
                  {project_ctx}\n\
-                 ⚠️ The file tree is live — go directly to relevant files.",
+                 {personal_instructions}\n\
+                 The file tree is live.",
                 sysinfo = sysinfo,
                 root    = root_line,
                 tools   = tools,
                 project_ctx = self.config.project_context,
+                personal_instructions = personal_instructions,
             )
         } else {
-            // Load personal instructions from ~/AGENTS.md at runtime
-            let personal_instructions = std::fs::read_to_string(std::env::var("HOME").unwrap_or_default() + "/AGENTS.md")
-                .map(|s| format!("\n\n### PERSONAL INSTRUCTIONS\n{}", s))
-                .unwrap_or_default();
-
-            let one_mode_section = if self.config.app_mode == AppMode::One {
-                "\n\n⚡ ONE MODE — async-first task execution:\n                 You are executing a single user-specified task. Default to async parallelism:\n                 1. Break the task into independent subtasks immediately.\n                 2. spawn each subtask as a parallel subagent with task_id + description.\n                 3. Continue coordination while subagents run in parallel.\n                 4. Collect [AGENT_RESULT: task_id = ...] injections and synthesize.\n                 5. When all done, emit [DONE].\n                 Prefer spawn over sequential execution — parallelism is free here.\n"
-                .to_string()
+            let one_mode = if self.config.app_mode == AppMode::One {
+                "\n\nONE MODE: Use parallel subagents (spawn) for decomposition. Emit </done> when fully complete.\n"
             } else {
-                String::new()
+                ""
             };
+
             format!(
-                "You are an agentic assistant with access to tools and subagent spawning.\n\
+                "You are an agentic assistant with tool access and subagent spawning.\n\
                  \n\
                  {sysinfo}\n\
                  \n\
                  {root}\n\
-                 All files go inside this directory.\n\
-                 Use relative paths (e.g. src/foo.rs) — they resolve to the project root automatically.\n\
-                 Write only within the project root.\n\
+                 All files must stay within this project root. Use relative paths.\n\
                  \n\
                  {tools}\
                  {one_mode}\n\
                  \n\
-                 OFFLINE KNOWLEDGE BASE:\n\
-                 The project contains .yggdra/knowledge/ with 135,000+ files across 50+ categories.\n\
-                 STRATEGY: Search .yggdra/knowledge/ with rg first, then readfile the best matches.\n\
+                 KNOWLEDGE BASE: Search .yggdra/knowledge/ using rg before asking.\n\
                  \n\
-                 IMPORTANT NOTES:\n\
-                 - Tool output is capped at 500 chars by default; adjust with: set_params tool_output_cap=5000\n\
-                 - Full output is always stored in session even if truncated in context.\n\
-                 - After calling a tool, include the result in your next response and continue reasoning.\n\
-                 - Subagents run in parallel; wait for all results before combining for final output.\n\
-                 - COMMIT RULE: setfile auto-commits on write. After patchfile, call commit manually.\n\
-                 - THOUGHT RULE: BEFORE EACH TOOL CALL, use the think tool to record your current thought\n\
-                   in .yggdra/thought.md. One sentence: what you are about to do and why. It overwrites\n\
-                   the previous thought — it represents your single active thought at any moment.\n\
-                   Example: {{\"tool_calls\": [{{\"name\": \"think\", \"parameters\": {{\"thought\": \"I will read src/main.rs to find the entry point.\"}}}}]}}\n\
-                 - TEXT EDITING: for any file change: readfile to get current content → setfile to\n\
-                   write the full updated content → commit. Git preserves history so full rewrites are safe.\n\
-                   For surgical edits of large files: readfile (note line numbers) → patchfile.\n
-
-                  - FILE SIZE RULE: keep every source file under 200 lines. If an edit would exceed\n\
-                    200 lines, split into focused modules first.\n\
-                 - When task is fully complete, respond with summary of results — no special marker needed.\n\
+                 DIRECTIVES:\n\
+                 - Thought: Record intent to .yggdra/thought.md before every tool call.\n\
+                 - Edits: readfile -> setfile -> commit.\n\
+                 - Limits: Files < 200 lines. Tool output capped at 500 chars.\n\
+                 - Completion: Summarize and emit </done> when task is finished.\n\
                  \n\
                  {project_ctx}{personal_instructions}\n\
-                 ⚠️ The file tree is live — go directly to relevant files.",
+                 The file tree is live.",
                 sysinfo = sysinfo,
                 root    = root_line,
                 tools   = tools,
-                one_mode = one_mode_section,
+                one_mode = one_mode,
                 project_ctx = self.config.project_context,
                 personal_instructions = personal_instructions,
             )
@@ -1047,7 +994,7 @@ impl Agent {
 
     /// Check if LLM output indicates completion (explicit marker only)
     fn is_done(output: &str) -> bool {
-        output.contains("[DONE]")
+        output.contains("</done>")
     }
 
     /// Trim an accumulated message history to a bounded size.
@@ -1072,8 +1019,10 @@ impl Agent {
         ];
 
         let steering = SteeringDirective::custom(
-            "Use tools to complete this task. Emit tool calls as JSON:\n\
-             {\"tool_calls\": [{\"name\": \"toolName\", \"parameters\": {\"key\": \"value\"}}]}\n\
+            "Use tools to complete this task. Emit tool calls as XML:\n\
+             <tool>toolName</tool>\n\
+             <param>value</param>\n\
+             <desc>explanation</desc>\n\
              After execution, include results in your next response. \
              When the task is fully complete, respond with plain text summarising the result."
         );
@@ -1191,9 +1140,10 @@ impl Agent {
 
         // Add user query with steering injection for tool use
         let steering = SteeringDirective::custom(
-            "Use tools or spawn subagents to answer this query. Emit tool calls as JSON:\n\
-             {\"tool_calls\": [{\"name\": \"toolName\", \"parameters\": {\"key\": \"value\"}}]}\n\
-             For parallel subagents: {\"tool_calls\": [{\"name\": \"spawn_agent\", \"parameters\": {\"task_id\": \"id\", \"description\": \"task\"}}]}\n\
+            "Use tools or spawn subagents to answer this query. Emit tool calls as XML:\n\
+             <tool>toolName</tool>\n\
+             <param>value</param>\n\
+             <desc>explanation</desc>\n\
              After execution, include results in your next response."
         );
         let query_with_steering = format!(
@@ -1242,8 +1192,8 @@ impl Agent {
                 return Ok(llm_output);
             }
 
-            // Check for tool calls
-            let tool_calls = parse_json_tool_calls(&llm_output, self.config.profile);
+            // Check for tool calls (exclusive XML format)
+            let tool_calls = parse_xml_tool_calls(&llm_output, self.config.profile);
             let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
             
             // Disable subagent spawning if recursion depth limit reached
@@ -1252,21 +1202,24 @@ impl Agent {
             }
 
             if tool_calls.is_empty() && spawn_calls.is_empty() {
-                // No tools or subagents called
-                if Self::is_done(&llm_output) {
-                    return Ok(llm_output);
-                }
-                // If no tools and not done, ask for completion
+        // If no tools and not done, ask for completion
                 messages.push(OllamaMessage {
                     role: "user".to_string(),
-                    content: "Have you completed the task? Respond with [DONE] when finished.".to_string(),
+                    content: "Have you completed the task? Respond with </done> when finished.".to_string(),
                 });
                 continue;
             }
 
-            // Execute tools with real-time injection: inject each result immediately after execution
-            // instead of batching all results together. This allows the agent to make faster decisions.
+            // Check if done after tools executed
+            if Self::is_done(&llm_output) {
+                return Ok(llm_output);
+            }
+
+            // Execute tools with real-time injection
+            let mut tool_results = String::new();
             for call in tool_calls {
+
+
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
@@ -1346,14 +1299,14 @@ mod tests {
     #[test]
     fn test_parse_no_tool_calls() {
         let output = "This is just text without any tools";
-        let calls = parse_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 0);
     }
 
     #[test]
     fn test_is_done() {
-        assert!(Agent::is_done("Task completed [DONE]"));
-        assert!(Agent::is_done("[DONE]"));
+        assert!(Agent::is_done("Task completed </done>"));
+        assert!(Agent::is_done("</done>"));
         assert!(!Agent::is_done("Everything is done"));
         assert!(!Agent::is_done("We have finished"));
         assert!(!Agent::is_done("Still working..."));
@@ -1361,7 +1314,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_has_steering() {
-        let prompt = json_tool_descriptions(crate::config::CapabilityProfile::Standard);
+        let prompt = json_tool_descriptions(crate::config::CapabilityProfile::ShellOnly);
         // Should contain tool instructions without wrapper tags
         assert!(prompt.contains("tools") || prompt.contains("Tools") || prompt.contains("TOOL"));
     }
@@ -1370,7 +1323,7 @@ mod tests {
     fn test_parse_tool_calls_setfile_preserves_content() {
         // JSON setfile: path\0content with newlines intact
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "src/foo.rs", "content": "fn main() {\n    println!(\"hi\");\n}\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
@@ -1381,7 +1334,7 @@ mod tests {
     #[test]
     fn test_parse_tool_calls_setfile_multiline() {
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "out.txt", "content": "line1\nline2\nline3\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
         assert_eq!(parts[0], "out.txt");
@@ -1481,25 +1434,25 @@ The answer is 42.";
 
     #[test]
     fn test_parse_json_readfile() {
-        let output = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "cat src/main.rs"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "readfile");
-        assert_eq!(calls[0].args, "src/main.rs");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args, "cat src/main.rs");
     }
 
     #[test]
     fn test_parse_json_readfile_with_lines() {
-        let output = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs", "start_line": 10, "end_line": 50}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "sed -n '10,50p' src/main.rs"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].args, "src/main.rs 10 50");
+        assert_eq!(calls[0].args, "sed -n '10,50p' src/main.rs");
     }
 
     #[test]
     fn test_parse_json_setfile() {
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "src/foo.rs", "content": "fn main() {}\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
@@ -1511,94 +1464,93 @@ The answer is 42.";
     fn test_parse_json_editfile_ignored() {
         // editfile is no longer a valid tool — should produce no calls
         let output = r#"{"tool_calls": [{"name": "editfile", "parameters": {"path": "src/lib.rs", "old_text": "old code", "new_text": "new code"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 0, "editfile should no longer be a valid tool");
     }
 
     #[test]
     fn test_parse_json_rg() {
-        let output = r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "fn main", "directory": "src/"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "rg 'fn main' src/"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        // rg now uses \x00 separator so multi-word patterns survive
-        assert_eq!(calls[0].args, "fn main\x00src/");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args, "rg 'fn main' src/");
     }
 
     #[test]
     fn test_parse_json_multiple_calls() {
         let output = r#"{"tool_calls": [
-            {"name": "readfile", "parameters": {"path": "src/main.rs"}},
-            {"name": "readfile", "parameters": {"path": "Cargo.toml"}}
+            {"name": "shell", "parameters": {"command": "cat src/main.rs"}},
+            {"name": "shell", "parameters": {"command": "cat Cargo.toml"}}
         ]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].args, "src/main.rs");
-        assert_eq!(calls[1].args, "Cargo.toml");
+        assert_eq!(calls[0].args, "cat src/main.rs");
+        assert_eq!(calls[1].args, "cat Cargo.toml");
     }
 
     #[test]
     fn test_parse_json_in_code_block() {
-        let output = "I'll read that file:\n```json\n{\"tool_calls\": [{\"name\": \"readfile\", \"parameters\": {\"path\": \"src/main.rs\"}}]}\n```";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = "I'll use shell:\n```json\n{\"tool_calls\": [{\"name\": \"shell\", \"parameters\": {\"command\": \"cat src/main.rs\"}}]}\n```";
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "readfile");
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
     fn test_parse_json_with_surrounding_text() {
-        let output = "Let me search for that pattern.\n{\"tool_calls\": [{\"name\": \"rg\", \"parameters\": {\"pattern\": \"TODO\", \"directory\": \".\"}}]}\nDone.";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = "Let me run that command.\n{\"tool_calls\": [{\"name\": \"shell\", \"parameters\": {\"command\": \"ls src/\"}}]}\nDone.";
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "rg");
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
     fn test_parse_json_empty_tool_calls() {
         let output = r#"{"tool_calls": []}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert!(calls.is_empty());
     }
 
     #[test]
     fn test_parse_json_plain_text_no_json() {
         let output = "The answer is 42. No tools needed.";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn test_parse_json_spawn_agent() {
-        let output = r#"{"tool_calls": [{"name": "spawn", "parameters": {"task_id": "search-docs", "description": "Search the docs for auth info"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+    fn test_parse_json_commit() {
+        let output = r#"{"tool_calls": [{"name": "commit", "parameters": {"message": "feat: add feature"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "spawn");
-        assert!(calls[0].args.contains("search-docs"));
-        assert!(calls[0].args.contains("Search the docs"));
+        assert_eq!(calls[0].name, "commit");
+        assert_eq!(calls[0].args, "feat: add feature");
     }
 
     #[test]
     fn test_parse_json_prose_with_braces_before_json() {
         // Model writes {approach 1} before the actual JSON — old parser grabbed wrong braces
-        let output = r#"I'll try {approach 1}: {"tool_calls": [{"name": "rg", "parameters": {"pattern": "main", "directory": "src/"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = r#"I'll try {approach 1}: {"tool_calls": [{"name": "shell", "parameters": {"command": "ls src/"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1, "Should find tool call despite prose braces");
-        assert_eq!(calls[0].name, "rg");
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
     fn test_parse_json_multiple_brace_pairs_before_json() {
         // Multiple {} pairs in prose before actual JSON
-        let output = r#"Step {1} then {2}: {"tool_calls": [{"name": "readfile", "parameters": {"path": "README.md"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let output = r#"Step {1} then {2}: {"tool_calls": [{"name": "shell", "parameters": {"command": "cat README.md"}}]}"#;
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1, "Should skip prose braces and find JSON");
-        assert_eq!(calls[0].name, "readfile");
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
     fn test_parse_json_with_escaped_quotes() {
         // JSON with escaped quotes inside string values
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "test.rs", "content": "let s = \"hello\";"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
     }
@@ -1632,9 +1584,9 @@ The answer is 42.";
     }
 
     #[test]
-    fn test_parse_blocked_tool_names_standard_all_ok() {
-        let output = r#"{"tool_calls": [{"name": "readfile", "parameters": {"path": "src/main.rs"}}]}"#;
-        let blocked = parse_blocked_tool_names(output, CapabilityProfile::Standard);
+    fn test_parse_blocked_tool_names_shellonly_tools_ok() {
+        let output = r#"{"tool_calls": [{"name": "commit", "parameters": {"message": "feat: test"}}]}"#;
+        let blocked = parse_blocked_tool_names(output, CapabilityProfile::ShellOnly);
         assert!(blocked.is_empty());
     }
 
@@ -1670,7 +1622,7 @@ The answer is 42.";
         {"name": "shell", "parameters": {"command": "cd /Users/banana/repos/fieldswings && cargo build --release --bin fields_wings", "description": "Building."}},
         {"name": "shell", "parameters": {"command": "cd /Users/banana/repos/fieldswings && cargo run --release --bin fields_wings", "description": "Testing."}}
     ]}"#;
-        let calls = parse_json_tool_calls(json, CapabilityProfile::Standard);
+        let calls = parse_json_tool_calls(json, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 5, "expected 5 tool calls, got {}", calls.len());
         for c in &calls { assert_eq!(c.name, "shell"); }
         assert_eq!(calls[0].description.as_deref(), Some("Removing old directory."));
@@ -1756,10 +1708,10 @@ The answer is 42.";
     }
 
     #[test]
-    fn test_parse_xml_setfile_in_standard() {
-        // setfile is valid in both Standard and ShellOnly profiles
+    fn test_parse_xml_setfile_in_shellonly() {
+        // setfile is valid in the ShellOnly profile
         let xml = "<tool>setfile</tool>\n<path>x.txt</path>\n<content>hello</content>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::Standard);
+        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
     }
@@ -1771,6 +1723,19 @@ The answer is 42.";
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "commit");
         assert_eq!(calls[0].args, "feat: add new tool");
+    }
+
+    #[test]
+    fn test_parse_xml_patchfile() {
+        let xml = "<tool>patchfile</tool>\n<path>src/main.rs</path>\n<start_line>10</start_line>\n<end_line>15</end_line>\n<new_text>fn run() {\n    todo!()\n}</new_text>\n<desc>Replace run function</desc>";
+        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "patchfile");
+        let parts: Vec<&str> = calls[0].args.splitn(4, '\x00').collect();
+        assert_eq!(parts[0], "src/main.rs");
+        assert_eq!(parts[1], "10");
+        assert_eq!(parts[2], "15");
+        assert!(parts[3].contains("fn run()"), "new_text should be preserved: {:?}", parts[3]);
     }
 
     #[test]
