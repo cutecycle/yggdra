@@ -13,6 +13,7 @@ make install               # copies binary to ~/.local/bin/yggdra
 ```
 
 Always run `cargo test --lib` after any change. Do not leave tests failing.
+After completing a task, run `make install` to ensure the updated binary is available in the path.
 
 ## Architecture
 

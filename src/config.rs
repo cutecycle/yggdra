@@ -12,20 +12,12 @@ pub struct AgentsConfig {
     pub params: ModelParams,
 }
 
-/// Tool capability profile — controls which tools are available to the agent.
-/// Not serialized — set at startup from CLI flag or binary name.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum CapabilityProfile {
-    #[default]
-    ShellOnly,
-}
-
 /// Application mode
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppMode {
     Ask,
-    Build,
+    Forever,
     Plan,
     One,
 }
@@ -40,7 +32,7 @@ impl std::fmt::Display for AppMode {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             AppMode::Ask => write!(f, "ask"),
-            AppMode::Build => write!(f, "build"),
+            AppMode::Forever => write!(f, "forever"),
             AppMode::Plan => write!(f, "plan"),
             AppMode::One => write!(f, "one"),
         }
@@ -52,7 +44,7 @@ impl std::str::FromStr for AppMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "ask" => Ok(AppMode::Ask),
-            "build" => Ok(AppMode::Build),
+            "forever" | "build" => Ok(AppMode::Forever),
             "plan" => Ok(AppMode::Plan),
             "one" => Ok(AppMode::One),
             _ => Err(format!("Unknown mode: {}", s)),
@@ -66,11 +58,22 @@ pub struct UISettings {
     /// Enable subtle vertical gradient background in message area
     #[serde(default = "default_true")]
     pub gradient_enabled: bool,
+    /// User theme preference: "dark", "light", or "auto"
+    pub theme: Option<String>,
+    /// Custom gradient start color as "r,g,b" string (optional)
+    pub gradient_start: Option<String>,
+    /// Custom gradient end color as "r,g,b" string (optional)
+    pub gradient_end: Option<String>,
 }
 
 impl Default for UISettings {
     fn default() -> Self {
-        Self { gradient_enabled: true }
+        Self { 
+            gradient_enabled: true,
+            theme: None,
+            gradient_start: None,
+            gradient_end: None,
+        }
     }
 }
 
@@ -92,47 +95,14 @@ pub struct Config {
     /// API key for OpenAI-compatible endpoints (optional, can also use env vars)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Knowledge index configuration
-    #[serde(default)]
-    pub knowledge_index: KnowledgeIndexSettings,
     /// Model sampling parameters
     #[serde(default)]
     pub params: ModelParams,
     /// UI visual settings
     #[serde(default)]
     pub ui_settings: UISettings,
-    /// Capability profile — not persisted, set at startup from binary name or --shell-only flag
-    #[serde(skip)]
-    pub profile: CapabilityProfile,
 }
 
-/// Knowledge index settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeIndexSettings {
-    /// Enable or disable knowledge indexing
-    #[serde(default = "default_knowledge_enabled")]
-    pub enabled: bool,
-    /// Size limit in GB (default 2GB)
-    #[serde(default = "default_knowledge_size_gb")]
-    pub size_limit_gb: f64,
-    /// Battery delay in milliseconds (default 100ms)
-    #[serde(default = "default_battery_delay_ms")]
-    pub battery_delay_ms: u64,
-}
-
-fn default_knowledge_enabled() -> bool { false }
-fn default_knowledge_size_gb() -> f64 { 0.02 } // 20MB default
-fn default_battery_delay_ms() -> u64 { 100 }
-
-impl Default for KnowledgeIndexSettings {
-    fn default() -> Self {
-        Self {
-            enabled: default_knowledge_enabled(),
-            size_limit_gb: default_knowledge_size_gb(),
-            battery_delay_ms: default_battery_delay_ms(),
-        }
-    }
-}
 
 /// Model sampling parameters — all fields optional so unset fields don't override Ollama defaults.
 /// Precedence (highest first): runtime override → config.json → AGENTS.md defaults.
@@ -352,11 +322,10 @@ struct FileConfig {
     tool_output_cap: Option<usize>,
     mode: Option<String>,
     api_key: Option<String>,
-    knowledge_index: Option<KnowledgeIndexSettings>,
     #[serde(default)]
     params: ModelParams,
     #[serde(default)]
-    ui_settings: Option<UISettings>,
+    ui_settings: UISettings,
 }
 
 /// Validate that an endpoint is a localhost/loopback address.
@@ -465,10 +434,8 @@ impl Default for Config {
             tool_output_cap: None,
             mode: AppMode::Plan,
             api_key: None,
-            knowledge_index: KnowledgeIndexSettings::default(),
             params: ModelParams::default(),
             ui_settings: UISettings::default(),
-            profile: CapabilityProfile::ShellOnly,
         }
     }
 }
@@ -501,11 +468,10 @@ impl Config {
             .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok());
 
-        let knowledge_index = file.knowledge_index.unwrap_or_default();
         let params = file.params;
-        let ui_settings = file.ui_settings.unwrap_or_default();
-
-        Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params, ui_settings, profile: CapabilityProfile::ShellOnly }
+        let ui_settings = file.ui_settings;
+        
+        Config { endpoint, model, context_window, tool_output_cap, mode, api_key, params, ui_settings }
     }
 
     /// Load config with smart model detection from Ollama.
@@ -551,10 +517,9 @@ impl Config {
             .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok());
 
-        let knowledge_index = file.knowledge_index.unwrap_or_default();
-        let ui_settings = file.ui_settings.unwrap_or_default();
-
-        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, api_key, knowledge_index, params: file.params, ui_settings, profile: CapabilityProfile::ShellOnly };
+        let ui_settings = file.ui_settings;
+        
+        let cfg = Config { endpoint, model, context_window, tool_output_cap, mode, api_key, params: file.params, ui_settings };
         (cfg, validated_client)
     }
 
@@ -717,7 +682,7 @@ mod tests {
 
     #[test]
     fn appmode_one_distinct_from_others() {
-        assert_ne!(AppMode::One, AppMode::Build);
+        assert_ne!(AppMode::One, AppMode::Forever);
         assert_ne!(AppMode::One, AppMode::Plan);
         assert_ne!(AppMode::One, AppMode::Ask);
     }

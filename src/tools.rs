@@ -1397,7 +1397,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Create a new registry: shell, setfile, patchfile, commit.
-    pub fn new(_profile: crate::config::CapabilityProfile) -> Self {
+    pub fn new() -> Self {
         let mut tools: std::collections::HashMap<String, Box<dyn Tool>> =
             std::collections::HashMap::new();
         tools.insert("shell".to_string(), Box::new(ShellTool) as Box<dyn Tool>);
@@ -1431,12 +1431,43 @@ impl ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::new(crate::config::CapabilityProfile::ShellOnly)
+        Self::new()
+    }
+}
+
+pub fn format_rust_code(code: &str) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("rustfmt")
+        .arg("--emit")
+        .arg("stdout")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return code.to_string(),
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(_) = stdin.write_all(code.as_bytes()) {
+            return code.to_string();
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+        _ => code.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1654,7 +1685,7 @@ mod tests {
 
     #[test]
     fn test_tool_registry() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
+        let registry = ToolRegistry::new();
         let tools = registry.list_tools();
 
         assert!(tools.contains(&"shell"));
@@ -1752,7 +1783,7 @@ mod tests {
 
     #[test]
     fn test_registry_unknown_tool() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
+        let registry = ToolRegistry::new();
         let result = registry.execute("nonexistent", "args");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
@@ -1826,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_tool_registry_includes_patchfile() {
-        let registry = ToolRegistry::new(crate::config::CapabilityProfile::ShellOnly);
+        let registry = ToolRegistry::new();
         let tools = registry.list_tools();
         assert!(
             tools.contains(&"patchfile"),

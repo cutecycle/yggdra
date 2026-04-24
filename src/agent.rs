@@ -4,7 +4,7 @@
 use crate::tools::ToolRegistry;
 use crate::steering::SteeringDirective;
 use crate::ollama::{OllamaClient, OllamaMessage, StreamEvent};
-use crate::config::{AppMode, CapabilityProfile};
+use crate::config::AppMode;
 use crate::sysinfo::SystemInfo;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
@@ -75,10 +75,8 @@ pub fn is_hallucinated_output(text: &str) -> bool {
 }
 
 /// Tool descriptions in XML format (used in the system prompt).
-pub fn json_tool_descriptions(profile: crate::config::CapabilityProfile) -> String {
-    use crate::config::CapabilityProfile;
-    if profile == CapabilityProfile::ShellOnly {
-        return r#"TOOL FORMAT — XML tags, content is always literal (no escaping needed):
+pub fn json_tool_descriptions() -> String {
+    r#"TOOL FORMAT — XML tags, content is always literal (no escaping needed):
 
 Run a shell command:
 <tool>shell</tool>
@@ -107,105 +105,27 @@ Optional tags on shell (add after <desc>):
 
 THINK: reason inside <think>...</think> before acting — stripped before execution.
 
-Example:
+Rules:
+- Output ONLY XML tool tags. No prose before or after the tags.
+- Multiple tool calls: output them back-to-back with no separators.
+- Never wrap tags in ``` fences.
+
+Example (single call):
 
 <think>I should check what files exist before building.</think>
 <tool>shell</tool>
 <command>cargo build --release 2>&1 | tail -30</command>
-<desc>Building release binary.</desc>"#.to_string();
-    }
-    r#"Available Tools (use exact names):
+<desc>Building release binary.</desc>
 
-1. "rg" — Search files with ripgrep
-   Parameters: {"pattern": "string (regex)", "directory": "string"}
-   Examples: {"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}
-   directory must be a specific path
+Example (two calls back-to-back):
 
-2. "exec" — Execute a single command: git, cargo, make, find, jq, node, python, ls, etc.
-   Parameters: {"command": "string (command name + arguments)"}
-   Examples: {"name": "exec", "parameters": {"command": "cargo test --lib"}}
-             {"name": "exec", "parameters": {"command": "git log --oneline"}}
-             {"name": "exec", "parameters": {"command": "find . -name '*.rs' -type f"}}
-   exec runs directly — use shell for pipes, redirects, and chains.
-   exec accepts bare names via PATH (git, cargo, python3); use shell for sh -c pipelines.
-
-3. "shell" — Run a command via sh -c (supports pipes, redirects, chains)
-   Parameters: {"command": "string (any sh-compatible command)", "returnlines": "string (optional) — line range e.g. \"1-50\" or \"51-100\" or \"50\" (first 50 lines). Header shows total."}
-   Examples: {"name": "shell", "parameters": {"command": "git log --oneline | head -5"}}
-             {"name": "shell", "parameters": {"command": "cat src/main.rs", "returnlines": "1-80"}}
-             {"name": "shell", "parameters": {"command": "cargo build && cargo test"}}
-             {"name": "shell", "parameters": {"command": "find . -name '*.rs' | xargs wc -l"}}
-   Use shell whenever you need: pipes (|), redirects (> >>), AND/OR chains (&& ||)
-   macOS sed note: always use `sed -i ''` (with empty string) not just `sed -i`.
-   For multi-line/complex replacements prefer: perl -pi -e 's/old/new/g' file
-
-4. "readfile" — Read a single file
-   Parameters: {"path": "string (exact file path)", "start_line": "number (optional)", "end_line": "number (optional)", "search": "string (optional — filter to matching lines only)"}
-   Examples: {"name": "readfile", "parameters": {"path": "README.md"}}
-             {"name": "readfile", "parameters": {"path": "src/main.rs", "start_line": 10, "end_line": 50}}
-             {"name": "readfile", "parameters": {"path": "src/main.rs", "search": "fn main"}}
-   For multiple files or globs, use exec with find instead.
-
-5. "setfile" — Create or fully overwrite a file; auto-commits on write (no separate commit needed)
-   Parameters: {"path": "string", "content": "string"}
-   Examples: {"name": "setfile", "parameters": {"path": "file.txt", "content": "hello"}}
-   For surgical edits: patchfile (preferred — line-range replace, requires manual commit).
-
-6. "patchfile" — **PREFERRED** way to modify existing files: replace a line range by number
-   Parameters: {"path": "string", "start_line": number, "end_line": number, "new_text": "string"}
-   Examples: {"name": "patchfile", "parameters": {"path": "src/main.rs", "start_line": 42, "end_line": 47, "new_text": "fn run() {\n    todo!()\n}"}}
-   WORKFLOW: readfile (note line numbers) → patchfile (replace that exact range). No need to reproduce the old text.
-   For full rewrites or new files: setfile.
-
-7. "commit" — Create a git commit (required after every file change)
-   Parameters: {"message": "string"}
-   Examples: {"name": "commit", "parameters": {"message": "feat(ui): add /stats command to display session metrics"}}
-   After setfile, a commit is automatic. After patchfile, immediately follow with a commit.
-   Commit message explains WHAT changed and WHY (not just "update file").
-   One logical change per commit.
-
-8. "tellhuman" — Send a conversational reply or status update to the user (no side effects)
-   Parameters: {"message": "string"}
-   Examples: {"name": "tellhuman", "parameters": {"message": "All tests pass — the fix is complete."}}
-             {"name": "tellhuman", "parameters": {"message": "I can't find that file. Can you double-check the path?"}}
-   Use this for: conversational responses, clarifying questions, status summaries, or any time you want
-   to communicate with the user without performing work. Prefer this over bare prose replies.
-   Also available as an optional field on any other tool call for combined message + action.
-
-9. "python" — Run a Python script
-   Parameters: {"script_path": "string"}
-   Examples: {"name": "python", "parameters": {"script_path": "script.py"}}
-
-10. "ruste" — Compile and run Rust code
-    Parameters: {"rust_file_path": "string"}
-    Examples: {"name": "ruste", "parameters": {"rust_file_path": "main.rs"}}
-
-11. "think" — Record your current thought in .yggdra/thought.md (required before every other tool call)
-    Parameters: {"thought": "string"}
-    Examples: {"name": "think", "parameters": {"thought": "I need to read src/main.rs to find the entry point."}}
-    Use this before every other tool call. One sentence: what you are about to do and why.
-    The file is overwritten each time — it is your single active thought, not a log.
-
-12. "spawn" — Two uses depending on parameters:
-    A) COMMAND: run a command directly (like exec). Use "command" parameter.
-       Parameters: {"command": "string"}
-       Examples: {"name": "spawn", "parameters": {"command": "cargo test --lib"}}
-                 {"name": "spawn", "parameters": {"command": "ls -la"}}
-    B) SUBAGENT: spawn a parallel subagent to handle a subtask autonomously. Use "task_id" + "description".
-       Parameters: {"task_id": "string", "description": "string"}
-       Examples: {"name": "spawn", "parameters": {"task_id": "write-tests", "description": "Write unit tests for src/tools.rs"}}
-                 {"name": "spawn", "parameters": {"task_id": "build-check", "description": "Run cargo build and report errors"}}
-    Subagents run in parallel — spawn multiple for async flow, then collect results.
-
-exec and spawn (command form) both accept bare names via PATH (git, cargo, python3); use shell for sh -c pipelines.
-
-Every tool response begins with one sentence explaining what you are doing and why.
-Write the explanation FIRST, then the JSON on the next line.
-Example:
-  Reading the game loop to understand the current structure.
-  {"tool_calls": [{"name": "readfile", "parameters": {"path": "src/game_loop.rs"}}]}"#.to_string()
+<tool>shell</tool>
+<command>echo one</command>
+<desc>First step.</desc>
+<tool>shell</tool>
+<command>echo two</command>
+<desc>Second step.</desc>"#.to_string()
 }
-
 
 /// Fix invalid JSON escape sequences emitted by models (e.g. `\&`, `\(`, `\s`).
 /// JSON only allows: `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`.
@@ -232,7 +152,7 @@ fn sanitize_json_escapes(s: &str) -> String {
 
 /// Parse JSON tool calls from model output → Vec<ToolCall>.
 /// Robust extraction (finds JSON in code blocks or raw), strict schema validation.
-pub fn parse_json_tool_calls(output: &str, profile: CapabilityProfile) -> Vec<ToolCall> {
+pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
     // Try to find JSON: first in ```json blocks, then raw
     let candidate = extract_json_candidate(output);
     let json_str = match candidate {
@@ -271,9 +191,8 @@ pub fn parse_json_tool_calls(output: &str, profile: CapabilityProfile) -> Vec<To
         };
         
         // Validate tool name against the active capability profile
-        if !is_valid_tool(&name, profile) {
-            eprintln!("⚠️  Tool '{}' is not available in {} profile — skipping", name,
-                if profile == CapabilityProfile::ShellOnly { "shell-only" } else { "standard" });
+        if !is_valid_tool(&name) {
+            eprintln!("⚠️  Tool '{}' is not available in shell-only profile — skipping", name);
             continue;
         }
         
@@ -441,16 +360,8 @@ fn extract_balanced_brackets(s: &str) -> Option<String> {
     }
     None
 }
-fn is_valid_tool(name: &str, profile: crate::config::CapabilityProfile) -> bool {
-    use crate::config::CapabilityProfile;
-    if profile == CapabilityProfile::ShellOnly {
-        return matches!(name, "shell" | "setfile" | "patchfile" | "commit");
-    }
-    matches!(
-        name,
-        "rg" | "exec" | "shell" | "readfile" | "setfile" | "patchfile" | "commit"
-            | "python" | "ruste" | "spawn" | "set_params" | "think"
-    )
+fn is_valid_tool(name: &str) -> bool {
+    matches!(name, "shell" | "setfile" | "patchfile" | "commit")
 }
 
 /// Validate tool parameters and return warning if problematic.
@@ -587,7 +498,7 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
 ///   <tellhuman>message</tellhuman>     <!-- optional -->
 ///
 /// Multiple tool calls = repeat the block. Content is always literal (no escaping needed).
-pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolCall> {
+pub fn parse_xml_tool_calls(text: &str) -> Vec<ToolCall> {
     fn extract_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
         let open = format!("<{}>", tag);
         let close = format!("</{}>", tag);
@@ -629,13 +540,13 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
             "cargo", "git", "make", "jq", "bat", "tree", "sh", "bash",
         ];
         let (tool_name, remap_prefix): (String, Option<String>) =
-            if !is_valid_tool(&raw_tool_name, profile) && UNIX_COMMANDS.contains(&raw_tool_name.as_str()) {
+            if !is_valid_tool(&raw_tool_name) && UNIX_COMMANDS.contains(&raw_tool_name.as_str()) {
                 ("shell".to_string(), Some(raw_tool_name.clone()))
             } else {
                 (raw_tool_name.clone(), None)
             };
 
-        if !is_valid_tool(&tool_name, profile) {
+        if !is_valid_tool(&tool_name) {
             search = &after_open[tool_end + "</tool>".len()..];
             continue;
         }
@@ -707,9 +618,8 @@ pub fn parse_xml_tool_calls(text: &str, profile: CapabilityProfile) -> Vec<ToolC
 }
 
 /// Parse tool calls from LLM output — XML first, then JSON, then prose backtick fallback.
-pub fn parse_tool_calls(output: &str, profile: CapabilityProfile) -> Vec<ToolCall> {
-    // Now exclusively using XML format for maximum reliability and a clean harness.
-    let xml_calls = parse_xml_tool_calls(output, profile);
+pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
+    let xml_calls = parse_xml_tool_calls(output);
     if !xml_calls.is_empty() { return xml_calls; }
 
     // Fallback to prose backticks for the absolute last resort
@@ -763,7 +673,7 @@ fn extract_backtick_command(text: &str) -> Option<String> {
 
 /// Return the names of tools that the model attempted to call but are blocked by the profile.
 /// Used to inject corrective error messages when a model uses a forbidden tool.
-pub fn parse_blocked_tool_names(text: &str, profile: CapabilityProfile) -> Vec<String> {
+pub fn parse_blocked_tool_names(text: &str) -> Vec<String> {
     let json_str = match extract_json_candidate(text) {
         Some(s) => s,
         None => return Vec::new(),
@@ -779,7 +689,7 @@ pub fn parse_blocked_tool_names(text: &str, profile: CapabilityProfile) -> Vec<S
     tool_calls
         .iter()
         .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(str::to_string))
-        .filter(|name| !is_valid_tool(name, profile))
+        .filter(|name| !is_valid_tool(name))
         .collect()
 }
 
@@ -792,7 +702,6 @@ pub struct AgentConfig {
     pub max_recursion_depth: usize,
     pub current_depth: usize,
     pub app_mode: AppMode,
-    pub profile: crate::config::CapabilityProfile,
     /// Optional channel to forward tokens live as the agent streams
     pub token_tx: Option<mpsc::UnboundedSender<String>>,
     /// Live project file listing (size + mtime + path). Injected into system prompt.
@@ -808,7 +717,6 @@ impl AgentConfig {
             max_recursion_depth: 10,
             current_depth: 0,
             app_mode: AppMode::Plan,
-            profile: crate::config::CapabilityProfile::ShellOnly,
             token_tx: None,
             project_context: String::new(),
         }
@@ -834,11 +742,6 @@ impl AgentConfig {
         self
     }
 
-    pub fn with_profile(mut self, profile: crate::config::CapabilityProfile) -> Self {
-        self.profile = profile;
-        self
-    }
-
     pub fn with_project_context(mut self, ctx: impl Into<String>) -> Self {
         self.project_context = ctx.into();
         self
@@ -857,7 +760,7 @@ pub struct Agent {
 impl Agent {
     /// Create new agent with config and Ollama client
     pub async fn new(config: AgentConfig, client: OllamaClient) -> Result<Self> {
-        let registry = ToolRegistry::new(config.profile);
+        let registry = ToolRegistry::new();
         Ok(Self {
             config,
             client,
@@ -873,8 +776,8 @@ impl Agent {
     }
 
     /// Parse tool calls from LLM output (delegates to module-level function)
-    fn parse_tool_calls(output: &str, profile: CapabilityProfile) -> Vec<ToolCall> {
-        parse_tool_calls(output, profile)
+    fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
+        parse_tool_calls(output)
     }
 
     /// Get current tool output truncation limit (unlimited — no cap applied)
@@ -905,8 +808,6 @@ impl Agent {
     }
 
     fn system_prompt_with_steering(&self) -> String {
-        use crate::config::CapabilityProfile;
-        let profile = self.config.profile;
         let root_line = crate::sandbox::project_root()
             .map(|p| format!("PROJECT ROOT: {}", p.display()))
             .unwrap_or_else(|| "PROJECT ROOT: (current directory)".to_string());
@@ -921,74 +822,37 @@ impl Agent {
         };
         let sysinfo = format!("{}\n{}", sysinfo, time_str);
 
-        let tools = json_tool_descriptions(profile);
+        let tools = json_tool_descriptions();
 
         let personal_instructions = std::fs::read_to_string(std::env::var("HOME").unwrap_or_default() + "/AGENTS.md")
             .map(|s| format!("\n\n### PERSONAL INSTRUCTIONS\n{}", s))
             .unwrap_or_default();
 
-        let prompt = if profile == CapabilityProfile::ShellOnly {
-            format!(
-                "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
-                 Use shell for all file operations, builds, and commits.\n\
-                 \n\
-                 {sysinfo}\n\
-                 \n\
-                 {root}\n\
-                 Stay within this directory. Use relative paths.\n\
-                 \n\
-                 {tools}\n\
-                 \n\
-                 DIRECTIVES:\n\
-                 - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
-                 - Constraints: Keep files < 200 lines. Use async for long tasks.\n\
-                 - Completion: Summarize results when finished.\n\
-                 \n\
-                 {project_ctx}\n\
-                 {personal_instructions}\n\
-                 The file tree is live.",
-                sysinfo = sysinfo,
-                root    = root_line,
-                tools   = tools,
-                project_ctx = self.config.project_context,
-                personal_instructions = personal_instructions,
-            )
-        } else {
-            let one_mode = if self.config.app_mode == AppMode::One {
-                "\n\nONE MODE: Use parallel subagents (spawn) for decomposition. Emit </done> when fully complete.\n"
-            } else {
-                ""
-            };
-
-            format!(
-                "You are an agentic assistant with tool access and subagent spawning.\n\
-                 \n\
-                 {sysinfo}\n\
-                 \n\
-                 {root}\n\
-                 All files must stay within this project root. Use relative paths.\n\
-                 \n\
-                 {tools}\
-                 {one_mode}\n\
-                 \n\
-                 KNOWLEDGE BASE: Search .yggdra/knowledge/ using rg before asking.\n\
-                 \n\
-                 DIRECTIVES:\n\
-                 - Thought: Record intent to .yggdra/thought.md before every tool call.\n\
-                 - Edits: readfile -> setfile -> commit.\n\
-                 - Limits: Files < 200 lines. Tool output capped at 500 chars.\n\
-                 - Completion: Summarize and emit </done> when task is finished.\n\
-                 \n\
-                 {project_ctx}{personal_instructions}\n\
-                 The file tree is live.",
-                sysinfo = sysinfo,
-                root    = root_line,
-                tools   = tools,
-                one_mode = one_mode,
-                project_ctx = self.config.project_context,
-                personal_instructions = personal_instructions,
-            )
-        };
+        let prompt = format!(
+            "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
+             Use shell for all file operations, builds, and commits.\n\
+             \n\
+             {sysinfo}\n\
+             \n\
+             {root}\n\
+             Stay within this directory. Use relative paths.\n\
+             \n\
+             {tools}\n\
+             \n\
+             DIRECTIVES:\n\
+             - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
+             - Constraints: Keep files < 200 lines. Use async for long tasks.\n\
+             - Completion: Summarize results when finished.\n\
+             \n\
+             {project_ctx}\n\
+             {personal_instructions}\n\
+             The file tree is live.",
+            sysinfo = sysinfo,
+            root    = root_line,
+            tools   = tools,
+            project_ctx = self.config.project_context,
+            personal_instructions = personal_instructions,
+        );
         SteeringDirective::custom(&prompt).format_for_system_prompt()
     }
 
@@ -1085,7 +949,7 @@ impl Agent {
             }
 
             // Check for tool calls (no subagent spawning here)
-            let tool_calls = parse_json_tool_calls(&llm_output, self.config.profile);
+            let tool_calls = parse_json_tool_calls(&llm_output);
 
             // No tool calls = task complete (model gave a plain response)
             if tool_calls.is_empty() {
@@ -1193,7 +1057,7 @@ impl Agent {
             }
 
             // Check for tool calls (exclusive XML format)
-            let tool_calls = parse_xml_tool_calls(&llm_output, self.config.profile);
+            let tool_calls = parse_xml_tool_calls(&llm_output);
             let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
             
             // Disable subagent spawning if recursion depth limit reached
@@ -1299,7 +1163,7 @@ mod tests {
     #[test]
     fn test_parse_no_tool_calls() {
         let output = "This is just text without any tools";
-        let calls = parse_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_tool_calls(output);
         assert_eq!(calls.len(), 0);
     }
 
@@ -1314,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_has_steering() {
-        let prompt = json_tool_descriptions(crate::config::CapabilityProfile::ShellOnly);
+        let prompt = json_tool_descriptions();
         // Should contain tool instructions without wrapper tags
         assert!(prompt.contains("tools") || prompt.contains("Tools") || prompt.contains("TOOL"));
     }
@@ -1323,7 +1187,7 @@ mod tests {
     fn test_parse_tool_calls_setfile_preserves_content() {
         // JSON setfile: path\0content with newlines intact
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "src/foo.rs", "content": "fn main() {\n    println!(\"hi\");\n}\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
@@ -1334,7 +1198,7 @@ mod tests {
     #[test]
     fn test_parse_tool_calls_setfile_multiline() {
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "out.txt", "content": "line1\nline2\nline3\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
         assert_eq!(parts[0], "out.txt");
@@ -1435,7 +1299,7 @@ The answer is 42.";
     #[test]
     fn test_parse_json_readfile() {
         let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "cat src/main.rs"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "cat src/main.rs");
@@ -1444,7 +1308,7 @@ The answer is 42.";
     #[test]
     fn test_parse_json_readfile_with_lines() {
         let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "sed -n '10,50p' src/main.rs"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].args, "sed -n '10,50p' src/main.rs");
     }
@@ -1452,7 +1316,7 @@ The answer is 42.";
     #[test]
     fn test_parse_json_setfile() {
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "src/foo.rs", "content": "fn main() {}\n"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
         let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
@@ -1464,14 +1328,14 @@ The answer is 42.";
     fn test_parse_json_editfile_ignored() {
         // editfile is no longer a valid tool — should produce no calls
         let output = r#"{"tool_calls": [{"name": "editfile", "parameters": {"path": "src/lib.rs", "old_text": "old code", "new_text": "new code"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 0, "editfile should no longer be a valid tool");
     }
 
     #[test]
     fn test_parse_json_rg() {
         let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "rg 'fn main' src/"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "rg 'fn main' src/");
@@ -1483,7 +1347,7 @@ The answer is 42.";
             {"name": "shell", "parameters": {"command": "cat src/main.rs"}},
             {"name": "shell", "parameters": {"command": "cat Cargo.toml"}}
         ]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].args, "cat src/main.rs");
         assert_eq!(calls[1].args, "cat Cargo.toml");
@@ -1492,7 +1356,7 @@ The answer is 42.";
     #[test]
     fn test_parse_json_in_code_block() {
         let output = "I'll use shell:\n```json\n{\"tool_calls\": [{\"name\": \"shell\", \"parameters\": {\"command\": \"cat src/main.rs\"}}]}\n```";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
     }
@@ -1500,7 +1364,7 @@ The answer is 42.";
     #[test]
     fn test_parse_json_with_surrounding_text() {
         let output = "Let me run that command.\n{\"tool_calls\": [{\"name\": \"shell\", \"parameters\": {\"command\": \"ls src/\"}}]}\nDone.";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
     }
@@ -1508,21 +1372,21 @@ The answer is 42.";
     #[test]
     fn test_parse_json_empty_tool_calls() {
         let output = r#"{"tool_calls": []}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert!(calls.is_empty());
     }
 
     #[test]
     fn test_parse_json_plain_text_no_json() {
         let output = "The answer is 42. No tools needed.";
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert!(calls.is_empty());
     }
 
     #[test]
     fn test_parse_json_commit() {
         let output = r#"{"tool_calls": [{"name": "commit", "parameters": {"message": "feat: add feature"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "commit");
         assert_eq!(calls[0].args, "feat: add feature");
@@ -1532,7 +1396,7 @@ The answer is 42.";
     fn test_parse_json_prose_with_braces_before_json() {
         // Model writes {approach 1} before the actual JSON — old parser grabbed wrong braces
         let output = r#"I'll try {approach 1}: {"tool_calls": [{"name": "shell", "parameters": {"command": "ls src/"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1, "Should find tool call despite prose braces");
         assert_eq!(calls[0].name, "shell");
     }
@@ -1541,7 +1405,7 @@ The answer is 42.";
     fn test_parse_json_multiple_brace_pairs_before_json() {
         // Multiple {} pairs in prose before actual JSON
         let output = r#"Step {1} then {2}: {"tool_calls": [{"name": "shell", "parameters": {"command": "cat README.md"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1, "Should skip prose braces and find JSON");
         assert_eq!(calls[0].name, "shell");
     }
@@ -1550,7 +1414,7 @@ The answer is 42.";
     fn test_parse_json_with_escaped_quotes() {
         // JSON with escaped quotes inside string values
         let output = r#"{"tool_calls": [{"name": "setfile", "parameters": {"path": "test.rs", "content": "let s = \"hello\";"}}]}"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
     }
@@ -1572,21 +1436,21 @@ The answer is 42.";
     #[test]
     fn test_parse_blocked_tool_names_shell_only() {
         let output = r#"{"tool_calls": [{"name": "rg", "parameters": {"pattern": "TODO", "directory": "src/"}}]}"#;
-        let blocked = parse_blocked_tool_names(output, CapabilityProfile::ShellOnly);
+        let blocked = parse_blocked_tool_names(output);
         assert_eq!(blocked, vec!["rg"]);
     }
 
     #[test]
     fn test_parse_blocked_tool_names_shell_allowed() {
         let output = r#"{"tool_calls": [{"name": "shell", "parameters": {"command": "cat README.md"}}]}"#;
-        let blocked = parse_blocked_tool_names(output, CapabilityProfile::ShellOnly);
+        let blocked = parse_blocked_tool_names(output);
         assert!(blocked.is_empty());
     }
 
     #[test]
     fn test_parse_blocked_tool_names_shellonly_tools_ok() {
         let output = r#"{"tool_calls": [{"name": "commit", "parameters": {"message": "feat: test"}}]}"#;
-        let blocked = parse_blocked_tool_names(output, CapabilityProfile::ShellOnly);
+        let blocked = parse_blocked_tool_names(output);
         assert!(blocked.is_empty());
     }
 
@@ -1597,7 +1461,7 @@ The answer is 42.";
             {"name": "readfile", "parameters": {"path": "README.md"}},
             {"name": "shell", "parameters": {"command": "ls"}}
         ]}"#;
-        let blocked = parse_blocked_tool_names(output, CapabilityProfile::ShellOnly);
+        let blocked = parse_blocked_tool_names(output);
         assert_eq!(blocked.len(), 2);
         assert!(blocked.contains(&"rg".to_string()));
         assert!(blocked.contains(&"readfile".to_string()));
@@ -1607,7 +1471,7 @@ The answer is 42.";
     fn test_parse_json_bare_array_no_wrapper() {
         // Model emits raw array without the {"tool_calls":...} wrapper
         let output = r#"[{"name": "shell", "parameters": {"command": "sed -n '1,160p' src/level_gen.rs", "description": "Reading"}}]"#;
-        let calls = parse_json_tool_calls(output, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(output);
         assert_eq!(calls.len(), 1, "expected bare array to be accepted");
         assert_eq!(calls[0].name, "shell");
     }
@@ -1622,7 +1486,7 @@ The answer is 42.";
         {"name": "shell", "parameters": {"command": "cd /Users/banana/repos/fieldswings && cargo build --release --bin fields_wings", "description": "Building."}},
         {"name": "shell", "parameters": {"command": "cd /Users/banana/repos/fieldswings && cargo run --release --bin fields_wings", "description": "Testing."}}
     ]}"#;
-        let calls = parse_json_tool_calls(json, CapabilityProfile::ShellOnly);
+        let calls = parse_json_tool_calls(json);
         assert_eq!(calls.len(), 5, "expected 5 tool calls, got {}", calls.len());
         for c in &calls { assert_eq!(c.name, "shell"); }
         assert_eq!(calls[0].description.as_deref(), Some("Removing old directory."));
@@ -1636,7 +1500,7 @@ The answer is 42.";
         let xml = r#"<tool>shell</tool>
 <command>cargo build --release 2>&1 | tail -20</command>
 <desc>Building release binary.</desc>"#;
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "cargo build --release 2>&1 | tail -20");
@@ -1651,7 +1515,7 @@ The answer is 42.";
 <desc>Running tests async.</desc>
 <mode>async</mode>
 <task_id>run-tests</task_id>"#;
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].async_mode);
         assert_eq!(calls[0].async_task_id.as_deref(), Some("run-tests"));
@@ -1663,7 +1527,7 @@ The answer is 42.";
 <command>echo done</command>
 <desc>Notifying user.</desc>
 <tellhuman>Build complete! Check output above.</tellhuman>"#;
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tellhuman.as_deref(), Some("Build complete! Check output above."));
     }
@@ -1677,7 +1541,7 @@ The answer is 42.";
 <tool>shell</tool>
 <command>printf 'fn main() {}\n' > src/main.rs</command>
 <desc>Writing main.rs.</desc>"#;
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 2, "expected 2 XML tool calls, got {}", calls.len());
         assert_eq!(calls[0].args, "mkdir -p src/game");
         assert_eq!(calls[1].args, "printf 'fn main() {}\\n' > src/main.rs");
@@ -1689,7 +1553,7 @@ The answer is 42.";
 <command>cat src/main.rs</command>
 <desc>Reading main.</desc>
 <returnlines>1-50</returnlines>"#;
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].args.contains('\x00'), "returnlines not encoded in args");
         assert!(calls[0].args.ends_with("1-50"));
@@ -1698,7 +1562,7 @@ The answer is 42.";
     #[test]
     fn test_parse_xml_setfile() {
         let xml = "<tool>setfile</tool>\n<path>src/main.rs</path>\n<content>\nfn main() {}\n</content>\n<desc>Create main</desc>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
         let mut parts = calls[0].args.splitn(2, '\x00');
@@ -1711,7 +1575,7 @@ The answer is 42.";
     fn test_parse_xml_setfile_in_shellonly() {
         // setfile is valid in the ShellOnly profile
         let xml = "<tool>setfile</tool>\n<path>x.txt</path>\n<content>hello</content>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "setfile");
     }
@@ -1719,7 +1583,7 @@ The answer is 42.";
     #[test]
     fn test_parse_xml_commit() {
         let xml = "<tool>commit</tool>\n<message>feat: add new tool</message>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "commit");
         assert_eq!(calls[0].args, "feat: add new tool");
@@ -1728,7 +1592,7 @@ The answer is 42.";
     #[test]
     fn test_parse_xml_patchfile() {
         let xml = "<tool>patchfile</tool>\n<path>src/main.rs</path>\n<start_line>10</start_line>\n<end_line>15</end_line>\n<new_text>fn run() {\n    todo!()\n}</new_text>\n<desc>Replace run function</desc>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "patchfile");
         let parts: Vec<&str> = calls[0].args.splitn(4, '\x00').collect();
@@ -1742,7 +1606,7 @@ The answer is 42.";
     fn test_parse_xml_unix_command_remapped_to_shell() {
         // Model erroneously uses `cat` as a tool name instead of `shell`
         let xml = "<tool>cat</tool>\n<command>src/main.rs</command>\n<desc>read file</desc>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "cat src/main.rs");
@@ -1752,7 +1616,7 @@ The answer is 42.";
     fn test_parse_xml_unix_command_no_command_tag() {
         // No <command> tag — just the remapped name becomes the command
         let xml = "<tool>ls</tool>\n<desc>list files</desc>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].args, "ls");
@@ -1762,13 +1626,13 @@ The answer is 42.";
     fn test_parse_xml_shell_names_remapped() {
         // "sh" and "bash" should be remapped to "shell" tool
         let xml_sh = "<tool>sh</tool>\n<command>ls</command>\n<desc>test</desc>";
-        let calls_sh = parse_xml_tool_calls(xml_sh, CapabilityProfile::ShellOnly);
+        let calls_sh = parse_xml_tool_calls(xml_sh);
         assert_eq!(calls_sh.len(), 1);
         assert_eq!(calls_sh[0].name, "shell");
         assert_eq!(calls_sh[0].args, "sh ls");
 
         let xml_bash = "<tool>bash</tool>\n<command>ls</command>\n<desc>test</desc>";
-        let calls_bash = parse_xml_tool_calls(xml_bash, CapabilityProfile::ShellOnly);
+        let calls_bash = parse_xml_tool_calls(xml_bash);
         assert_eq!(calls_bash.len(), 1);
         assert_eq!(calls_bash[0].name, "shell");
         assert_eq!(calls_bash[0].args, "bash ls");
@@ -1777,7 +1641,7 @@ The answer is 42.";
     #[test]
     fn test_parse_xml_unknown_tool_still_skipped() {
         let xml = "<tool>foobar</tool>\n<command>do stuff</command>";
-        let calls = parse_xml_tool_calls(xml, CapabilityProfile::ShellOnly);
+        let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 0);
     }
 

@@ -1,12 +1,10 @@
 # 🌳 yggdra
 
-**Your local LLM just learned how to use tools.**
-
-Yggdra is an airgapped agentic TUI — a tiny Rust app that connects to
+Yggdra is an airgapped agentic TUI — a Rust app that connects to
 [Ollama](https://ollama.ai), gives your model a toolbox (ripgrep, git, python,
-file editing, even nested sub-agents), and lets it *do things* on your
+file editing, even nested sub-agents), and lets it operate on your
 filesystem. No cloud. No API keys. No phoning home. Just you, a terminal, and
-a surprisingly capable local model.
+a local model.
 
 ```
 ┌──────────────────────────────── yggdra ─────────────────────────────────┐
@@ -30,11 +28,8 @@ a surprisingly capable local model.
 Most agentic coding tools need the cloud. Yggdra doesn't. It's built for the
 scenario where you *can't* — or *won't* — send your code to someone else's
 servers. Plug in an Ollama instance (local or on your tailnet), point it at a
-project, and let it work.
-
-It's also just… nice? The TUI is clean, sessions persist, and the model can
-spawn sub-agents to parallelize work. It feels like pair programming with
-someone who never gets tired and never judges your variable names.
+project, and let it work. The TUI is clean, sessions persist, and the model can
+spawn sub-agents to parallelize work.
 
 ---
 
@@ -76,15 +71,15 @@ One → Ask.
 
 ## The toolbox
 
-The model doesn't just talk — it acts. All local, no network:
+Available tools (all local, no network):
 
 | Tool | What it does |
 |------|-------------|
 | **rg** | Ripgrep search across files |
-| **exec** | Run local commands (ls, cat, etc. — no network binaries allowed) |
-| **shell** | Run a shell command (restricted profile available via `--shell` / `/shell`) |
-| **editfile** | Read and write files (line-range edits) |
-| **setfile** | Full-file overwrite — git-tracked, the right tool for whole-file rewrites |
+| **exec** | Run local commands (PATH-resolved, no network binaries) |
+| **shell** | Run a shell command (sh -c wrapper) |
+| **setfile** | Write entire file — creates if missing, git-tracked |
+| **patchfile** | Line-range replacement (targeted patch without full-file overwrite) |
 | **commit** | Stage and commit with git |
 | **python** | Execute Python snippets |
 | **ruste** | Compile and run Rust snippets |
@@ -99,7 +94,7 @@ Results come back as `[TOOL_OUTPUT: name = ...]` and the model keeps going.
 
 The model can spawn child agents to handle subtasks in parallel — up to 10
 levels deep. Each sub-agent gets the same tools (minus the ability to spawn
-further agents, to prevent recursion nightmares).
+further agents, to prevent infinite recursion).
 
 ---
 
@@ -130,7 +125,7 @@ across 73 categories (Rust docs, Godot tutorials, spacecraft systems, whatever
 you've curated).
 
 The model searches it with `rg` like any other directory. No indexing server,
-no vector DB, just grep and vibes.
+no vector DB, just rg.
 
 ---
 
@@ -189,11 +184,10 @@ airgapped.
 
 ## Slash commands
 
-The usual: `/help`, `/models`, `/quit`. New in 0.2.0:
-
+- `/help`, `/models`, `/quit`
 - `/one` — switch to One mode for a single autonomous task
 - `/abort` — kill stuck streams, async tasks, and in-flight tool execution
-- `/shell` — switch to ShellOnly capability profile (shell + setfile + commit)
+- `/shell CMD` — run a shell command inline without going through the agent
 - `/test_notification` — fire a test OS notification to verify your setup
 
 ### macOS notifications
@@ -210,10 +204,7 @@ Run `/test_notification` inside yggdra to confirm.
 
 ## Nice touches
 
-- **Battery-aware indexing** — knowledge base indexing slows down when you're
-  on battery power. Your laptop won't hate you.
-- **Native notifications** — 🌷 on new session, 🌻 on model response. Cute
-  *and* functional.
+- **Native notifications** — OS notifications on new session and model response.
 - **Adaptive theming** — detects light/dark terminal and picks colors
   accordingly. Solarized-inspired palette.
 - **Structured logging** — every message written to
@@ -238,6 +229,32 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev guide and
 
 ---
 
+## Vendored dependencies
+
+All crates are committed to `vendor/` via `cargo vendor`. Building requires
+**zero network access** — `cargo build --release` resolves everything locally.
+
+- **Offline by design**: perfect for air-gapped machines; no crates.io reach
+  required at build time.
+- **Reproducible**: the exact dependency tree is in the repo — no registry
+  surprises, no yanked crates, no `Cargo.lock` drift between machines.
+- **CI-friendly**: pipelines without internet access build cleanly.
+
+This is wired up in `.cargo/config.toml`:
+
+```toml
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+```
+
+To update a dependency: run `cargo update` then `cargo vendor` and commit the
+changes to `vendor/`.
+
+---
+
 ## Troubleshooting
 
 **"Ollama is offline"** — Start it (`ollama serve`) or point
@@ -256,9 +273,4 @@ start fresh.
 
 ## License
 
-MIT — do whatever you want.
-
----
-
-*Built for the space between "I want an AI coding assistant" and "I refuse to
-upload my code." That space is bigger than people think.*
+MIT

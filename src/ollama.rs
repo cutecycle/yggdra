@@ -211,6 +211,33 @@ pub struct GenerateResponse {
     pub message: OllamaMessage,
 }
 
+/// Internal deserialization struct for Ollama non-streaming response.
+/// Captures the `thinking` field that thinking models (qwen3.5, QwQ, etc.)
+/// return separately from `content` when native thinking is enabled.
+#[derive(Deserialize)]
+struct OllamaRespMsg {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    thinking: String,
+}
+#[derive(Deserialize)]
+struct OllamaRespBody {
+    message: OllamaRespMsg,
+}
+
+/// Merge thinking + content: if content is non-empty return it; otherwise wrap
+/// thinking in `<think>` tags so callers (parsers, test gauntlet) can handle it.
+fn merge_thinking(content: String, thinking: String) -> String {
+    if !content.is_empty() {
+        content
+    } else if !thinking.is_empty() {
+        format!("<think>{}</think>", thinking)
+    } else {
+        String::new()
+    }
+}
+
 /// Token event sent from streaming to UI
 pub enum StreamEvent {
     Token(String),
@@ -611,6 +638,36 @@ impl OllamaClient {
                 Err(e)
             }
         }
+    }
+
+    /// Create a client immediately without a connectivity probe (no HTTP round-trip).
+    /// The caller should spawn a background task to validate connectivity if desired.
+    pub fn new_unchecked(endpoint: &str, model: &str, api_key: Option<&str>) -> anyhow::Result<Self> {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(3600))
+            .pool_idle_timeout(Duration::from_secs(3600))
+            .build()?;
+
+        let backend = match detect_api_format(endpoint) {
+            ApiFormat::OpenAI => Backend::OpenAI {
+                endpoint: endpoint.to_string(),
+                api_key: api_key.unwrap_or("").to_string(),
+            },
+            ApiFormat::Ollama => Backend::Ollama {
+                endpoint: endpoint.to_string(),
+            },
+            ApiFormat::LlamaCpp => Backend::LlamaCpp {
+                endpoint: endpoint.to_string(),
+            },
+        };
+
+        Ok(Self {
+            backend,
+            http_client,
+            model: model.to_string(),
+            native_ctx: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn endpoint(&self) -> &str { self.backend.endpoint() }
@@ -1302,9 +1359,9 @@ impl OllamaClient {
                         response.text().await.unwrap_or_default()
                     ));
                 }
-                let data: GenerateResponse = response.json().await
+                let data: OllamaRespBody = response.json().await
                     .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
-                Ok(data.message.content)
+                Ok(merge_thinking(data.message.content, data.message.thinking))
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let mut request = build_openai_request(&self.model, ollama_messages, params);
@@ -1390,9 +1447,12 @@ impl OllamaClient {
                         response.text().await.unwrap_or_default()
                     ));
                 }
-                let data: GenerateResponse = response.json().await
+                let data: OllamaRespBody = response.json().await
                     .map_err(|e| anyhow!("Failed to parse generate response: {}", e))?;
-                Ok(data)
+                let content = merge_thinking(data.message.content, data.message.thinking);
+                Ok(GenerateResponse {
+                    message: OllamaMessage { role: "assistant".to_string(), content },
+                })
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let mut request = build_openai_request(model, messages, params);

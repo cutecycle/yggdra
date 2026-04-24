@@ -35,6 +35,18 @@ type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 const MAX_TOOL_ITERATIONS: usize = 30;
 const DEFAULT_TOOL_OUTPUT_CAP: usize = 600;
 
+/// Parse an RGB color string in format "r,g,b" into a Color
+fn parse_rgb_string(s: &str) -> Option<Color> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let r = parts[0].trim().parse::<u8>().ok()?;
+    let g = parts[1].trim().parse::<u8>().ok()?;
+    let b = parts[2].trim().parse::<u8>().ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
 /// What the app should do at the end of a streaming turn with no parsed tool calls.
 ///
 /// Extracted as a pure function so the loop-prevention logic is independently testable
@@ -67,13 +79,13 @@ pub(crate) fn decide_stream_end(
     let kicks_after = consecutive_empty_kicks + 1;
     match mode {
         AppMode::Plan | AppMode::Ask => StreamEndAction::Persist,
-        AppMode::Build => {
-            if kicks_after >= 5 {
-                StreamEndAction::Halt("model stuck")
-            } else {
-                StreamEndAction::Kick
+            AppMode::Forever => {
+                if kicks_after >= 5 {
+                    StreamEndAction::Halt("model stuck")
+                } else {
+                    StreamEndAction::Kick
+                }
             }
-        }
         AppMode::One => {
             if !has_text {
                 // Model produced only thinking tokens (or nothing) — kick up to 3 times.
@@ -203,6 +215,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "compress", description: "Summarize session and reset context", keywords: "compress summarize archive context reset memory", fill: "/compress" },
     PaletteCommand { name: "gradient", description: "Toggle pastel gradient background", keywords: "gradient background pastel visual theme", fill: "/gradient " },
     PaletteCommand { name: "theme",    description: "Set colour theme (dark/light/auto)",  keywords: "theme dark light color colour visual",  fill: "/theme " },
+    PaletteCommand { name: "color",    description: "Generate gradient colors from a prompt (e.g. sunset, ocean, forest)", keywords: "color gradient theme palette aesthetic visual", fill: "/color " },
     PaletteCommand { name: "checkpoint", description: "Save session checkpoint",        keywords: "save progress milestone snapshot",   fill: "/checkpoint " },
     PaletteCommand { name: "clear",  description: "Archive conversation to scrollback", keywords: "clear buffer reset history archive", fill: "/clear" },
     PaletteCommand { name: "mem",    description: "Search archived scrollback",         keywords: "search memory past conversation",    fill: "/tool mem " },
@@ -618,18 +631,45 @@ impl App {
         stats.on_session_start();
         stats.save(&cwd);
 
-        let profile = config.profile;
         let endpoint_type = if ollama_client.is_some() {
             crate::ollama::detect_endpoint_type(&config.endpoint)
         } else {
             "Offline".to_string()
         };
 
-        // Use detect_safe() here — it uses macOS system APIs and can't block.
-        // detect() uses OSC11 which toggles raw mode and can hang before TerminalGuard is set up.
-        let theme = Theme::detect_safe()
-            .map(|light| if light { Theme::light() } else { Theme::dark() })
-            .unwrap_or_else(Theme::dark);
+        // Default to dark theme; only call detect_safe() when config explicitly says "auto".
+        // detect_safe() uses macOS system APIs which can be unreliable on startup,
+        // causing the theme to appear to "reset" to light when the user expects dark.
+        let mut theme = Theme::dark();
+
+        // Load custom gradient colors from config if set
+        if let (Some(start_str), Some(end_str)) = (&config.ui_settings.gradient_start, &config.ui_settings.gradient_end) {
+            if let (Some(start), Some(end)) = (parse_rgb_string(start_str), parse_rgb_string(end_str)) {
+                theme.gradient_start = start;
+                theme.gradient_end = end;
+            }
+        }
+
+        // Apply theme preference from config
+        if let Some(theme_pref) = &config.ui_settings.theme {
+            match theme_pref.as_str() {
+                "dark" => theme = Theme::dark(),
+                "light" => theme = Theme::light(),
+                "auto" | _ => {
+                    if let Some(detected) = Theme::detect_safe() {
+                        theme = if detected { Theme::light() } else { Theme::dark() };
+                    }
+                }
+            }
+        }
+
+        // Re-apply custom gradient colors after theme (they override theme defaults)
+        if let (Some(start_str), Some(end_str)) = (&config.ui_settings.gradient_start, &config.ui_settings.gradient_end) {
+            if let (Some(start), Some(end)) = (parse_rgb_string(start_str), parse_rgb_string(end_str)) {
+                theme.gradient_start = start;
+                theme.gradient_end = end;
+            }
+        }
 
         let project_context = build_project_context(10000);
 
@@ -643,7 +683,7 @@ impl App {
             message_buffer,
             task_manager,
             ollama_client,
-            tool_registry: ToolRegistry::new(profile),
+            tool_registry: ToolRegistry::new(),
             cached_message_count: 0,
             streaming_text: String::new(),
             thinking_text: String::new(),
@@ -914,7 +954,7 @@ impl App {
 
         // In Build mode, fire a kick prompt to orient the agent.
         // One mode waits for the user to specify their task first.
-        if self.mode == AppMode::Build {
+        if self.mode == AppMode::Forever {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
@@ -1145,7 +1185,7 @@ impl App {
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
                 self.last_stream_token_time = None;
-                if matches!(self.mode, AppMode::Build | AppMode::One) {
+                if matches!(self.mode, AppMode::Forever | AppMode::One) {
                     self.consecutive_empty_kicks += 1;
                     if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                         self.autokick_paused = true;
@@ -1226,7 +1266,7 @@ impl App {
                     self.turn_phase = TurnPhase::Idle;
                     self.tool_iteration_count = 0;
                     self.last_infer_rate = None;
-                    if matches!(self.mode, AppMode::Build | AppMode::One) {
+                    if matches!(self.mode, AppMode::Forever | AppMode::One) {
                         self.consecutive_empty_kicks += 1;
                         if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                             self.autokick_paused = true;
@@ -1246,7 +1286,7 @@ impl App {
                         self.stream_rx = None;
                         self.turn_phase = TurnPhase::Idle;
                         self.tool_iteration_count = 0;
-                        if matches!(self.mode, AppMode::Build | AppMode::One) {
+                        if matches!(self.mode, AppMode::Forever | AppMode::One) {
                             self.consecutive_empty_kicks += 1;
                             if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                                 self.autokick_paused = true;
@@ -1414,9 +1454,32 @@ impl App {
 
         // Sanitize training artifacts before persisting or parsing
         let response_text = agent::sanitize_model_output(&response_text);
+        
+        // Format Rust code blocks using rustfmt
+        let mut formatted_text = String::new();
+        let mut last_pos = 0;
+        while let Some(start) = response_text[last_pos..].find("```rust") {
+            let start_abs = last_pos + start;
+            formatted_text.push_str(&response_text[last_pos..start_abs]);
+            formatted_text.push_str("```rust");
+            
+            let search_start = start_abs + "```rust".len();
+            if let Some(end) = response_text[search_start..].find("```") {
+                let end_abs = search_start + end;
+                let code = &response_text[search_start..end_abs];
+                formatted_text.push_str(&crate::tools::format_rust_code(code));
+                formatted_text.push_str("```");
+                last_pos = end_abs + 3;
+            } else {
+                formatted_text.push_str(&response_text[search_start..]);
+                last_pos = response_text.len();
+            }
+        }
+        formatted_text.push_str(&response_text[last_pos..]);
+        let response_text = formatted_text;
 
         // Parse tool calls early so we can inject narration before persisting
-        let tool_calls = agent::parse_tool_calls(&response_text, self.config.profile);
+        let tool_calls = agent::parse_tool_calls(&response_text);
         let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&response_text);
 
         // If the model emitted a bare tool call (no explanation), synthesize one
@@ -1618,12 +1681,11 @@ impl App {
                 let (tx, rx) = oneshot::channel::<ToolResult>();
                 let tool_name = call.name.clone();
                 let args = call.args.clone();
-                let profile = self.config.profile;
                 let tool_name_for_result = tool_name.clone();
                 let args_for_result = args.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let registry = crate::tools::ToolRegistry::new(profile);
+                        let registry = crate::tools::ToolRegistry::new();
                         registry.execute(&tool_name, &args).map_err(|e| e.to_string())
                     }).await;
                     let output = match result {
@@ -1668,12 +1730,11 @@ impl App {
                     .collect();
                 self.status_message = format!("🔧 Executing {} tools in batch...", calls.len());
                 let (tx, rx) = oneshot::channel::<ToolResult>();
-                let profile = self.config.profile;
                 let cap = Some(self.config.tool_output_cap
                     .or(self.config.params.tool_output_cap)
                     .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP));
                 tokio::spawn(async move {
-                    let output = App::execute_tools_batch_async(calls, cap, profile).await;
+                    let output = App::execute_tools_batch_async(calls, cap).await;
                     let _ = tx.send(ToolResult {
                         tool_name: "__batch__".to_string(),
                         args: String::new(),
@@ -1699,7 +1760,7 @@ impl App {
             }
         } else {
             // No valid tool calls — check if model tried a blocked tool (profile restriction)
-            let blocked = agent::parse_blocked_tool_names(&response_text, self.config.profile);
+            let blocked = agent::parse_blocked_tool_names(&response_text);
             if !blocked.is_empty() && !is_hallucinating {
                 let error_parts: Vec<String> = blocked.iter().map(|name| {
                     format!(
@@ -1744,7 +1805,6 @@ impl App {
             //   2. "tool_calls" present but parse failed — truncated/malformed stream →
             //      delete the partial message from history and silently retry (model gets a
             //      clean slate without seeing its own garbled output)
-            let shell_only = self.config.profile == crate::config::CapabilityProfile::ShellOnly;
             let has_tool_calls_key = response_text.contains("\"tool_calls\"");
             // Detect malformed/cutoff output differently for XML vs JSON format
             let xml_started = response_text.contains("<tool>");
@@ -1767,8 +1827,7 @@ impl App {
                     || (starts_json && unbalanced)
             };
             let json_malformed = json_malformed || xml_malformed;
-            if shell_only
-                && !response_text.trim().is_empty()
+            if !response_text.trim().is_empty()
             {
                  if json_malformed {
                      // Stream was cut short or JSON was malformed — delete the garbage from history
@@ -1795,12 +1854,12 @@ impl App {
                  }
                  // If a valid tool call is present, it's not a format error, even if there's prose.
                  if !response_text.trim().is_empty() {
-                     let xml_calls = agent::parse_xml_tool_calls(&response_text, self.config.profile);
+                     let xml_calls = agent::parse_xml_tool_calls(&response_text);
                      if !xml_calls.is_empty() {
                          // Valid XML found, ignore the prose and continue normally
                          return;
                      }
-                     let json_calls = agent::parse_json_tool_calls(&response_text, self.config.profile);
+                     let json_calls = agent::parse_json_tool_calls(&response_text);
                      if !json_calls.is_empty() {
                          // Valid JSON found, ignore the prose and continue normally
                          return;
@@ -2044,13 +2103,7 @@ impl App {
             }
             let repeat_count = count_repeat_calls(&self.recent_tool_calls, &tool_name, call_hash);
             if repeat_count >= 3 {
-                use crate::config::CapabilityProfile;
-                let hint = if self.config.profile == CapabilityProfile::ShellOnly {
-                    "Try a different approach: use shell with a different command or narrower grep pattern.".to_string()
-                } else {
-                    "Try a different approach: advance the line range (e.g. start_line=<next>), \
-                     use `rg` to search for a specific pattern, or use readfile with a `search` parameter.".to_string()
-                };
+                let hint = "Try a different approach: use shell with a different command or narrower grep pattern.".to_string();
                 self.push_agent_notice(format!(
                     "⚠️ You have called '{}' with identical arguments {} times in a row. {}",
                     tool_name, repeat_count, hint
@@ -2060,7 +2113,6 @@ impl App {
         // ──────────────────────────────────────────────────────────────────
 
         let (tx, rx) = oneshot::channel();
-        let tool_profile = self.config.profile;
         let args_for_result = args.clone();
 
         // Wrap in tokio timeout as a safety net — spawn's own timeout handles the
@@ -2068,7 +2120,7 @@ impl App {
         tokio::spawn(async move {
             let tool_name_for_result = tool_name.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let registry = ToolRegistry::new(tool_profile);
+                let registry = ToolRegistry::new();
                 registry.execute(&tool_name, &args)
                     .map_err(|e| e.to_string())
             }).await;
@@ -2093,7 +2145,6 @@ impl App {
         let (tx, rx) = oneshot::channel();
         let endpoint = self.config.endpoint.clone();
         let model = self.config.model.clone();
-        let app_profile = self.config.profile;
         let project_ctx = self.project_context.clone();
 
         let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -2104,8 +2155,7 @@ impl App {
             let config = crate::agent::AgentConfig::new(&model, &endpoint)
                 .with_max_iterations(10)
                 .with_max_recursion_depth(10)
-                .with_app_mode(crate::config::AppMode::Build)
-                .with_profile(app_profile)
+                .with_app_mode(crate::config::AppMode::Forever)
                 .with_project_context(project_ctx)
                 .with_token_tx(token_tx);
             let result = crate::spawner::spawn_subagent(
@@ -2506,7 +2556,7 @@ impl App {
                 self.tool_result_rx = None;
                 self.turn_phase = TurnPhase::Idle;
                 self.tool_iteration_count = 0;
-                if matches!(self.mode, AppMode::Build | AppMode::One) {
+                if matches!(self.mode, AppMode::Forever | AppMode::One) {
                     self.consecutive_empty_kicks += 1;
                     if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                         self.autokick_paused = true;
@@ -2800,82 +2850,31 @@ impl App {
 
     fn steering_text(&self) -> String {
         let os = std::env::consts::OS;
-        let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
-        use crate::config::CapabilityProfile;
-        let shell_only = self.config.profile == CapabilityProfile::ShellOnly;
 
-        let mode_block = if shell_only {
-            match self.mode {
-                AppMode::Ask =>
-                    "MODE: ASK (read-only). Read files freely — discuss, analyse, explain.",
-                AppMode::Plan =>
-                    "MODE: PLAN (interactive). Discuss and analyse. Use shell for read-only commands only.",
-                AppMode::Build =>
-                    "MODE: BUILD (autonomous). Execute shell commands to complete tasks.",
-                AppMode::One =>
-                    "MODE: ONE (one-off). Execute shell commands autonomously to complete a single task. \
-                     When the task is fully complete, emit </done> on its own line — this stops the loop.",
-            }
-        } else {
-            match self.mode {
-                AppMode::Ask =>
-                    "MODE: ASK (read-only). Search and read freely. Explain what changes would look like.",
-                AppMode::Plan =>
-                    "MODE: PLAN (interactive). Discuss, analyse, and suggest. \
-                     rg/readfile/exec/shell freely; setfile/commit only when user explicitly requests changes.",
-                AppMode::Build =>
-                    "MODE: BUILD (autonomous). Execute immediately and continuously. \
-                     Read todos, write code, run tests, commit. Act immediately. \
-                     Work through tasks end-to-end. Continue to the next task when one is done.",
-                AppMode::One =>
-                    "MODE: ONE (one-off). Autonomously complete a SINGLE task end-to-end. \
-                     Read todos, write code, run tests, commit as needed. \
-                     When the task is fully complete, emit </done> on its own line to stop the loop. \
-                     Do NOT pick up additional tasks after completion.",
-            }
+        let mode_block = match self.mode {
+            AppMode::Ask =>
+                "MODE: ASK (read-only). Read files freely — discuss, analyse, explain.",
+            AppMode::Plan =>
+                "MODE: PLAN (interactive). Discuss and analyse. Use shell for read-only commands only.",
+            AppMode::Forever =>
+                "MODE: BUILD (autonomous). Execute shell commands to complete tasks.",
+            AppMode::One =>
+                "MODE: ONE (one-off). Execute shell commands autonomously to complete a single task. \
+                 When the task is fully complete, emit </done> on its own line — this stops the loop.",
         };
 
-        let mut base = if shell_only {
-            let ctx_note = self.config.params.num_ctx
-                .or(self.config.context_window)
-                .map(|n| format!("\nCONTEXT WINDOW: {} tokens — budget returnlines accordingly", n))
-                .unwrap_or_default();
-            format!(
-                "yggdra shell-only | OS: {os}\n\
-                 {mode_block}\n\
-                 ONE tool: shell{ctx_note}\n\
-                 ---\n"
-            )
-        } else {
-            format!(
-                "ASSISTANT is yggdra, a terminal ai agent. OS: {os}. Terminal: {term_width} cols.\n\
-                 {mode_block}\n\
-                 ---\n\
-                 You HAVE FULL TOOL ACCESS. Execute tools immediately and liberally.\n\
-                 AVAILABLE TOOLS:\n\
-                 • rg — ripgrep search: find patterns in files/dirs\n\
-                 • readfile — read a file (optionally: readfile path start end for a line range)\n\
-                 • setfile — create or fully overwrite a file (auto-commits; git tracks history)\n\
-                 • patchfile — surgical line-range replacement (readfile first; commit after)\n\
-                 • exec — run a single command (git, cargo, make, find, jq, node, python, etc.)\n\
-                 • shell — run via sh -c (use for pipes, redirects, && chains)\n\
-                 • commit — git commit changes\n\
-                 • python — run Python code or complex logic\n\
-                 • ruste — compile & run Rust code\n\
-                 • think — reasoning block (use freely)\n\
-                 • spawn — spawn a subagent for parallel subtasks\n\
-                 ---\n\
-                 SHELL COMMANDS:\n\
-                 • exec: single commands — exec \"cargo test\", exec \"git log --oneline\"\n\
-                 • shell: pipelines & chains — shell \"git log | head -5\", shell \"cargo build && cargo test\"\n\
-                 Use exec for simple commands, shell whenever you need pipes (|), redirects (>), or && / ||\n\
-                 exec uses PATH (git, cargo, node) — use shell for sh -c pipelines\n\
-                 ---\n\
-                 TOOL FORMAT:\n"
-            )
-        };
-        // JSON format only — all production models (qwen3.5, gemma-4) support it
-        base.push_str(&agent::json_tool_descriptions(self.config.profile));
+        let ctx_note = self.config.params.num_ctx
+            .or(self.config.context_window)
+            .map(|n| format!("\nCONTEXT WINDOW: {} tokens — budget returnlines accordingly", n))
+            .unwrap_or_default();
+        let mut base = format!(
+            "yggdra shell-only | OS: {os}\n\
+             {mode_block}\n\
+             ONE tool: shell{ctx_note}\n\
+             ---\n"
+        );
+        // XML tool format description
+        base.push_str(&agent::json_tool_descriptions());
         base.push_str("\n---\n");
 
         // Inject project root so the model always knows where to put files
@@ -2893,133 +2892,57 @@ impl App {
             root = root_display
         ));
 
-        if shell_only {
-            base.push_str(
-                "ASYNC: add <mode>async</mode> and <task_id>my-task</task_id> tags to any call\n\
-                 to run it in the background. You get an immediate ack and continue.\n\
-                 Result injected as [ASYNC_RESULT: my-task = ...] when done.\n\
-                 Output also written to .yggdra/async/my-task.txt for inspection.\n\
-                 Use async for: long builds, test suites, background installs.\n\
-                 ---\n\
-                 CODE EDITING — reliable shell patterns:\n\
-                 1. Read first — always get exact lines before changing:\n\
-                    cat -n src/foo.rs | sed -n '25,40p'\n\
-                 2. Single-line replace by line number (no regex, handles any chars):\n\
-                    awk 'NR==30{print \"new content\"; next} {print}' f.rs > f.new && mv f.new f.rs\n\
-                 3. Multi-line splice by line numbers:\n\
-                    { head -n $((N-1)) f.rs; printf 'new\\ncontent\\n'; tail -n +$((M+1)) f.rs; } > f.new && mv f.new f.rs\n\
-                 4. Complex changes (handles any special chars):\n\
-                    python3 -c \"s=open('f.rs').read(); open('f.rs','w').write(s.replace('exact old','new'))\"\n\
-                 Verify every edit: cat -n f.rs | sed -n 'N,Mp'\n\
-                 sed regex on Rust code is fragile — use awk line-numbers or python3.replace instead.\n\
-                 ---\n\
-                 KNOWLEDGE BASE: .yggdra/knowledge/ — 135,000+ offline docs (Rust, Godot, physics, etc)\n\
-                 shell \"ls .yggdra/knowledge/\"                          — list categories\n\
-                 shell \"rg 'topic' .yggdra/knowledge/rust/ -l\"     — search docs\n\
-                 shell \"cat .yggdra/knowledge/rust/some-doc.md\"         — read a doc\n\
-                 .yggdra/knowledge/INDEX.md — indexed category list. Check it before searching.\n\
-                 ---\n\
-                 AGENTS.md is already in context — start working immediately.\n\
-                 PERSIST NOTES: shell \"echo 'note' >> .yggdra/memory.md\" to remember facts across turns.\n\
-                 PERSIST REASONING: shell \"echo 'thought' >> .yggdra/thoughts.md\" before complex steps."
-            );
-            // Inject recent context / memory / thoughts
-            let recent = self.recent_messages_block();
-            if !recent.is_empty() {
-                base.push_str("\n---\n");
-                base.push_str(&recent);
-            }
-            let memory = Self::memory_block();
-            if !memory.is_empty() {
-                base.push_str("\n---\n");
-                base.push_str(&memory);
-            }
-            let thoughts = Self::thoughts_block();
-            if !thoughts.is_empty() {
-                base.push_str("\n---\n");
-                base.push_str(&thoughts);
-            }
-        } else {
-            base.push_str(
-                "Access any file using rg, readfile, exec, or shell.\n\
-                 Use tools proactively to explore, analyze, and implement. Be concise.\n\
-                 ---\n\
-                 PROJECT DIRS:\n\
-                 • .yggdra/todo/ — task files (status, requirements, hints). Find with rg\n\
-                 • .yggdra/log/ — session history by timestamp. Read with exec\n\
-                 • .yggdra/knowledge/ — 135k+ offline docs (Rust, Godot, physics, etc). Search with rg\n\
-                 • .yggdra/knowledge/INDEX.md — indexed category list (auto-refreshed)\n\
-                 ---\n\
-                 KNOWLEDGE BASE:\n\
-                 Check INDEX.md first to see which categories are indexed.\n\
-                 For indexed categories (large keyword lists), search directly: rg \"term\" .yggdra/knowledge/category/\n\
-                 For unindexed content, INDEX.md suggests fallback commands.\n\
-                 As indexing runs in background on battery-aware schedule, INDEX.md grows over time.\n\
-                 ---\n\
-                 WORKFLOW:\n\
-                 1. Discover pending todos: rg TODO .yggdra/todo/\n\
-                 2. Read task details: readfile .yggdra/todo/TASKNAME.md\n\
-                 3. Work on task — for code changes:\n\
-                    a. readfile the target (note line numbers)\n\
-                    b. patchfile (surgical) or setfile (full rewrite) to make the change\n\
-                    c. commit immediately with a message: WHAT changed + WHY\n\
-                    d. repeat steps a-c for each logical change\n\
-                 4. Update todo status to done\n\
-                 5. Commit the todo status update\n\
-                 6. Continue to the next task\n\
-                 ---\n\
-                 COMMIT RULE: every file write is followed immediately by a commit.\n\
-                 One logical change per commit.\n\
-                 Commit messages explain the change (e.g. 'fix(agent): add patchfile to is_valid_tool').\n\
-                 ---\n\
-                 BEFORE EACH TOOL CALL: write one short sentence saying what you are about to do and why.\n\
-                 Example: \"Searching for existing tests before adding a new one.\"\n\
-                 Keep it to one line. Then emit the tool call JSON immediately after.\n\
-                 ---\n\
-                 🎯 AGENTS.md is already in context — start working immediately."
-            );
-            // Plan mode: inject <plan> and [UNDERSTOOD] instructions
-            if self.mode == AppMode::Plan {
-                let threshold = self.effective_params().ambiguity_threshold.unwrap_or(0);
-                base.push_str(&format!(
-                    "\n---\n\
-                     PLAN MODE — you maintain .yggdra/plan.md:\n\
-                     Whenever your understanding of the plan evolves, end your response with:\n\
-                     <plan>\n\
-                     ## Goal\n\
-                     One sentence describing the objective.\n\
-                     ## Steps\n\
-                     - [ ] pending step\n\
-                     - [x] completed step\n\
-                     ## Notes\n\
-                     Key constraints or decisions.\n\
-                     </plan>\n\
-                     yggdra writes .yggdra/plan.md automatically. Omit if plan hasn't changed.\n\
-                     \n\
-                     UNDERSTOOD SIGNAL: When your ambiguity about what to do is ≤{t} (current threshold={t}),\n\
-                     declare readiness by writing [UNDERSTOOD] in your response.\n\
-                     The human will be notified; when they press Enter, execution begins in One mode.\n\
-                     If threshold is 0, only declare [UNDERSTOOD] when fully certain.\n",
-                    t = threshold
-                ));
-            }
-            // Inject recent context / memory / thoughts
-            let recent = self.recent_messages_block();
-            if !recent.is_empty() { base.push_str("\n---\n"); base.push_str(&recent); }
-            let memory = Self::memory_block();
-            if !memory.is_empty() { base.push_str("\n---\n"); base.push_str(&memory); }
-            let thoughts = Self::thoughts_block();
-            if !thoughts.is_empty() { base.push_str("\n---\n"); base.push_str(&thoughts); }
+        base.push_str(
+            "ASYNC: add <mode>async</mode> and <task_id>my-task</task_id> tags to any call\n\
+             to run it in the background. You get an immediate ack and continue.\n\
+             Result injected as [ASYNC_RESULT: my-task = ...] when done.\n\
+             Output also written to .yggdra/async/my-task.txt for inspection.\n\
+             Use async for: long builds, test suites, background installs.\n\
+             ---\n\
+             CODE EDITING — reliable shell patterns:\n\
+             1. Read first — always get exact lines before changing:\n\
+                cat -n src/foo.rs | sed -n '25,40p'\n\
+             2. Single-line replace by line number (no regex, handles any chars):\n\
+                awk 'NR==30{print \"new content\"; next} {print}' f.rs > f.new && mv f.new f.rs\n\
+             3. Multi-line splice by line numbers:\n\
+                { head -n $((N-1)) f.rs; printf 'new\\ncontent\\n'; tail -n +$((M+1)) f.rs; } > f.new && mv f.new f.rs\n\
+             4. Complex changes (handles any special chars):\n\
+                python3 -c \"s=open('f.rs').read(); open('f.rs','w').write(s.replace('exact old','new'))\"\n\
+             Verify every edit: cat -n f.rs | sed -n 'N,Mp'\n\
+             sed regex on Rust code is fragile — use awk line-numbers or python3.replace instead.\n\
+             ---\n\
+             KNOWLEDGE BASE: .yggdra/knowledge/ — 135,000+ offline docs (Rust, Godot, physics, etc)\n\
+             shell \"ls .yggdra/knowledge/\"                          — list categories\n\
+             shell \"rg 'topic' .yggdra/knowledge/rust/ -l\"     — search docs\n\
+             shell \"cat .yggdra/knowledge/rust/some-doc.md\"         — read a doc\n\
+             .yggdra/knowledge/INDEX.md — indexed category list. Check it before searching.\n\
+             ---\n\
+             AGENTS.md is already in context — start working immediately.\n\
+             PERSIST NOTES: shell \"echo 'note' >> .yggdra/memory.md\" to remember facts across turns.\n\
+             PERSIST REASONING: shell \"echo 'thought' >> .yggdra/thoughts.md\" before complex steps."
+        );
+        // Inject recent context / memory / thoughts
+        let recent = self.recent_messages_block();
+        if !recent.is_empty() {
+            base.push_str("\n---\n");
+            base.push_str(&recent);
+        }
+        let memory = Self::memory_block();
+        if !memory.is_empty() {
+            base.push_str("\n---\n");
+            base.push_str(&memory);
+        }
+        let thoughts = Self::thoughts_block();
+        if !thoughts.is_empty() {
+            base.push_str("\n---\n");
+            base.push_str(&thoughts);
         }
         if let Some(ctx) = &self.agents_context {
             base.push_str("\n---\n--- AGENTS.md ---\n");
             base.push_str(ctx);
-        } else if shell_only {
+        } else {
             base.push_str("\n---\nNo AGENTS.md exists yet. Use shell \"cat AGENTS.md\" or \
                 shell \"ls\" to explore the directory.");
-        } else {
-            base.push_str("\n---\nNo AGENTS.md exists yet. If you haven't already, explore the \
-                directory and create one with readfile/setfile AGENTS.md.");
         }
         // Inject live project file listing — model knows what exists without ls/find turns
         base.push_str("\n---\n");
@@ -3041,15 +2964,13 @@ impl App {
             if !error_block.is_empty() { base.push_str(&error_block); }
         }
 
-        if shell_only {
-            base.push_str("---\nOutput XML tool tags only — no prose outside the tags.");
-        }
+        base.push_str("---\nOutput XML tool tags only — no prose outside the tags.");
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
 
     /// Execute multiple tool calls in parallel (blocking) and return pre-formatted output.
-    async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>, cap: Option<usize>, profile: crate::config::CapabilityProfile) -> String {
-        let registry = crate::tools::ToolRegistry::new(profile);
+    async fn execute_tools_batch_async(tool_calls: Vec<(String, String)>, cap: Option<usize>) -> String {
+        let registry = crate::tools::ToolRegistry::new();
         tokio::task::spawn_blocking(move || {
             let results: Vec<String> = tool_calls
                 .into_iter()
@@ -3238,16 +3159,23 @@ impl App {
             lines.min(12).max(3)
         };
 
+        // Show a 1-line warning bar when inference endpoint is not localhost
+        let is_remote_endpoint = !self.config.endpoint.contains("localhost")
+            && !self.config.endpoint.contains("127.0.0.1")
+            && !self.config.endpoint.contains("::1");
+        let warning_height: u16 = if is_remote_endpoint { 1 } else { 0 };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
                     Constraint::Length(2),                      // [0] Header
-                    Constraint::Min(5),                         // [1] Messages
-                    Constraint::Length(1),                      // [2] Spacer above boxes
-                    Constraint::Length(subagent_panel_height),  // [3] Subagent panel (0 if none visible)
-                    Constraint::Length(input_height),           // [4] Input
-                    Constraint::Length(1),                      // [5] Status bar
+                    Constraint::Length(warning_height),         // [1] Warning bar (0 if local)
+                    Constraint::Min(5),                         // [2] Messages
+                    Constraint::Length(1),                      // [3] Spacer above boxes
+                    Constraint::Length(subagent_panel_height),  // [4] Subagent panel (0 if none visible)
+                    Constraint::Length(input_height),           // [5] Input
+                    Constraint::Length(1),                      // [6] Status bar
                 ]
                 .as_ref(),
             )
@@ -3256,7 +3184,7 @@ impl App {
         // Header with context window indicator
         let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
         let (mode_label, mode_color) = match self.mode {
-            AppMode::Build => ("⚡ BUILD", self.theme.violet),
+            AppMode::Forever => ("⚡ FOREVER", self.theme.violet),
             AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
             AppMode::Ask => ("🔍 ASK", Color::Yellow),
             AppMode::One => ("🎯 ONE", Color::Green),
@@ -3288,6 +3216,12 @@ impl App {
             _ => (&self.endpoint_type, Color::Yellow),
         };
 
+        let remote_indicator = if self.config.endpoint.contains("localhost") || self.config.endpoint.contains("127.0.0.1") {
+            ""
+        } else {
+            "🌐 "
+        };
+
         let header_line = Line::from(vec![
             Span::raw("🌷 "),
             Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
@@ -3298,6 +3232,7 @@ impl App {
             Span::raw(" | "),
             Span::raw(&context_indicator),
             Span::raw(" | "),
+            Span::raw(remote_indicator),
             Span::styled(format!("[{}]", endpoint_display), Style::default().fg(endpoint_color)),
         ]);
 
@@ -3305,8 +3240,16 @@ impl App {
             .block(Block::default().borders(Borders::BOTTOM).title("Status"));
         f.render_widget(header, chunks[0]);
 
+        // Warning bar: shown when inference endpoint is not localhost
+        if is_remote_endpoint && warning_height > 0 {
+            let warn_text = format!("⚠ OUTSIDE INFERENCE: {}  — data leaves this machine", self.config.endpoint);
+            let warn_bar = Paragraph::new(warn_text)
+                .style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD));
+            f.render_widget(warn_bar, chunks[1]);
+        }
+
         // Messages area with full-width colored bands — bottom-anchored with scroll
-        let messages_area = chunks[1];
+        let messages_area = chunks[2];
         let viewport_height = messages_area.height as i32;
         let area_width = messages_area.width;
 
@@ -3474,8 +3417,8 @@ impl App {
                 f.render_widget(para, gradient_area);
             }
             // Continue gradient into spacer + results + input areas
-            let extra_start = chunks[2].y;
-            let extra_end   = chunks[4].y + chunks[4].height;
+            let extra_start = chunks[3].y;
+            let extra_end   = chunks[5].y + chunks[5].height;
             let total_height = messages_area.height + (extra_end - extra_start);
             for y in extra_start..extra_end {
                 let offset = messages_area.height + (y - extra_start);
@@ -3607,7 +3550,7 @@ impl App {
         };
 
         let (mode_badge, mode_border_color) = match self.mode {
-            AppMode::Build => (" ⚡BUILD ", self.theme.violet),
+            AppMode::Forever => (" ⚡FOREVER ", self.theme.violet),
             AppMode::Plan  => (" 🧠PLAN ",  self.theme.accent),
             AppMode::Ask => (" 🔍ASK ", Color::Yellow),
             AppMode::One => (" 🎯ONE ", Color::Green),
@@ -3629,7 +3572,7 @@ impl App {
         let box_style = Style::default().bg(box_bg);
 
         // Render subagent panel if there are visible entries
-        if !visible_subagents.is_empty() && chunks[3].height > 0 {
+        if !visible_subagents.is_empty() && chunks[4].height > 0 {
             let panel_text = format_subagent_panel(&visible_subagents, self.tick_count);
             let spinner_frames = ['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷'];
             let spin = spinner_frames[(self.tick_count as usize / 4) % spinner_frames.len()];
@@ -3647,7 +3590,7 @@ impl App {
                     .style(box_style))
                 .style(box_style)
                 .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(panel, chunks[3]);
+            f.render_widget(panel, chunks[4]);
         }
 
         let input = Paragraph::new(format!("> {}", input_text))
@@ -3656,24 +3599,28 @@ impl App {
                 .border_style(Style::default().fg(mode_border_color))
                 .borders(Borders::ALL)
                 .style(box_style))
-            .style(box_style)
             .wrap(ratatui::widgets::Wrap { trim: false });
-        f.render_widget(input, chunks[4]);
+        
+        // Clear the input area before rendering to prevent garbage text artifacts
+        let clear_area = chunks[5];
+        f.render_widget(Clear, clear_area);
+        
+        f.render_widget(input, chunks[5]);
 
         // Show hardware cursor at the end of typed text so the user can see where
         // they're typing. Only shown when there's actual input (not the placeholder hint)
         // and no overlays are open.
         if !self.input_buffer.is_empty() && !self.model_picker_open {
-            let available_w = (chunks[4].width as usize).saturating_sub(2); // inside borders
+            let available_w = (chunks[5].width as usize).saturating_sub(2); // inside borders
             if available_w > 0 {
                 // "> " prefix is 2 chars; cursor goes after the last typed character
                 let display_chars = 2 + self.input_buffer.width();
                 let row_offset = (display_chars / available_w) as u16;
                 let col_in_row = (display_chars % available_w) as u16;
-                let cursor_x = (chunks[4].x + 1 + col_in_row)
-                    .min(chunks[4].x + chunks[4].width.saturating_sub(2));
-                let cursor_y = (chunks[4].y + 1 + row_offset)
-                    .min(chunks[4].y + chunks[4].height.saturating_sub(2));
+                let cursor_x = (chunks[5].x + 1 + col_in_row)
+                    .min(chunks[5].x + chunks[5].width.saturating_sub(2));
+                let cursor_y = (chunks[5].y + 1 + row_offset)
+                    .min(chunks[5].y + chunks[5].height.saturating_sub(2));
                 f.set_cursor_position((cursor_x, cursor_y));
             }
         }
@@ -3682,7 +3629,7 @@ impl App {
         if self.palette_open {
             let matches = self.palette_matches();
             if !matches.is_empty() {
-                let area = chunks[4];
+                let area = chunks[5];
                 let max_palette_rows = area.y.saturating_sub(chunks[0].height);
                 let visible_items = matches.len().min(8).min(max_palette_rows.saturating_sub(2) as usize);
                 let palette_height = (visible_items + 2) as u16;
@@ -3832,7 +3779,7 @@ impl App {
         };
         // Countdown to next auto-request: shown when on battery, build mode, idle
         let countdown_text = if self.on_battery == BatteryState::OnBattery
-            && self.mode == AppMode::Build
+            && self.mode == AppMode::Forever
             && self.turn_phase == TurnPhase::Idle
         {
             const KICK_SECS: u64 = 5;
@@ -3848,7 +3795,7 @@ impl App {
         if !countdown_text.is_empty() { parts.push(&countdown_text); }
         let power_segment = parts.join(" ");
 
-        let width = chunks[5].width as usize;
+        let width = chunks[6].width as usize;
         let status = if self.plan_understood {
             "💡 Agent is ready — press Enter to execute in One mode".to_string()
         } else if width >= 60 && !power_segment.is_empty() {
@@ -3876,11 +3823,11 @@ impl App {
             )
         };
         let status_bar = Paragraph::new(status);
-        f.render_widget(status_bar, chunks[5]);
+        f.render_widget(status_bar, chunks[6]);
 
         // File viewer overlay — covers the messages area
         if self.file_viewer_open && !self.file_viewer_tabs.is_empty() {
-            self.draw_file_viewer(f, chunks[1]);
+            self.draw_file_viewer(f, chunks[2]);
         }
     }
 
@@ -4258,8 +4205,8 @@ impl App {
     /// Cycle mode Plan→Build→One→Ask→Plan; if entering Build/One, kick the agent loop.
     async fn cycle_mode(&mut self) {
         self.mode = match self.mode {
-            AppMode::Plan  => AppMode::Build,
-            AppMode::Build => AppMode::One,
+            AppMode::Plan  => AppMode::Forever,
+            AppMode::Forever => AppMode::One,
             AppMode::One   => AppMode::Ask,
             AppMode::Ask   => AppMode::Plan,
         };
@@ -4268,7 +4215,7 @@ impl App {
         let label = match self.mode {
             AppMode::Ask   => "🔍 Ask",
             AppMode::Plan  => "🧠 Plan",
-            AppMode::Build => "⚡ Build",
+            AppMode::Forever => "⚡ Forever",
             AppMode::One   => "🎯 One",
         };
         self.notify(format!("Switched to {} mode", label));
@@ -4276,8 +4223,11 @@ impl App {
         self.needs_full_redraw = true;
         if self.mode == AppMode::Ask {
             self.abort_active_turn();
-        } else if matches!(self.mode, AppMode::Build | AppMode::One) && self.turn_phase == TurnPhase::Idle {
-            self.inject_continue_kick();
+        }
+        if matches!(self.mode, AppMode::Forever | AppMode::One) {
+            if self.turn_phase == TurnPhase::Idle {
+                self.inject_continue_kick();
+            }
         }
     }
 
@@ -4352,7 +4302,7 @@ impl App {
                 self.handle_shell_command(shell_cmd).await;
             }
         } else if command == "/build" {
-            self.mode = AppMode::Build;
+            self.mode = AppMode::Forever;
             self.config.mode = self.mode;
             let _ = self.config.save();
             self.notify("⚡ Switched to Build mode — autonomous execution");
@@ -4385,7 +4335,7 @@ impl App {
                 match arg {
                     "ask" => { self.mode = AppMode::Ask; self.abort_active_turn(); }
                     "plan" => self.mode = AppMode::Plan,
-                    "build" => self.mode = AppMode::Build,
+                    "build" => self.mode = AppMode::Forever,
                     "one" => self.mode = AppMode::One,
                     _ => {
                         self.notify(format!("Unknown mode '{}' — use ask, plan, build, or one", arg));
@@ -4394,8 +4344,8 @@ impl App {
                 }
             } else {
                 self.mode = match self.mode {
-                    AppMode::Plan => AppMode::Build,
-                    AppMode::Build => AppMode::One,
+                    AppMode::Plan => AppMode::Forever,
+                    AppMode::Forever => AppMode::One,
                     AppMode::One => AppMode::Ask,
                     AppMode::Ask => AppMode::Plan,
                 };
@@ -4406,7 +4356,7 @@ impl App {
             self.config.mode = self.mode;
             let _ = self.config.save();
             let label = match self.mode {
-                AppMode::Build => "⚡ Build",
+                AppMode::Forever => "⚡ Forever",
                 AppMode::Plan => "🧠 Plan",
                 AppMode::Ask => "🔍 Ask",
                 AppMode::One => "🎯 One",
@@ -4493,6 +4443,9 @@ impl App {
         } else if command == "/theme" || command.starts_with("/theme ") {
             let arg = command.strip_prefix("/theme").unwrap_or("").trim();
             self.handle_theme_command(arg);
+        } else if command == "/color" || command.starts_with("/color ") {
+            let prompt = command.strip_prefix("/color").unwrap_or("").trim();
+            self.handle_color_command(prompt).await;
         } else if command.starts_with("/copycode") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_copycode(n).await;
@@ -4568,9 +4521,10 @@ impl App {
              /ask          - Switch to Ask mode (read-only)\n\
              /one          - Switch to One mode (one-off task w/ completion notification)\n\
              /abort        - Abort current stream / async tasks / tool execution\n\
-             /shell CMD    - Switch to ShellOnly tool profile / run a shell command inline\n\
+             /shell CMD    - Run a shell command inline\n\
              /gradient     - Toggle gradient background\n\
              /theme        - Switch theme: /theme dark | /theme light | /theme auto\n\
+             /color PROMPT - Generate gradient colors from prompt (e.g. sunset, ocean, cyberpunk)\n\
              /checkpoint   - Save session checkpoint\n\
              /clear        - Archive conversation to scrollback\n\
              /save         - Save current plan as a todo task\n\
@@ -4766,10 +4720,14 @@ impl App {
         match arg {
             "dark" => {
                 self.theme = Theme::dark();
+                self.config.ui_settings.theme = Some("dark".to_string());
+                let _ = self.config.save();
                 self.notify("🌑 Theme set to dark");
             }
             "light" => {
                 self.theme = Theme::light();
+                self.config.ui_settings.theme = Some("light".to_string());
+                let _ = self.config.save();
                 self.notify("🌕 Theme set to light");
             }
             "auto" | "" => {
@@ -4779,10 +4737,98 @@ impl App {
                     Some(false) => { self.theme = Theme::dark();  self.notify("🎨 Theme auto-detected: dark"); }
                     None        => self.notify("⚠️  Could not detect theme — use /theme dark or /theme light"),
                 }
+                self.config.ui_settings.theme = Some("auto".to_string());
+                let _ = self.config.save();
             }
             _ => {
                 self.notify("❌ Usage: /theme dark | /theme light | /theme auto");
             }
+        }
+    }
+
+    /// Handle /color — generate gradient colors from a text prompt (e.g. "sunset", "ocean", "forest")
+    async fn handle_color_command(&mut self, prompt: &str) {
+        if prompt.is_empty() {
+            self.notify("🎨 Usage: /color <prompt> — e.g. /color sunset, /color ocean, /color cyberpunk");
+            return;
+        }
+
+        if self.ollama_client.is_none() {
+            self.notify("❌ No Ollama connection — cannot generate colors");
+            return;
+        }
+
+        self.notify(format!("🎨 Generating colors for \"{}\"…", prompt));
+
+        let color_prompt = format!(
+            "You are a color palette generator. Given a theme prompt, return EXACTLY two RGB colors \
+             in this format only, no other text:\n\n\
+             START: RGB(r, g, b)\n\
+             END: RGB(r, g, b)\n\n\
+             Theme: {}\n\n\
+             Return only the two RGB lines, nothing else.",
+            prompt
+        );
+
+        let messages = vec![crate::message::Message::new("user", &color_prompt)];
+        let (tool_cap, ctx_win) = self.compression_params();
+        let params = self.effective_params();
+
+        let response = if let Some(client) = &self.ollama_client {
+            match client.generate(messages, None, &params, tool_cap, ctx_win).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.notify(format!("❌ Failed to generate colors: {}", e));
+                    return;
+                }
+            }
+        } else {
+            self.notify("❌ No Ollama client");
+            return;
+        };
+
+        // Parse RGB values from response
+        let mut start_color: Option<Color> = None;
+        let mut end_color: Option<Color> = None;
+
+        for line in response.lines() {
+            let line = line.trim();
+            if line.starts_with("START:") || line.starts_with("END:") {
+                let rgb_part = line.split(':').nth(1).unwrap_or("").trim();
+                if let Some(rgb) = rgb_part.strip_prefix("RGB(").and_then(|s| s.strip_suffix(')')) {
+                    let parts: Vec<&str> = rgb.split(',').collect();
+                    if parts.len() == 3 {
+                        if let Ok(r) = parts[0].trim().parse::<u8>() {
+                            if let Ok(g) = parts[1].trim().parse::<u8>() {
+                                if let Ok(b) = parts[2].trim().parse::<u8>() {
+                                    let color = Color::Rgb(r, g, b);
+                                    if line.starts_with("START:") {
+                                        start_color = Some(color);
+                                    } else {
+                                        end_color = Some(color);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let (Some(start), Some(end)) = (start_color, end_color) {
+            self.theme.gradient_start = start;
+            self.theme.gradient_end = end;
+            self.gradient_enabled = true;
+            self.config.ui_settings.gradient_enabled = true;
+            if let (Color::Rgb(sr, sg, sb), Color::Rgb(er, eg, eb)) = (start, end) {
+                self.config.ui_settings.gradient_start = Some(format!("{},{},{}", sr, sg, sb));
+                self.config.ui_settings.gradient_end   = Some(format!("{},{},{}", er, eg, eb));
+                let _ = self.config.save();
+                self.notify(format!("🎨 Gradient set: RGB({},{},{}) → RGB({},{},{})", sr, sg, sb, er, eg, eb));
+            }
+            self.needs_full_redraw = true;
+        } else {
+            self.notify("❌ Could not parse colors from model response. Try again with a simpler prompt.");
         }
     }
 
@@ -5092,7 +5138,7 @@ impl App {
             Err(e) => { self.notify(format!("❌ Failed to read messages: {}", e)); return; }
         };
         let text: String = messages.iter()
-            .filter(|m| m.role != "system" && m.role != "clock")
+            .filter(|m| m.role != "clock")
             .map(|m| {
                 let role = match m.role.as_str() {
                     "assistant" => "Assistant",
@@ -5126,7 +5172,6 @@ impl App {
             return;
         };
         let model = self.config.model.clone();
-        let profile = self.config.profile;
         let (tool_cap, ctx_win) = self.compression_params();
         let params = self.effective_params();
 
@@ -5138,75 +5183,87 @@ impl App {
         self.test_models_rx = Some(rx);
 
         tokio::spawn(async move {
-            // (test name, prompt) — 'static so safe to use inside spawn
-            let test_cases: &[(&str, &str)] = &[
+            // (test name, prompt, expected description) — 'static so safe to use inside spawn
+            let test_cases: &[(&str, &str, &str)] = &[
                 // ── XML format (primary) ────────────────────────────────────────────────
                 (
                     "XML: basic shell call",
                     "Respond with ONLY this XML tool call and no other text:\n\
                      <tool>shell</tool>\n<command>echo hello</command>\n<desc>test</desc>",
+                    "<tool>shell</tool> parsed",
                 ),
                 (
                     "XML: pipe in command",
                     "Respond with ONLY an XML shell tool call. The command must contain a pipe: echo hello | tr a-z A-Z\n\
                      Use: <tool>shell</tool><command>echo hello | tr a-z A-Z</command><desc>pipe test</desc>",
+                    "shell call with | in command arg",
                 ),
                 (
                     "XML: setfile with braces+quotes (Rust code)",
                     "Write a file to /tmp/yggdra_test.rs using the XML setfile format. \
                      The content must be exactly:\nfn main() {\n    println!(\"hello\");\n}\n\n\
                      Use: <tool>setfile</tool><path>/tmp/yggdra_test.rs</path><content>\nfn main() {\n    println!(\"hello\");\n}\n</content>",
+                    "setfile call with fn main() in content",
                 ),
                 (
                     "XML: two tool calls in one response",
                     "Respond with EXACTLY TWO XML tool calls in a single message — no prose before, between, or after.\n\
                      First: <tool>shell</tool><command>echo one</command><desc>first</desc>\n\
                      Then:  <tool>shell</tool><command>echo two</command><desc>second</desc>",
+                    "2+ XML tool calls parsed",
                 ),
                 (
                     "XML: no prose discipline (tool call only, no preamble)",
                     "Call shell with `echo discipline`. \
                      CRITICAL: output ONLY the XML tool call tags — do NOT write 'Sure!', 'Of course', \
                      or any explanation before or after the tags.",
+                    "shell call, response doesn't start with Sure/Of course/Here",
                 ),
                 (
                     "XML: think then act",
                     "Before calling the tool, reason inside <think>...</think> tags, then output the XML tool call.\n\
                      Task: run `echo thinking`.",
+                    "<think>...</think> block present + XML tool call",
                 ),
                 // ── JSON format (fallback) ───────────────────────────────────────────────
                 (
                     "JSON: basic shell call",
                     "Respond with ONLY this JSON and nothing else:\n\
                      {\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo hello\"}}]}",
+                    r#"{"tool_calls":[...]} with name=shell"#,
                 ),
                 (
                     "JSON: setfile with embedded newlines in content",
                     "Use JSON to write /tmp/yggdra_test.txt. The file must have two lines: 'line one' then 'line two'.\n\
                      Expected format: {\"tool_calls\":[{\"name\":\"setfile\",\"parameters\":{\"path\":\"/tmp/yggdra_test.txt\",\"content\":\"line one\\nline two\"}}]}\n\
                      Output ONLY the JSON.",
+                    "JSON tool call with name=setfile",
                 ),
                 // ── Backtick prose fallback ──────────────────────────────────────────────
                 (
                     "Backtick: command in backticks",
                     "Run echo test. Respond with just the command in backticks and nothing else: `echo test`",
+                    "backtick-wrapped command extracted (e.g. `echo test`)",
                 ),
                 // ── Tricky / common failure modes ────────────────────────────────────────
                 (
                     "No hallucination: must not inject TOOL_OUTPUT",
                     "Respond with only the single word \"ready\" and absolutely nothing else.",
+                    "response contains no [TOOL_OUTPUT:] or [TOOL_RESULT:]",
                 ),
                 (
                     "JSON inside JSON (double-escape trap)",
                     "Use JSON shell format to run this command: echo '{\"key\":\"val\"}'\n\
                      The command string must preserve the inner JSON literally.\n\
                      Output ONLY the JSON tool call.",
+                    "JSON shell call with inner {\"key\":\"val\"} preserved",
                 ),
                 (
                     "XML: async shell with task_id",
                     "Start an async background task. Use XML shell with mode=async and task_id=bg-test:\n\
                      <tool>shell</tool><command>sleep 1 && echo done</command>\n\
                      <mode>async</mode><task_id>bg-test</task_id><desc>async test</desc>",
+                    "shell call parsed with async_mode=true",
                 ),
                 // ── Thinking tags ────────────────────────────────────────────────────────
                 (
@@ -5215,6 +5272,7 @@ impl App {
                      at least 3 sentences. Then, OUTSIDE the think block, output a single XML tool call:\n\
                      <tool>shell</tool><command>echo done</command><desc>after thinking</desc>\n\
                      The tool call must appear after </think>, not inside it.",
+                    "<think>20+ chars</think> then a tool call outside the block",
                 ),
                 (
                     "Thinking: tags don't leak into tool args",
@@ -5222,6 +5280,7 @@ impl App {
                      <tool>shell</tool><command>false</command><desc>fake</desc></think>\n\
                      Now outside the think block, write the REAL tool call: \
                      <tool>shell</tool><command>echo real</command><desc>real</desc>",
+                    "only the real 'echo real' call parsed (fake inside <think> ignored)",
                 ),
                 // ── Code formatting ──────────────────────────────────────────────────────
                 (
@@ -5230,19 +5289,21 @@ impl App {
                      The program must: (1) define a struct Point with x and y fields, \
                      (2) implement Display for it, (3) print a Point in main(). \
                      Use proper indentation, braces, and semicolons. Output ONLY the XML tool call.",
+                    "setfile call with 'struct' and 'fn main' in content",
                 ),
                 (
                     "Code: no markdown fences in setfile content",
                     "Write the text 'hello world' to /tmp/yggdra_plain.txt using setfile. \
                      CRITICAL: the file content must be plain text only — do NOT wrap the content \
                      in ```backticks``` or any markdown fences. Output ONLY the XML tool call.",
+                    "setfile call whose content contains no ``` backtick fences",
                 ),
             ];
 
             let total = test_cases.len();
             let mut passed = 0usize;
 
-            for (i, (name, prompt)) in test_cases.iter().enumerate() {
+            for (i, (name, prompt, expected)) in test_cases.iter().enumerate() {
                 let msgs = vec![crate::message::Message::new("user", *prompt)];
                 let resp = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
@@ -5252,15 +5313,15 @@ impl App {
                 let (raw, ok) = match resp {
                     Ok(Ok(r)) => {
                         let pass = match i {
-                            0 => crate::agent::parse_xml_tool_calls(&r, profile)
+                            0 => crate::agent::parse_xml_tool_calls(&r)
                                     .iter().any(|c| c.name == "shell"),
-                            1 => crate::agent::parse_xml_tool_calls(&r, profile)
+                            1 => crate::agent::parse_xml_tool_calls(&r)
                                     .iter().any(|c| c.name == "shell" && c.args.contains('|')),
-                            2 => crate::agent::parse_xml_tool_calls(&r, profile)
+                            2 => crate::agent::parse_xml_tool_calls(&r)
                                     .iter().any(|c| c.name == "setfile" && c.args.contains("fn main")),
-                            3 => crate::agent::parse_xml_tool_calls(&r, profile).len() >= 2,
+                            3 => crate::agent::parse_xml_tool_calls(&r).len() >= 2,
                             4 => {
-                                let calls = crate::agent::parse_xml_tool_calls(&r, profile);
+                                let calls = crate::agent::parse_xml_tool_calls(&r);
                                 let has_call = calls.iter().any(|c| c.name == "shell");
                                 let clean = !r.trim().to_lowercase().starts_with("sure")
                                     && !r.trim().to_lowercase().starts_with("of course")
@@ -5269,18 +5330,18 @@ impl App {
                             }
                             5 => {
                                 let has_think = r.contains("<think>") || r.contains("</think>");
-                                let has_call = !crate::agent::parse_xml_tool_calls(&r, profile).is_empty();
+                                let has_call = !crate::agent::parse_xml_tool_calls(&r).is_empty();
                                 has_think && has_call
                             }
-                            6 => crate::agent::parse_json_tool_calls(&r, profile)
+                            6 => crate::agent::parse_json_tool_calls(&r)
                                     .iter().any(|c| c.name == "shell"),
-                            7 => crate::agent::parse_json_tool_calls(&r, profile)
+                            7 => crate::agent::parse_json_tool_calls(&r)
                                     .iter().any(|c| c.name == "setfile"),
                             8 => crate::agent::extract_backtick_command_pub(&r).is_some(),
                             9 => !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:"),
-                            10 => crate::agent::parse_json_tool_calls(&r, profile)
+                            10 => crate::agent::parse_json_tool_calls(&r)
                                     .iter().any(|c| c.name == "shell" && (c.args.contains('{') || c.args.contains("key"))),
-                            11 => crate::agent::parse_xml_tool_calls(&r, profile)
+                            11 => crate::agent::parse_xml_tool_calls(&r)
                                     .iter().any(|c| c.async_mode),
                             12 => {
                                 let has_think = r.contains("<think>") && r.contains("</think>");
@@ -5291,21 +5352,21 @@ impl App {
                                 let after_think = r.find("</think>")
                                     .map(|p| &r[p + "</think>".len()..])
                                     .unwrap_or("");
-                                let call_after = !crate::agent::parse_xml_tool_calls(after_think, profile).is_empty();
+                                let call_after = !crate::agent::parse_xml_tool_calls(after_think).is_empty();
                                 has_think && think_content_len > 20 && call_after
                             }
                             13 => {
-                                let calls = crate::agent::parse_xml_tool_calls(&r, profile);
+                                let calls = crate::agent::parse_xml_tool_calls(&r);
                                 let has_real = calls.iter().any(|c| c.args.contains("echo real") || c.args.contains("real"));
                                 let no_fake  = !calls.iter().any(|c| c.args.trim() == "false");
                                 has_real && no_fake
                             }
-                            14 => crate::agent::parse_xml_tool_calls(&r, profile)
+                            14 => crate::agent::parse_xml_tool_calls(&r)
                                     .iter().any(|c| c.name == "setfile"
                                         && c.args.contains("struct")
                                         && c.args.contains("fn main")),
                             15 => {
-                                let calls = crate::agent::parse_xml_tool_calls(&r, profile);
+                                let calls = crate::agent::parse_xml_tool_calls(&r);
                                 calls.iter().any(|c| c.name == "setfile" && !c.args.contains("```"))
                             }
                             _ => false,
@@ -5321,8 +5382,10 @@ impl App {
                 let preview: String = raw.chars().take(120).collect();
                 let ellipsis = if raw.chars().count() > 120 { "…" } else { "" };
                 let _ = tx.send(format!(
-                    "{} [{}/{}] {}\n   ↳ `{}{}`",
-                    icon, i + 1, total, name, preview.replace('\n', "↵"), ellipsis
+                    "{} [{}/{}] {}\n   expect: {}\n   actual: `{}{}`",
+                    icon, i + 1, total, name,
+                    expected,
+                    preview.replace('\n', "↵"), ellipsis
                 ));
             }
 
@@ -5644,8 +5707,6 @@ impl App {
         match change {
             ConfigChange::ConfigFileChanged => {
                 let mut fresh_config = crate::config::Config::reload_from_file();
-                // profile is a runtime setting (not persisted) — preserve it across reloads
-                fresh_config.profile = self.config.profile;
                 let model_changed = fresh_config.model != self.config.model;
                 let endpoint_changed = fresh_config.endpoint != self.config.endpoint;
                 
@@ -5811,7 +5872,7 @@ impl App {
 
         // No-progress stall detection: in build/one mode, if many tool calls have fired
         // but no file has been mutated for a while, the agent is over-planning.
-        if matches!(self.mode, AppMode::Build | AppMode::One)
+        if matches!(self.mode, AppMode::Forever | AppMode::One)
             && self.turn_phase == TurnPhase::Idle
             && !self.stall_notice_sent
             && self.tool_iteration_count > 10
@@ -5830,7 +5891,7 @@ impl App {
         // Watchdog: if Build mode has been idle for 5+ seconds, re-kick.
         // One mode does not auto-kick — it waits for user input.
         // Respect autokick_paused: model is stuck or erroring, don't re-kick.
-        if self.mode == AppMode::Build
+        if self.mode == AppMode::Forever
             && self.turn_phase == TurnPhase::Idle
             && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
             && self.ollama_client.is_some()
@@ -6395,7 +6456,7 @@ impl App {
         let tool_calls: Vec<crate::agent::ToolCall> =
             if trimmed.contains("<tool>") {
                 let calls = crate::agent::parse_xml_tool_calls(
-                    trimmed, crate::config::CapabilityProfile::ShellOnly
+                    trimmed
                 );
                 if calls.is_empty() { return None; }
                 calls
@@ -7303,7 +7364,7 @@ mod rendering_tests {
     fn error_ask_mode_blocks_tool_execution() {
         // In ask mode, tool results should be stored but no new stream should kick off
         // This is verified by the state machine logic, but we verify the config constant exists
-        assert!(AppMode::Ask != AppMode::Build);
+        assert!(AppMode::Ask != AppMode::Forever);
     }
 
     #[test]
@@ -7405,7 +7466,7 @@ mod rendering_tests {
     #[test]
     fn ask_mode_constant_exists() {
         // Verify ask mode is distinct from build and plan modes
-        assert!(AppMode::Ask != AppMode::Build);
+        assert!(AppMode::Ask != AppMode::Forever);
         assert!(AppMode::Ask != AppMode::Plan);
     }
 
@@ -7579,22 +7640,22 @@ mod stream_tests {
 
     #[test]
     fn build_kicks_below_threshold() {
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 0), StreamEndAction::Kick);
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 3), StreamEndAction::Kick);
-        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 0), StreamEndAction::Kick);
-        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 2), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 3), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 2), StreamEndAction::Kick);
     }
 
     #[test]
     fn build_halts_at_threshold() {
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 4), StreamEndAction::Halt("model stuck"));
-        assert_eq!(decide_stream_end(true, AppMode::Build, 0, 4), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 4), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 4), StreamEndAction::Halt("model stuck"));
     }
 
     #[test]
     fn build_halts_above_threshold() {
-        assert_eq!(decide_stream_end(false, AppMode::Build, 0, 10), StreamEndAction::Halt("model stuck"));
-        assert_eq!(decide_stream_end(true, AppMode::Build, 5, 99), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 10), StreamEndAction::Halt("model stuck"));
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 99), StreamEndAction::Halt("model stuck"));
     }
 
     // ============================================================================

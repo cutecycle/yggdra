@@ -1,235 +1,405 @@
-// Test harness for small local models: qwen:0.8b, qwen:2b, qwen:4b, gemma:2b, gemma:7b
-// Runs on localhost:11434 (local Ollama)
-// Displays expected vs actual output for debugging
+// Gauntlet test suite for small Ollama models — uses real yggdra parsers + system prompt.
+// Usage: test_models [endpoint] [model1 model2 ...]
+// Default endpoint: http://localhost:11434
+// Default models: qwen3.5:0.8b-bf16  qwen3.5:2b-q4_K_M  qwen3.5:4b-q4_K_M
 
-use std::collections::HashMap;
-use std::time::Instant;
+use yggdra::{agent, message::Message, ollama::OllamaClient};
 
-#[derive(Debug, Clone)]
+// ── test definitions ──────────────────────────────────────────────────────────
+
 struct TestCase {
     name: &'static str,
     prompt: &'static str,
-    /// Expected patterns in output (one should match)
-    expected_patterns: Vec<&'static str>,
+    check: fn(&str) -> bool,
+    /// Short description of what a pass looks like (shown on failure)
+    expect: &'static str,
+    /// Override think flag: None = use default (false), Some(v) = force v
+    think: Option<bool>,
 }
+
+fn xml_shell(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell")
+}
+fn xml_setfile_rust(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "setfile" && c.args.contains("fn main"))
+}
+fn xml_two_calls(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).len() >= 2
+}
+fn xml_no_preamble(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    let has_call = calls.iter().any(|c| c.name == "shell");
+    let clean = !r.trim().to_lowercase().starts_with("sure")
+        && !r.trim().to_lowercase().starts_with("of course")
+        && !r.trim().to_lowercase().starts_with("here");
+    has_call && clean
+}
+fn xml_think_act(r: &str) -> bool {
+    let has_think = r.contains("<think>") || r.contains("</think>");
+    let has_call  = !agent::parse_xml_tool_calls(r).is_empty();
+    has_think && has_call
+}
+fn json_shell(r: &str) -> bool {
+    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "shell")
+}
+fn no_hallucination(r: &str) -> bool {
+    !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:")
+}
+
+// ── new check functions ───────────────────────────────────────────────────────
+
+fn xml_exec(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "exec")
+}
+fn xml_patchfile(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "patchfile")
+}
+fn xml_no_fence(r: &str) -> bool {
+    !r.contains("```") && !agent::parse_xml_tool_calls(r).is_empty()
+}
+fn xml_multiline(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r)
+        .iter()
+        .any(|c| c.args.contains('\n'))
+}
+fn xml_unicode(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r)
+        .iter()
+        .any(|c| c.args.contains("héllo") || c.args.contains("wörld"))
+}
+fn xml_commit(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "commit")
+}
+fn json_two_calls(r: &str) -> bool {
+    agent::parse_json_tool_calls(r).len() >= 2
+}
+fn json_no_preamble(r: &str) -> bool {
+    let calls = agent::parse_json_tool_calls(r);
+    let has_call = !calls.is_empty();
+    let clean = !r.trim().to_lowercase().starts_with("sure")
+        && !r.trim().to_lowercase().starts_with("of course")
+        && !r.trim().to_lowercase().starts_with("here")
+        && !r.trim().to_lowercase().starts_with("i'll")
+        && !r.trim().to_lowercase().starts_with("i will");
+    has_call && clean
+}
+fn json_exec(r: &str) -> bool {
+    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "exec")
+}
+fn json_setfile(r: &str) -> bool {
+    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "setfile")
+}
+fn ack_no_hallucination(r: &str) -> bool {
+    !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:")
+        && r.to_lowercase().contains("acknowledged")
+}
+fn no_code_block(r: &str) -> bool {
+    !r.contains("```") && !agent::parse_xml_tool_calls(r).is_empty()
+}
+fn xml_two_different_tools(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    if calls.len() < 2 { return false; }
+    let first = &calls[0].name;
+    calls.iter().any(|c| &c.name != first)
+}
+
+const TESTS: &[TestCase] = &[
+    TestCase {
+        name: "XML: basic shell call",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo hello</command>\n<desc>test</desc>",
+        check: xml_shell,
+        expect: "<tool>shell</tool> parsed",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: setfile with Rust code",
+        prompt: "Write a file to /tmp/yggdra_test.rs using the XML setfile format. \
+                 Content must include: fn main() {\n    println!(\"hello\");\n}\n\
+                 Use: <tool>setfile</tool><path>/tmp/yggdra_test.rs</path>\
+                 <content>\nfn main() {\n    println!(\"hello\");\n}\n</content>",
+        check: xml_setfile_rust,
+        expect: "<tool>setfile</tool> with Rust code",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: two tool calls in one response",
+        prompt: "Respond with EXACTLY TWO XML tool calls — no prose before, between, or after.\n\
+                 First: <tool>shell</tool><command>echo one</command><desc>first</desc>\n\
+                 Then:  <tool>shell</tool><command>echo two</command><desc>second</desc>",
+        check: xml_two_calls,
+        expect: "2 or more XML tool calls parsed",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: no prose discipline",
+        prompt: "Call shell with `echo discipline`. \
+                 CRITICAL: output ONLY the XML tool call — do NOT write 'Sure!', 'Of course', \
+                 or any explanation before or after.",
+        check: xml_no_preamble,
+        expect: "<tool>shell</tool> with no preamble",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: think then act",
+        prompt: "Before calling the tool, reason inside <think>...</think> tags, then output the XML tool call.\n\
+                 Task: run `echo thinking`.",
+        check: xml_think_act,
+        expect: "<think>...</think> block + XML tool call",
+        think: None, // allow native thinking; ThinkTokens are wrapped in <think> by stream_collect
+    },
+    TestCase {
+        name: "JSON: basic shell call",
+        prompt: "Respond with ONLY this JSON and nothing else:\n\
+                 {\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo hello\"}}]}",
+        check: json_shell,
+        expect: "JSON tool_calls with shell",
+        think: Some(false),
+    },
+    TestCase {
+        name: "No hallucination",
+        prompt: "Respond with only the single word \"ready\" and absolutely nothing else.",
+        check: no_hallucination,
+        expect: "no [TOOL_OUTPUT:] in response",
+        think: Some(false),
+    },
+    // ── XML parsing robustness ────────────────────────────────────────────────
+    TestCase {
+        name: "XML: exec tool call",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>exec</tool>\n<cmd>ls /tmp</cmd>",
+        check: xml_exec,
+        expect: "<tool>exec</tool> parsed with name == \"exec\"",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: patchfile tool call",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>patchfile</tool>\n<path>/tmp/test.rs</path>\n\
+                 <patch>--- a/test.rs\n+++ b/test.rs\n@@ -1 +1 @@\n-old\n+new\n</patch>",
+        check: xml_patchfile,
+        expect: "<tool>patchfile</tool> parsed with name == \"patchfile\"",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: no markdown fence",
+        prompt: "Output ONLY a raw XML tool call for shell with command `echo fence`. \
+                 Do NOT wrap it in ```xml or ``` fences. No other text.",
+        check: xml_no_fence,
+        expect: "valid XML tool call with no ``` fences",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: multiline command",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo line1\necho line2</command>\n<desc>multiline</desc>",
+        check: xml_multiline,
+        expect: "parsed command args contain a newline character",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: unicode in args",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo \"héllo wörld\"</command>\n<desc>unicode</desc>",
+        check: xml_unicode,
+        expect: "parsed args contain unicode string (héllo or wörld)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: commit tool call",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>commit</tool>\n<message>test</message>",
+        check: xml_commit,
+        expect: "<tool>commit</tool> parsed with name == \"commit\"",
+        think: Some(false),
+    },
+    // ── JSON tests ────────────────────────────────────────────────────────────
+    TestCase {
+        name: "JSON: two tool calls",
+        prompt: "Respond with ONLY this JSON and nothing else:\n\
+                 {\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo one\"}},\
+                 {\"name\":\"shell\",\"parameters\":{\"command\":\"echo two\"}}]}",
+        check: json_two_calls,
+        expect: "parse_json_tool_calls returns >= 2 calls",
+        think: Some(false),
+    },
+    TestCase {
+        name: "JSON: no preamble discipline",
+        prompt: "Output ONLY a JSON tool call for `echo hello` — no explanation, \
+                 no 'Sure', no 'Here is', just the raw JSON object with tool_calls.",
+        check: json_no_preamble,
+        expect: "JSON tool call present and no preamble words",
+        think: Some(false),
+    },
+    TestCase {
+        name: "JSON: exec tool call",
+        prompt: "Respond with ONLY this JSON and nothing else:\n\
+                 {\"tool_calls\":[{\"name\":\"exec\",\"parameters\":{\"cmd\":\"ls /tmp\"}}]}",
+        check: json_exec,
+        expect: "JSON tool call with name == \"exec\"",
+        think: Some(false),
+    },
+    TestCase {
+        name: "JSON: setfile tool call",
+        prompt: "Respond with ONLY this JSON and nothing else:\n\
+                 {\"tool_calls\":[{\"name\":\"setfile\",\"parameters\":\
+                 {\"path\":\"/tmp/test.txt\",\"content\":\"hello\"}}]}",
+        check: json_setfile,
+        expect: "JSON tool call with name == \"setfile\"",
+        think: Some(false),
+    },
+    // ── Behavioral / discipline tests ─────────────────────────────────────────
+    TestCase {
+        name: "Discipline: no tool output hallucination variant",
+        prompt: "Respond with only the word \"acknowledged\" and absolutely nothing else.",
+        check: ack_no_hallucination,
+        expect: "no [TOOL_OUTPUT:] and response contains \"acknowledged\"",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: no code block wrapping",
+        prompt: "Output the XML tool call for `echo clean` with NO markdown fences. \
+                 No ```, no ```xml. Just the raw XML.",
+        check: no_code_block,
+        expect: "parse_xml_tool_calls succeeds and no ``` in response",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: two different tools",
+        prompt: "Respond with EXACTLY TWO XML tool calls — no prose before, between, or after.\n\
+                 First: <tool>shell</tool><command>echo hello</command><desc>greet</desc>\n\
+                 Then:  <tool>setfile</tool><path>/tmp/out.txt</path><content>hello</content>",
+        check: xml_two_different_tools,
+        expect: ">= 2 XML tool calls with different tool names",
+        think: Some(false),
+    },
+];
+
+// ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    
-    let models = if args.len() > 1 {
-        args[1..].to_vec()
+
+    let (endpoint, models) = if args.len() >= 2 && args[1].starts_with("http") {
+        let ep = args[1].clone();
+        let ms = if args.len() > 2 {
+            args[2..].to_vec()
+        } else {
+            default_models()
+        };
+        (ep, ms)
+    } else if args.len() > 1 {
+        ("http://localhost:11434".to_string(), args[1..].to_vec())
     } else {
-        vec![
-            "qwen:0.5b".to_string(),
-            "qwen:2b".to_string(),
-            "qwen:4b".to_string(),
-            "gemma:2b".to_string(),
-            "gemma:7b".to_string(),
-        ]
+        ("http://localhost:11434".to_string(), default_models())
     };
 
-    let endpoint = std::env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    println!("🧪 Model Gauntlet Test Suite");
-    println!("📍 Endpoint: {}", endpoint);
-    println!("🤖 Models to test: {}", models.join(", "));
+    println!("🧪 yggdra Model Gauntlet");
+    println!("📍 Endpoint : {}", endpoint);
+    println!("🤖 Models   : {}", models.join(", "));
     println!();
 
-    // Define test cases
-    let test_cases = vec![
-        TestCase {
-            name: "JSON Tool Call",
-            prompt: "Respond with a JSON tool call to search the web for weather. Use this format: {\"tool_calls\": [{\"name\": \"search\", \"arguments\": {\"query\": \"weather\"}}]}",
-            expected_patterns: vec!["tool_calls", "search", "weather"],
-        },
-        TestCase {
-            name: "Simple Math",
-            prompt: "What is 2 + 2?",
-            expected_patterns: vec!["4"],
-        },
-        TestCase {
-            name: "Code Snippet",
-            prompt: "Write a simple Rust function that adds two numbers.",
-            expected_patterns: vec!["fn", "add", "+"],
-        },
-    ];
-
-    let mut results: HashMap<String, Vec<TestResult>> = HashMap::new();
+    
+    let mut totals: Vec<(String, usize, usize)> = vec![];
 
     for model in &models {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("📦 Testing Model: {}", model);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("📦 {}", model);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        // Check if model is available
-        match check_model_available(&endpoint, model).await {
-            Ok(true) => println!("✅ Model available"),
-            Ok(false) => {
-                println!("❌ Model not available on Ollama");
-                continue;
-            }
-            Err(e) => {
-                println!("⚠️  Error checking model: {}", e);
-                continue;
-            }
+        // connect
+        let client = match OllamaClient::new(&endpoint, model).await {
+            Ok(c) => c,
+            Err(e) => { println!("  ❌ connect failed: {}", e); continue; }
+        };
+
+        let system = agent::json_tool_descriptions();
+        let mut passed = 0usize;
+
+        for test in TESTS {
+            let msgs = vec![Message::new("user", test.prompt)];
+            let mut params = yggdra::config::ModelParams::default();
+            // Per-test think override: None = let model decide (native thinking allowed)
+            params.think = test.think;
+
+            // Use streaming (matches real agent behaviour, avoids Ollama non-streaming 500 crashes)
+            let raw = tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                stream_collect(&client, &system, msgs, params),
+            ).await
+            .unwrap_or_else(|_| "timeout".to_string());
+
+            let ok = (test.check)(&raw);
+
+            let icon = if ok { "✅" } else { "❌" };
+            let preview: String = raw.chars().take(160).collect();
+            let ellipsis = if raw.chars().count() > 160 { "…" } else { "" };
+            println!("{} {}", icon, test.name);
+            println!("   expect: {}", test.expect);
+            println!("   actual: `{}{}`", preview.replace('\n', "↵"), ellipsis);
+            if ok { passed += 1; }
         }
 
-        let mut model_results = vec![];
-
-        for test_case in &test_cases {
-            println!("\n🧪 Test: {}", test_case.name);
-            println!("   Prompt: {}", test_case.prompt);
-
-            match run_test(&endpoint, model, test_case).await {
-                Ok(result) => {
-                    let status = if result.passed { "✅ PASS" } else { "❌ FAIL" };
-                    println!("{}", status);
-                    println!("   Response (first 200 chars): {}", 
-                        if result.response.len() > 200 {
-                            format!("{}...", &result.response[..200])
-                        } else {
-                            result.response.clone()
-                        }
-                    );
-                    println!("   Tokens: {}/{}ms", result.tokens_used, result.duration_ms);
-                    println!("   Matched patterns: {}", result.matched_patterns.join(", "));
-                    model_results.push(result);
-                }
-                Err(e) => {
-                    println!("❌ ERROR: {}", e);
-                    model_results.push(TestResult {
-                        test_name: test_case.name.to_string(),
-                        passed: false,
-                        response: format!("Error: {}", e),
-                        tokens_used: 0,
-                        duration_ms: 0,
-                        matched_patterns: vec![],
-                    });
-                }
-            }
-        }
-
-        results.insert(model.clone(), model_results);
+        println!("  → {}/{} passed", passed, TESTS.len());
+        totals.push((model.clone(), passed, TESTS.len()));
         println!();
     }
 
-    // Summary
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("📊 Summary");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    for model in &models {
-        if let Some(model_results) = results.get(model) {
-            let passed = model_results.iter().filter(|r| r.passed).count();
-            let total = model_results.len();
-            let avg_tokens = if !model_results.is_empty() {
-                model_results.iter().map(|r| r.tokens_used).sum::<u32>() / total as u32
-            } else {
-                0
-            };
-            println!("{}: {}/{} tests passed (avg {} tokens)", model, passed, total, avg_tokens);
-        }
+    for (m, p, t) in &totals {
+        let bar = "█".repeat(*p) + &"░".repeat(t - p);
+        println!("  {} [{bar}] {p}/{t}", m);
     }
 
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct TestResult {
-    test_name: String,
-    passed: bool,
-    response: String,
-    tokens_used: u32,
-    duration_ms: u32,
-    matched_patterns: Vec<String>,
+fn default_models() -> Vec<String> {
+    vec![
+        "qwen3.5:0.8b-bf16".to_string(),
+        "qwen3.5:2b-q4_K_M".to_string(),
+        "qwen3.5:4b-q4_K_M".to_string(),
+    ]
 }
 
-async fn check_model_available(endpoint: &str, model: &str) -> anyhow::Result<bool> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/tags", endpoint);
-    
-    let response = client.get(&url).send().await?;
-    if !response.status().is_success() {
-        return Ok(false);
-    }
-
-    let body = response.json::<serde_json::Value>().await?;
-    if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-        Ok(models.iter().any(|m| {
-            m.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| n == model)
-                .unwrap_or(false)
-        }))
-    } else {
-        Ok(false)
-    }
-}
-
-async fn run_test(endpoint: &str, model: &str, test_case: &TestCase) -> anyhow::Result<TestResult> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/chat", endpoint);
-
-    let request = serde_json::json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": test_case.prompt
+/// Collect all streaming content + thinking tokens into a single string.
+/// Uses steering (system prompt) via generate_streaming() — matches real agent behaviour.
+/// Native ThinkToken events are wrapped in `<think>...</think>` so parsers/checks can see them.
+async fn stream_collect(
+    client: &OllamaClient,
+    system: &str,
+    msgs: Vec<Message>,
+    params: yggdra::config::ModelParams,
+) -> String {
+    use yggdra::ollama::StreamEvent;
+    let mut rx = client.generate_streaming(msgs, Some(system), params, None, None);
+    let mut text = String::new();
+    let mut in_think = false;
+    loop {
+        match rx.recv().await {
+            Some(StreamEvent::Token(t)) => {
+                if in_think {
+                    text.push_str("</think>");
+                    in_think = false;
+                }
+                text.push_str(&t);
             }
-        ],
-        "stream": false
-    });
-
-    let start = Instant::now();
-    let response = client
-        .post(&url)
-        .json(&request)
-        .send()
-        .await?;
-    
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!("HTTP {}", response.status()));
+            Some(StreamEvent::ThinkToken(t)) => {
+                if !in_think && !t.is_empty() {
+                    text.push_str("<think>");
+                    in_think = true;
+                }
+                text.push_str(&t);
+            }
+            Some(StreamEvent::Done { .. }) => {
+                if in_think { text.push_str("</think>"); }
+                break;
+            }
+            Some(StreamEvent::Error(e)) => { text = format!("error: {e}"); break; }
+            None => break,
+        }
     }
-
-    let body = response.json::<serde_json::Value>().await?;
-    let duration = start.elapsed();
-
-    let response_text = body
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let prompt_tokens = body
-        .get("prompt_eval_count")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0) as u32;
-
-    let completion_tokens = body
-        .get("eval_count")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0) as u32;
-
-    let total_tokens = prompt_tokens + completion_tokens;
-
-    // Check if response matches expected patterns
-    let matched_patterns: Vec<String> = test_case
-        .expected_patterns
-        .iter()
-        .filter(|pattern| response_text.to_lowercase().contains(&pattern.to_lowercase()))
-        .map(|p| p.to_string())
-        .collect();
-
-    let passed = !matched_patterns.is_empty();
-
-    Ok(TestResult {
-        test_name: test_case.name.to_string(),
-        passed,
-        response: response_text,
-        tokens_used: total_tokens,
-        duration_ms: duration.as_millis() as u32,
-        matched_patterns,
-    })
+    text
 }

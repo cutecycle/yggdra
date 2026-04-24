@@ -23,3 +23,8 @@ jobs:
       - run: cargo test --lib --release
 
       - run: cargo build --release
+
+      - name: License check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

@@ -4,7 +4,7 @@ mod dlog;
 mod epoch;
 mod gaps;
 mod highlight;
-mod knowledge_index;
+
 mod markdown;
 mod msglog;
 mod message;
@@ -27,7 +27,7 @@ mod watcher;
 use anyhow::Result;
 use session::Session;
 use ui::App;
-use config::{AppMode, CapabilityProfile};
+use config::AppMode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,24 +35,19 @@ async fn main() -> Result<()> {
     #[cfg(unix)]
     unsafe { libc::setpgid(0, 0); }
 
-    // Shell-only is the default profile. Use --standard to get the full tool set.
-    let binary_name = std::env::args().next().unwrap_or_default();
-    let mut shell_only = !binary_name.ends_with("yggdra-std");
-
     // Parse CLI arguments for mode override
     let mut mode_override: Option<AppMode> = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--ask"        => mode_override = Some(AppMode::Ask),
-            "--build"      => mode_override = Some(AppMode::Build),
+            "--build"      => mode_override = Some(AppMode::Forever),
             "--plan"       => mode_override = Some(AppMode::Plan),
             "--one"        => mode_override = Some(AppMode::One),
             "--test"          => {
-                mode_override = Some(AppMode::Build);
+                mode_override = Some(AppMode::Forever);
                 std::env::set_var("YGGDRA_TEST_MODE", "1");
             }
-            "--shell-only" => shell_only = true,
-            "--standard"   => shell_only = false,
+            "--shell-only" | "--standard" => {} // no-op: shell-only is now hardcoded
             "--help" | "-h" => {
                 eprintln!("Usage: yggdra [OPTIONS]");
                 eprintln!("Options:");
@@ -61,8 +56,6 @@ async fn main() -> Result<()> {
                 eprintln!("  --plan        Start in plan mode (default)");
                 eprintln!("  --one         Start in one-off task mode (auto-completes with notification)");
                 eprintln!("  --test          Run in build mode using OpenRouter API for tests");
-                eprintln!("  --standard    Use full tool set (editfile, rg, commit…)");
-                eprintln!("  --shell-only  Restrict agent to shell tool only (default)");
                 eprintln!("  --help        Show this help message");
                 return Ok(());
             }
@@ -126,10 +119,6 @@ async fn main() -> Result<()> {
             c.mode = mode;
             eprintln!("🔧 CLI override: mode={}", mode);
         }
-        if shell_only {
-            c.profile = CapabilityProfile::ShellOnly;
-            eprintln!("🐚 Shell-only mode: agent restricted to shell tool");
-        }
         c
     };
 
@@ -191,13 +180,6 @@ async fn main() -> Result<()> {
         }
     };
     
-    // Start background knowledge indexing task
-    let index_config = crate::knowledge_index::KnowledgeIndexConfig {
-        size_limit_bytes: (config.knowledge_index.size_limit_gb as u64) * 1024 * 1024 * 1024,
-        battery_delay_ms: config.knowledge_index.battery_delay_ms,
-        enabled: config.knowledge_index.enabled,
-    };
-    knowledge_index::start_indexing_task(Some(index_config));
     
     // One mode uses ephemeral sessions — each invocation is a fresh start.
     let session = if config.mode == AppMode::One {
@@ -225,18 +207,26 @@ async fn main() -> Result<()> {
             Some(ollama::OllamaClient::new_with_existing(probe, &config.model))
         }
     } else {
-        match ollama::OllamaClient::new_with_key(&config.endpoint, &config.model, config.api_key.as_deref()).await {
-            Ok(client) => Some(client),
-            Err(_) => {
-                notifications::error_occurred("Ollama connection failed").await;
-                None
+        // Build the client immediately (no blocking probe) so the TUI can start at once.
+        // A background task validates connectivity and notifies if Ollama is unreachable.
+        match ollama::OllamaClient::new_unchecked(&config.endpoint, &config.model, config.api_key.as_deref()) {
+            Ok(client) => {
+                let checker = client.clone();
+                tokio::spawn(async move {
+                    if let Err(_) = checker.list_models().await {
+                        notifications::error_occurred("Ollama connection failed").await;
+                    }
+                });
+                Some(client)
             }
+            Err(_) => None,
         }
     };
 
-    // Detect native context length for the selected model (best-effort; silently skips on error).
+    // Detect native context length in the background — purely informational, not needed at launch.
     if let Some(ref client) = ollama_client {
-        client.fetch_native_ctx().await;
+        let ctx_client = client.clone();
+        tokio::spawn(async move { ctx_client.fetch_native_ctx().await; });
     }
 
     let mut app = App::new(config, session, ollama_client, agents_md, config_watcher_rx);

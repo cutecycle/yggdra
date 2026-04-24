@@ -2,7 +2,7 @@ name: Update Vendored Dependencies
 
 on:
   schedule:
-    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+    - cron: "0 6 1 * *"  # Monthly on the 1st at 06:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -25,6 +25,12 @@ jobs:
       - name: Re-vendor
         run: cargo vendor
 
+      - name: Verify build
+        run: cargo build --release --offline
+
+      - name: Run tests
+        run: cargo test --lib --release --offline
+
       - name: Check for changes
         id: diff
         run: |
@@ -39,7 +45,7 @@ jobs:
           commit-message: "chore: update vendored dependencies"
           title: "chore: update vendored dependencies"
           body: |
-            Automated weekly vendor update.
+            Automated monthly vendor update.
 
             Changes to `vendor/` and `Cargo.lock` from `cargo update && cargo vendor`.
           labels: dependencies
