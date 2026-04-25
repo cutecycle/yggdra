@@ -1,7 +1,9 @@
 # Normalize line endings for cross-platform consistency.
-# This ensures vendor files keep LF on Windows checkout,
-# so cargo checksum verification doesn't fail (checksums are computed on LF content).
 * text=auto eol=lf
+
+# Vendor files must never have line endings converted — cargo verifies
+# checksums against exact byte content, and any eol normalization breaks them.
+vendor/** -text
 
 # Binary files must never be converted
 *.png binary
