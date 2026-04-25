@@ -47,9 +47,9 @@ After completing a task, run `make install` to ensure the updated binary is avai
 - Tool results injected as: `[TOOL_OUTPUT: name = result]`
 - Completion signal: `[DONE]`
 - Session data lives in `~/.yggdra/sessions/<uuid>/`
-- Per-project data lives in `.yggdra/` (log/, gaps, session marker, todo/*, knowledge -> offlinebase)
+- Per-project data lives in `.yggdra/` (log/, gaps, session marker, todo/*, knowledge symlink)
 - **Todos:** discoverable markdown files in `.yggdra/todo/` — see `.yggdra/todo/README.md`
-- **Knowledge base:** symlink `.yggdra/knowledge` → `~/source/repos/offlinebase` (135,000+ offline docs)
+- **Knowledge base:** optional symlink `.yggdra/knowledge` → any local docs folder
 
 ## CLI Flags
 
@@ -75,23 +75,20 @@ Mode cycle order in the UI: Plan → Build → One → Ask → Plan.
 
 ## Knowledge Base Access
 
-Agents can search the offline knowledge base at `.yggdra/knowledge` (symlink to `~/source/repos/offlinebase`):
+Agents can search a local knowledge base if `.yggdra/knowledge` is symlinked to a docs folder:
 
 ```bash
-# Search Rust docs
-<|tool>rg<|tool_sep>async|trait|lifetime<|tool_sep>.yggdra/knowledge/rust/<|end_tool>
-
-# Search Godot tutorials
-<|tool>rg<|tool_sep>Node3D|physics<|tool_sep>.yggdra/knowledge/godot/<|end_tool>
+# Search docs
+<|tool>rg<|tool_sep>async|trait|lifetime<|tool_sep>.yggdra/knowledge/<|end_tool>
 
 # List categories
-<|tool>spawn<|tool_sep>ls<|tool_sep>.yggdra/knowledge/<|end_tool>
+<|tool>exec<|tool_sep>ls<|tool_sep>.yggdra/knowledge/<|end_tool>
 
 # Read a specific doc
-<|tool>editfile<|tool_sep>.yggdra/knowledge/README.md<|end_tool>
+<|tool>shell<|tool_sep>cat .yggdra/knowledge/README.md<|end_tool>
 ```
 
-The knowledge base contains 135,000+ files across 73 categories: spacecraft systems, programming (Rust/Python), graphics (Godot), life support, navigation, and reference materials.
+The model treats it like any searchable directory — no indexing server required.
 
 ## Constraints — never break these
 
