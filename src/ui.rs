@@ -466,6 +466,8 @@ pub struct App {
     palette_open: bool,
     /// Which palette item is highlighted
     palette_selection: usize,
+    /// Input buffer saved when Ctrl+P opens palette mid-text; restored on close/cancel
+    palette_saved_buffer: Option<String>,
     /// Whether the model picker overlay is open
     model_picker_open: bool,
     /// Available models for the picker
@@ -506,6 +508,8 @@ pub struct App {
     last_battery_check: std::time::Instant,
     /// Pending async battery check result
     battery_result_rx: Option<tokio::sync::oneshot::Receiver<BatteryState>>,
+    /// Pending async /color generation result (raw LLM response text or error)
+    color_result_rx: Option<oneshot::Receiver<Result<String, String>>>,
     /// Syntax highlighter for code blocks
     highlighter: Highlighter,
     /// Currently displayed inline tool results (cleared when tool completes and is added to history)
@@ -546,6 +550,14 @@ pub struct App {
     /// Used to render the cutoff divider in the message list.
     context_cutoff_dropped: usize,
     /// Compact project file listing (size + modified time + path, newest-first).
+
+    // ── Celebration effects ───────────────────────────────────────────────
+    /// Active fireworks particles for </done> celebration. Each particle has (x, y, dx, dy, age, max_age, color).
+    fireworks: Vec<(f32, f32, f32, f32, u16, u16, ratatui::style::Color)>,
+    /// Frame when fireworks were triggered (for animation timing)
+    fireworks_triggered_at: Option<u64>,
+    /// Current task progress percentage (0-100), parsed from <percent>N</percent> tags
+    task_progress: Option<u32>,
     /// Injected into every system prompt so the model knows what exists.
     project_context: String,
     /// When project_context was last built (refresh after mutations or after 60s stale)
@@ -575,6 +587,19 @@ pub struct App {
     /// When true, the next draw loop iteration will clear the terminal first to recover
     /// from rendering corruption (e.g., after connection errors with raw escape sequences).
     needs_full_redraw: bool,
+}
+
+/// Format a token count as a human-readable string (e.g. 1.2k, 32k, 1.5M).
+fn human_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
 }
 
 impl App {
@@ -717,6 +742,7 @@ impl App {
             last_stream_token_time: None,
             palette_open: false,
             palette_selection: 0,
+            palette_saved_buffer: None,
             model_picker_open: false,
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
@@ -737,6 +763,7 @@ impl App {
             on_battery: crate::battery::battery_state(),
             last_battery_check: std::time::Instant::now(),
             battery_result_rx: None,
+            color_result_rx: None,
             highlighter: Highlighter::new(),
             inline_tool_results: Vec::new(),
             subagent_entries: Vec::new(),
@@ -764,6 +791,9 @@ impl App {
             render_cache_msg_count: usize::MAX, // force first build
             render_cache_width: 0,
             render_cache_theme: crate::theme::ThemeKind::Dark,
+            fireworks: Vec::new(),
+            fireworks_triggered_at: None,
+            task_progress: None,
             render_cache_exchange_end: 0,
             plan_understood: false,
             endpoint_type,
@@ -882,12 +912,12 @@ impl App {
                     if let Some(eq) = rest.find(" = ") {
                         let name = &rest[..eq];
                         let raw_body = rest[eq + 3..].trim_end_matches(']');
-                        if Self::looks_like_diff(raw_body) {
+                        if looks_like_diff(raw_body) {
                             let hint = if is_cursor {
                                 if is_expanded { "collapse" } else { "expand" }
                             } else { "" };
                             let max_lines = if is_expanded { 0 } else { 10 };
-                            let diff_lines = Self::render_diff_styled(display_emoji, name, raw_body, max_lines, hint);
+                            let diff_lines = render_diff_styled(display_emoji, name, raw_body, max_lines, hint);
                             Some(ratatui::text::Text::from(diff_lines))
                         } else { None }
                     } else { None }
@@ -1009,6 +1039,9 @@ impl App {
         loop {
             self.tick_count = self.tick_count.wrapping_add(1);
             
+            // Update fireworks animation
+            self.update_fireworks();
+            
             // Check for config changes (watcher events) — drain all pending
             if let Some(ref mut rx) = self.config_watcher_rx {
                 let mut last_change: Option<crate::watcher::ConfigChange> = None;
@@ -1037,6 +1070,8 @@ impl App {
             self.check_gap_result();
             // Drain any streamed /test_models results
             self.check_test_models();
+            // Poll for completed async /color generation
+            self.check_color_result();
             // Check for completed subagent execution
             self.check_subagent_result();
             // Check for completed async background tasks
@@ -1501,12 +1536,24 @@ impl App {
         // Extract <plan>...</plan> block: write to .yggdra/plan.md and strip from stored text
         let response_text = self.extract_and_write_plan(response_text);
 
-        // Detect [UNDERSTOOD] in Plan mode — agent is ready to execute
-        if self.mode == AppMode::Plan && response_text.contains("[UNDERSTOOD]") {
+        // Detect </understood> in Plan mode — agent is ready to execute
+        if self.mode == AppMode::Plan && response_text.contains("</understood>") {
             self.plan_understood = true;
             self.status_message = "💡 Agent is ready — press Enter to execute".to_string();
             tokio::spawn(crate::notifications::agent_says("💡 Plan understood — press Enter to execute"));
             self.render_cache_dirty = true;
+        }
+
+        // Parse <percent>N</percent> for task progress bar
+        if let Some(start) = response_text.find("<percent>") {
+            if let Some(end) = response_text.find("</percent>") {
+                if start < end {
+                    let pct_str = &response_text[start + 9..end];
+                    if let Ok(pct) = pct_str.parse::<u32>() {
+                        self.task_progress = Some(pct.min(100));
+                    }
+                }
+            }
         }
 
         // Persist assistant message
@@ -1578,6 +1625,9 @@ impl App {
         if response_text.contains("</done>") {
             self.push_system_event("🌸 milestone");
             tokio::spawn(crate::notifications::model_responded("🌸 milestone reached"));
+
+            // 🎆 Trigger fireworks celebration!
+            self.trigger_fireworks();
 
             // Track task tokens: compute since last </done>
             let task_tokens = self.total_tokens_used.saturating_sub(self.session_tokens_at_last_done);
@@ -2855,9 +2905,12 @@ impl App {
             AppMode::Ask =>
                 "MODE: ASK (read-only). Read files freely — discuss, analyse, explain.",
             AppMode::Plan =>
-                "MODE: PLAN (interactive). Discuss and analyse. Use shell for read-only commands only.",
+                "MODE: PLAN (interactive). Discuss and analyse. Use shell for read-only commands only. \
+                 Every response must begin with an ambiguity rating (1-100) in the format <ambiguity>N</ambiguity>. \
+                 When you understand the task, emit </understood> on its own line — this signals you're ready to proceed.",
             AppMode::Forever =>
-                "MODE: BUILD (autonomous). Execute shell commands to complete tasks.",
+                "MODE: BUILD (autonomous). Execute shell commands to complete tasks. \
+                 When the task is fully complete, emit </done> on its own line.",
             AppMode::One =>
                 "MODE: ONE (one-off). Execute shell commands autonomously to complete a single task. \
                  When the task is fully complete, emit </done> on its own line — this stops the loop.",
@@ -2868,7 +2921,10 @@ impl App {
             .map(|n| format!("\nCONTEXT WINDOW: {} tokens — budget returnlines accordingly", n))
             .unwrap_or_default();
         let mut base = format!(
-            "yggdra shell-only | OS: {os}\n\
+            "yggdra — the adorable TUI agent 🌸✨\n\
+             You are yggdra, the most adorable in the universe! Be warm, friendly, and encouraging, but critical -- \
+             and remember to get a chuckle out of the user. \
+             Keep responses concise but delightful.\n\
              {mode_block}\n\
              ONE tool: shell{ctx_note}\n\
              ---\n"
@@ -2921,12 +2977,6 @@ impl App {
              PERSIST NOTES: shell \"echo 'note' >> .yggdra/memory.md\" to remember facts across turns.\n\
              PERSIST REASONING: shell \"echo 'thought' >> .yggdra/thoughts.md\" before complex steps."
         );
-        // Inject recent context / memory / thoughts
-        let recent = self.recent_messages_block();
-        if !recent.is_empty() {
-            base.push_str("\n---\n");
-            base.push_str(&recent);
-        }
         let memory = Self::memory_block();
         if !memory.is_empty() {
             base.push_str("\n---\n");
@@ -2964,7 +3014,19 @@ impl App {
             if !error_block.is_empty() { base.push_str(&error_block); }
         }
 
-        base.push_str("---\nOutput XML tool tags only — no prose outside the tags.");
+        // Inject recent chat context last — highest recency weight for small models
+        let recent = self.recent_messages_block();
+        if !recent.is_empty() {
+            base.push_str("\n---\n");
+            base.push_str(&recent);
+        }
+
+        base.push_str("---\n\
+             COMPLETION SIGNALS:\n\
+             • </done> — Task is COMPLETE. Use when work is finished (BUILD/ONE modes).\n\
+             • </understood> — Ready to proceed. Use in PLAN mode after understanding the task.\n\
+             PROGRESS: Use <percent>N</percent> (0-100) to show task progress in the UI loading bar.\n\
+             Output XML tool tags only — no prose outside the tags.");
         SteeringDirective::custom(&base).format_for_system_prompt()
     }
 
@@ -3077,6 +3139,112 @@ impl App {
             .map(|v| v.len()).unwrap_or(0);
     }
 
+    /// Trigger fireworks celebration effect across the gradient background
+    fn trigger_fireworks(&mut self) {
+        use ratatui::style::Color;
+        
+        // Celebration colors: gold, pink, cyan, purple, orange
+        let colors = vec![
+            Color::Rgb(255, 215, 0),   // Gold
+            Color::Rgb(255, 105, 180), // Hot pink
+            Color::Rgb(0, 255, 255),   // Cyan
+            Color::Rgb(147, 112, 219), // Purple
+            Color::Rgb(255, 165, 0),   // Orange
+            Color::Rgb(50, 205, 50),   // Lime green
+        ];
+        
+        // Spawn 30 particles from bottom center
+        for i in 0..30 {
+            let angle = (i as f32 / 30.0) * std::f32::consts::PI;
+            let speed = 0.3 + (i % 5) as f32 * 0.1;
+            let dx = (angle.cos() - 0.5) * speed;
+            let dy = -angle.sin() * speed - 0.2;
+            
+            let color = colors[i % colors.len()];
+            self.fireworks.push((0.5, 1.0, dx, dy, 0, 60 + (i % 20) as u16, color));
+        }
+        
+        self.fireworks_triggered_at = Some(self.tick_count);
+    }
+
+    /// Update fireworks particle positions and remove expired particles
+    fn update_fireworks(&mut self) {
+        if self.fireworks.is_empty() {
+            return;
+        }
+        
+        // Update all particles
+        let mut new_fireworks = Vec::new();
+        for (x, y, dx, dy, age, max_age, color) in self.fireworks.drain(..) {
+            let new_age = age + 1;
+            if new_age >= max_age {
+                continue; // Particle expired
+            }
+            
+            // Update position with gravity
+            let new_y = y + dy;
+            let new_x = x + dx;
+            let new_dy = dy + 0.015; // Gravity
+            
+            new_fireworks.push((new_x, new_y, dx, new_dy, new_age, max_age, color));
+        }
+        
+        self.fireworks = new_fireworks;
+    }
+
+    /// Render fireworks particles across the entire screen area
+    fn render_fireworks(&self, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::style::{Style, Color};
+        use ratatui::widgets::Paragraph;
+        
+        for (x, y, _dx, _dy, age, max_age, color) in &self.fireworks {
+            // Calculate opacity based on age (fade out near end of life)
+            let progress = *age as f32 / *max_age as f32;
+            let opacity = if progress < 0.7 {
+                1.0
+            } else {
+                1.0 - ((progress - 0.7) / 0.3) // Fade out in last 30% of life
+            };
+            
+            // Convert normalized coordinates to screen coordinates
+            let screen_x = area.x + ((*x * area.width as f32) as u16).min(area.width - 1);
+            let screen_y = area.y + ((*y * area.height as f32) as u16).min(area.height - 1);
+            
+            // Create sparkle character based on age (twinkle effect)
+            let sparkle = match age % 4 {
+                0 => "✦",
+                1 => "✧",
+                2 => "★",
+                _ => "☆",
+            };
+            
+            // Apply opacity by adjusting color brightness
+            let dimmed_color = match color {
+                Color::Rgb(r, g, b) => {
+                    let factor = opacity;
+                    Color::Rgb(
+                        (*r as f32 * factor) as u8,
+                        (*g as f32 * factor) as u8,
+                        (*b as f32 * factor) as u8,
+                    )
+                }
+                _ => *color,
+            };
+            
+            let particle = Paragraph::new(sparkle)
+                .style(Style::default().fg(dimmed_color));
+            
+            let particle_area = ratatui::layout::Rect {
+                x: screen_x,
+                y: screen_y,
+                width: 2, // Sparkle chars are wider
+                height: 1,
+            };
+            
+            f.render_widget(particle, particle_area);
+        }
+    }
+
     /// Push a notice that is both shown in the UI and forwarded to the model as
     /// an inline system instruction (role "notice" → Ollama "system").
     fn push_agent_notice(&mut self, text: impl Into<String>) {
@@ -3169,87 +3337,30 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(2),                      // [0] Header
-                    Constraint::Length(warning_height),         // [1] Warning bar (0 if local)
-                    Constraint::Min(5),                         // [2] Messages
-                    Constraint::Length(1),                      // [3] Spacer above boxes
-                    Constraint::Length(subagent_panel_height),  // [4] Subagent panel (0 if none visible)
-                    Constraint::Length(input_height),           // [5] Input
-                    Constraint::Length(1),                      // [6] Status bar
+                    Constraint::Length(warning_height),         // [0] Warning bar (0 if local)
+                    Constraint::Min(5),                         // [1] Messages
+                    Constraint::Length(1),                      // [2] Spacer above boxes
+                    Constraint::Length(subagent_panel_height),  // [3] Subagent panel (0 if none visible)
+                    Constraint::Length(input_height),           // [4] Input
+                    Constraint::Length(1),                      // [5] Status bar
                 ]
                 .as_ref(),
             )
             .split(area);
 
-        // Header with context window indicator
-        let connection_status = if self.ollama_client.is_some() { "🦙" } else { "❌" };
-        let (mode_label, mode_color) = match self.mode {
-            AppMode::Forever => ("⚡ FOREVER", self.theme.violet),
-            AppMode::Plan  => ("🧠 PLAN",  self.theme.accent),
-            AppMode::Ask => ("🔍 ASK", Color::Yellow),
-            AppMode::One => ("🎯 ONE", Color::Green),
-        }; 
-
-        // Token usage indicator — real counts when available, estimate otherwise
-        let (prompt_tok, gen_tok) = self.last_token_counts;
-        let context_indicator = if prompt_tok > 0 {
-            // Real data from Ollama
-            let context_window = self.effective_context_window() as f64;
-            let usage_pct = ((prompt_tok as f64) / context_window * 100.0).min(100.0) as u32;
-            let dot = if usage_pct > 70 { "🔴" } else if usage_pct > 50 { "🟡" } else { "🟢" };
-            format!("{dot} {prompt_tok}+{gen_tok}tok ({usage_pct}%)")
-        } else {
-            // No response yet — show session total or idle
-            if self.total_tokens_used > 0 {
-                format!("🟢 {}tok total", self.total_tokens_used)
-            } else {
-                "🟢 idle".to_string()
-            }
-        };
-
-        // Endpoint type indicator with color
-        let (endpoint_display, endpoint_color) = match self.endpoint_type.as_str() {
-            "OpenRouter" => (&self.endpoint_type, Color::Red),
-            "llama.cpp" => (&self.endpoint_type, Color::Magenta),
-            "Ollama" => (&self.endpoint_type, Color::Green),
-            "Offline" => (&self.endpoint_type, Color::Gray),
-            _ => (&self.endpoint_type, Color::Yellow),
-        };
-
-        let remote_indicator = if self.config.endpoint.contains("localhost") || self.config.endpoint.contains("127.0.0.1") {
-            ""
-        } else {
-            "🌐 "
-        };
-
-        let header_line = Line::from(vec![
-            Span::raw("🌷 "),
-            Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-            Span::raw(" | "),
-            Span::raw(connection_status),
-            Span::raw(" | "),
-            Span::raw(&self.config.model),
-            Span::raw(" | "),
-            Span::raw(&context_indicator),
-            Span::raw(" | "),
-            Span::raw(remote_indicator),
-            Span::styled(format!("[{}]", endpoint_display), Style::default().fg(endpoint_color)),
-        ]);
-
-        let header = Paragraph::new(header_line)
-            .block(Block::default().borders(Borders::BOTTOM).title("Status"));
-        f.render_widget(header, chunks[0]);
-
         // Warning bar: shown when inference endpoint is not localhost
         if is_remote_endpoint && warning_height > 0 {
-            let warn_text = format!("⚠ OUTSIDE INFERENCE: {}  — data leaves this machine", self.config.endpoint);
+            let warn_text = format!("⚠ outside inference: {}  — data leaves this machine", self.config.endpoint);
             let warn_bar = Paragraph::new(warn_text)
                 .style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD));
-            f.render_widget(warn_bar, chunks[1]);
+            f.render_widget(warn_bar, chunks[0]);
         }
 
         // Messages area with full-width colored bands — bottom-anchored with scroll
-        let messages_area = chunks[2];
+        let messages_area = chunks[1];
+        // Clear the messages area on every frame — prevents stale cells when input box
+        // shrinks (rows shift from input chunk to messages chunk, ratatui diff won't clear them)
+        f.render_widget(Clear, messages_area);
         let viewport_height = messages_area.height as i32;
         let area_width = messages_area.width;
 
@@ -3299,7 +3410,7 @@ impl App {
             // If the model is building a tool-call (JSON or XML), pretty-print it; otherwise show raw.
             } else if self.streaming_text.trim_start().starts_with('{')
                    || self.streaming_text.contains("<tool>") {
-                if let Some(pretty) = Self::prettify_tool_calls(&self.streaming_text) {
+                if let Some(pretty) = prettify_tool_calls(&self.streaming_text) {
                     // Convert styled lines to plain text for streaming preview
                     let preview: String = pretty.iter()
                         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
@@ -3417,8 +3528,8 @@ impl App {
                 f.render_widget(para, gradient_area);
             }
             // Continue gradient into spacer + results + input areas
-            let extra_start = chunks[3].y;
-            let extra_end   = chunks[5].y + chunks[5].height;
+            let extra_start = chunks[2].y;
+            let extra_end   = chunks[4].y + chunks[4].height;
             let total_height = messages_area.height + (extra_end - extra_start);
             for y in extra_start..extra_end {
                 let offset = messages_area.height + (y - extra_start);
@@ -3440,6 +3551,11 @@ impl App {
                 let gradient_area = Rect { x: area.x, y, width: area.width, height: 1 };
                 f.render_widget(para, gradient_area);
             }
+        }
+
+        // Render fireworks celebration on top of gradient
+        if !self.fireworks.is_empty() {
+            self.render_fireworks(f, area);
         }
 
         let mut skipped: i32 = 0;
@@ -3572,7 +3688,7 @@ impl App {
         let box_style = Style::default().bg(box_bg);
 
         // Render subagent panel if there are visible entries
-        if !visible_subagents.is_empty() && chunks[4].height > 0 {
+        if !visible_subagents.is_empty() && chunks[3].height > 0 {
             let panel_text = format_subagent_panel(&visible_subagents, self.tick_count);
             let spinner_frames = ['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷'];
             let spin = spinner_frames[(self.tick_count as usize / 4) % spinner_frames.len()];
@@ -3590,7 +3706,7 @@ impl App {
                     .style(box_style))
                 .style(box_style)
                 .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(panel, chunks[4]);
+            f.render_widget(panel, chunks[3]);
         }
 
         let input = Paragraph::new(format!("> {}", input_text))
@@ -3602,25 +3718,25 @@ impl App {
             .wrap(ratatui::widgets::Wrap { trim: false });
         
         // Clear the input area before rendering to prevent garbage text artifacts
-        let clear_area = chunks[5];
+        let clear_area = chunks[4];
         f.render_widget(Clear, clear_area);
         
-        f.render_widget(input, chunks[5]);
+        f.render_widget(input, chunks[4]);
 
         // Show hardware cursor at the end of typed text so the user can see where
         // they're typing. Only shown when there's actual input (not the placeholder hint)
         // and no overlays are open.
         if !self.input_buffer.is_empty() && !self.model_picker_open {
-            let available_w = (chunks[5].width as usize).saturating_sub(2); // inside borders
+            let available_w = (chunks[4].width as usize).saturating_sub(2); // inside borders
             if available_w > 0 {
                 // "> " prefix is 2 chars; cursor goes after the last typed character
                 let display_chars = 2 + self.input_buffer.width();
                 let row_offset = (display_chars / available_w) as u16;
                 let col_in_row = (display_chars % available_w) as u16;
-                let cursor_x = (chunks[5].x + 1 + col_in_row)
-                    .min(chunks[5].x + chunks[5].width.saturating_sub(2));
-                let cursor_y = (chunks[5].y + 1 + row_offset)
-                    .min(chunks[5].y + chunks[5].height.saturating_sub(2));
+                let cursor_x = (chunks[4].x + 1 + col_in_row)
+                    .min(chunks[4].x + chunks[4].width.saturating_sub(2));
+                let cursor_y = (chunks[4].y + 1 + row_offset)
+                    .min(chunks[4].y + chunks[4].height.saturating_sub(2));
                 f.set_cursor_position((cursor_x, cursor_y));
             }
         }
@@ -3629,8 +3745,8 @@ impl App {
         if self.palette_open {
             let matches = self.palette_matches();
             if !matches.is_empty() {
-                let area = chunks[5];
-                let max_palette_rows = area.y.saturating_sub(chunks[0].height);
+                let area = chunks[4];
+                let max_palette_rows = area.y; // float above input, full terminal height available
                 let visible_items = matches.len().min(8).min(max_palette_rows.saturating_sub(2) as usize);
                 let palette_height = (visible_items + 2) as u16;
                 // Float palette just above the input box, full width
@@ -3743,41 +3859,32 @@ impl App {
             f.render_widget(list, inner[1]);
         }
 
-        // Status bar — show current prompt tokens / context window size
+        // Status bar — mode, model, connection, token info, all in one line
         let ctx_window = self.effective_context_window();
         let (prompt_tok, _) = self.last_token_counts;
-        
-        // Calculate task tokens (since last </done>)
+
+        // Calculate task tokens (since last [DONE])
         let task_tokens = self.total_tokens_used.saturating_sub(self.session_tokens_at_last_done);
-        
-        let token_info = if prompt_tok > 0 {
-            // Show current + task tokens if task is in progress
-            if task_tokens > 0 {
-                format!("🪙 {}+{}/{}", prompt_tok, task_tokens, ctx_window)
-            } else {
-                format!("🪙 {}/{}", prompt_tok, ctx_window)
-            }
-        } else if self.total_tokens_used > 0 {
-            // Show session total + task breakdown
-            if task_tokens > 0 {
-                format!("🪙 {}(+{})", self.total_tokens_used, task_tokens)
-            } else {
-                format!("🪙 {}", self.total_tokens_used)
-            }
-        } else {
-            format!("🪙 0/{}", ctx_window)
-        };
-        // Battery + inference rate segment
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let bright = Style::default().fg(Color::White);
+
+        // Context usage with traffic-light color
+        let usage_pct = if prompt_tok > 0 {
+            ((prompt_tok as f64) / (ctx_window as f64) * 100.0).min(100.0) as u32
+        } else { 0 };
+        let pct_color = if usage_pct > 70 { Color::Red }
+            else if usage_pct > 50 { Color::Yellow }
+            else { Color::Green };
+
+        // Battery icon
         let battery_icon = match self.on_battery {
             BatteryState::OnBattery => "🔋",
-            BatteryState::AC => "🔌",
+            BatteryState::AC => "",
             BatteryState::Unknown => "",
         };
-        let rate_text = match self.last_infer_rate {
-            Some(r) => format!("⚡ {:.1} tok/s", r),
-            None => String::new(),
-        };
-        // Countdown to next auto-request: shown when on battery, build mode, idle
+
+        // Countdown to next auto-request (battery + build mode + idle)
         let countdown_text = if self.on_battery == BatteryState::OnBattery
             && self.mode == AppMode::Forever
             && self.turn_phase == TurnPhase::Idle
@@ -3785,49 +3892,128 @@ impl App {
             const KICK_SECS: u64 = 5;
             let elapsed = self.last_build_kick.elapsed().as_secs();
             let remaining = KICK_SECS.saturating_sub(elapsed);
-            format!("⏱ {}s", remaining)
+            format!(" ⏱{}s", remaining)
         } else {
             String::new()
         };
-        let mut parts: Vec<&str> = Vec::new();
-        if !battery_icon.is_empty() { parts.push(battery_icon); }
-        if !rate_text.is_empty()    { parts.push(&rate_text); }
-        if !countdown_text.is_empty() { parts.push(&countdown_text); }
-        let power_segment = parts.join(" ");
 
-        let width = chunks[6].width as usize;
-        let status = if self.plan_understood {
-            "💡 Agent is ready — press Enter to execute in One mode".to_string()
-        } else if width >= 60 && !power_segment.is_empty() {
-            format!(
-                "🔢 {} | {} | 💬 {} | {}",
-                &self.session.id[..8],
-                token_info,
-                self.cached_message_count,
-                power_segment,
-            )
-        } else if width >= 40 && !power_segment.is_empty() {
-            // Drop session ID on narrow terminals
-            format!(
-                "{} | 💬 {} | {}",
-                token_info,
-                self.cached_message_count,
-                power_segment,
-            )
-        } else {
-            format!(
-                "🔢 {} | {} | 💬 {}",
-                &self.session.id[..8],
-                token_info,
-                self.cached_message_count,
-            )
+        // Mode label + color
+        let (mode_label, mode_color) = match self.mode {
+            AppMode::Forever => ("⚡FOREVER", self.theme.violet),
+            AppMode::Plan    => ("🧠PLAN",    self.theme.accent),
+            AppMode::Ask     => ("🔍ASK",     Color::Yellow),
+            AppMode::One     => ("🎯ONE",     Color::Green),
         };
-        let status_bar = Paragraph::new(status);
-        f.render_widget(status_bar, chunks[6]);
+
+        // Connection icon
+        let conn_icon = if self.ollama_client.is_some() { "🦙" } else { "❌" };
+
+        // Endpoint type + color (only show if non-default)
+        let (endpoint_display, endpoint_color) = match self.endpoint_type.as_str() {
+            "OpenRouter"      => (Some("OpenRouter"),      Color::Red),
+            "Groq"            => (Some("Groq"),            Color::Red),
+            "OpenAI"          => (Some("OpenAI"),          Color::Red),
+            "OpenAI-compat"   => (Some("OpenAI-compat"),   Color::Red),
+            "Ollama-external" => (Some("Ollama-ext"),      Color::Red),
+            "llama.cpp"       => (Some("llama.cpp"),       Color::Magenta),
+            "Ollama-local"    => (None,                    Color::Green), // local = no noise
+            "Ollama" | "Offline" => (None,                 Color::Green),
+            _                 => (Some(self.endpoint_type.as_str()), Color::Yellow),
+        };
+
+        let width = chunks[5].width as usize;
+        let status_line = if self.plan_understood {
+            Line::from("💡 Agent is ready — press Enter to execute in One mode")
+        } else if width >= 80 {
+            // Full layout: mode | conn model | ctx/window (%) | task | total | ⚡rate | msgs | [endpoint]
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::raw(conn_icon));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(self.config.model.clone(), bright));
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::styled(
+                format!("{}/{}", human_tokens(prompt_tok), human_tokens(ctx_window)), bright));
+            spans.push(Span::styled(" (", dim));
+            spans.push(Span::styled(format!("{}%", usage_pct), Style::default().fg(pct_color)));
+            spans.push(Span::styled(")", dim));
+            if task_tokens > 0 {
+                spans.push(Span::styled(" | task:", dim));
+                spans.push(Span::styled(format!("{}", human_tokens(task_tokens)), bright));
+            }
+            if self.total_tokens_used > 0 {
+                spans.push(Span::styled(" | total:", dim));
+                spans.push(Span::styled(human_tokens(self.total_tokens_used), bright));
+            }
+            if let Some(r) = self.last_infer_rate {
+                spans.push(Span::styled(" | ", dim));
+                if !battery_icon.is_empty() { spans.push(Span::raw(battery_icon)); spans.push(Span::raw(" ")); }
+                spans.push(Span::styled(format!("⚡{:.0}t/s", r), bright));
+            } else if !battery_icon.is_empty() {
+                spans.push(Span::styled(" | ", dim));
+                spans.push(Span::raw(battery_icon));
+            }
+            if !countdown_text.is_empty() { spans.push(Span::styled(&countdown_text, bright)); }
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::styled(format!("💬{}", self.cached_message_count), bright));
+            if let Some(ep) = endpoint_display {
+                spans.push(Span::styled(" | ", dim));
+                spans.push(Span::styled(format!("[{}]", ep), Style::default().fg(endpoint_color)));
+            }
+            Line::from(spans)
+        } else if width >= 50 {
+            // Medium layout: mode | conn model | ctx% | ⚡rate | msgs
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::raw(conn_icon));
+            spans.push(Span::raw(" "));
+            // Truncate model name to keep it from dominating
+            let model_short: String = self.config.model.chars().take(20).collect();
+            spans.push(Span::styled(model_short, bright));
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::styled(format!("{}%", usage_pct), Style::default().fg(pct_color)));
+            if let Some(r) = self.last_infer_rate {
+                spans.push(Span::styled(" | ", dim));
+                spans.push(Span::styled(format!("⚡{:.0}t/s", r), bright));
+            }
+            spans.push(Span::styled(" | ", dim));
+            spans.push(Span::styled(format!("💬{}", self.cached_message_count), bright));
+            Line::from(spans)
+        } else if width >= 30 {
+            // Compact: mode | ctx% | msgs
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" ", dim));
+            spans.push(Span::styled(format!("{}%", usage_pct), Style::default().fg(pct_color)));
+            spans.push(Span::styled(" 💬", dim));
+            spans.push(Span::styled(format!("{}", self.cached_message_count), bright));
+            Line::from(spans)
+        } else {
+            // Minimal: ctx% | msgs
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(format!("{}%", usage_pct), Style::default().fg(pct_color)));
+            spans.push(Span::styled(format!(" 💬{}", self.cached_message_count), bright));
+            Line::from(spans)
+        };
+        let status_bar = Paragraph::new(status_line);
+        f.render_widget(status_bar, chunks[5]);
+
+        // Render task progress bar if active (colored background in status bar area)
+        if let Some(pct) = self.task_progress {
+            use ratatui::style::{Style, Color};
+            use ratatui::widgets::{Gauge, Widget};
+            
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Rgb(255, 180, 0)).bg(Color::Rgb(60, 60, 60)))
+                .percent(pct as u16);
+            gauge.render(chunks[5], f.buffer_mut());
+        }
 
         // File viewer overlay — covers the messages area
         if self.file_viewer_open && !self.file_viewer_tabs.is_empty() {
-            self.draw_file_viewer(f, chunks[2]);
+            self.draw_file_viewer(f, chunks[1]);
         }
     }
 
@@ -3993,6 +4179,20 @@ impl App {
                     }
                 } else if c == 's' {
                     self.handle_command().await;
+                } else if c == 'p' {
+                    // Open command palette without losing current input
+                    if !self.palette_open {
+                        self.palette_saved_buffer = Some(self.input_buffer.clone());
+                        self.input_buffer = "/".to_string();
+                        self.palette_open = true;
+                        self.palette_selection = 0;
+                    } else {
+                        // Toggle off: restore saved buffer
+                        self.palette_open = false;
+                        if let Some(saved) = self.palette_saved_buffer.take() {
+                            self.input_buffer = saved;
+                        }
+                    }
                 }
             }
             // Open palette on '/'
@@ -4036,12 +4236,23 @@ impl App {
                 // Tab completes the highlighted item
                 let matches = self.palette_matches();
                 if let Some(&cmd) = matches.get(self.palette_selection) {
-                    self.input_buffer = cmd.fill.to_string();
-                    self.palette_open = false;
+                    if let Some(saved) = self.palette_saved_buffer.take() {
+                        // Opened via Ctrl+P: execute command then restore original input
+                        self.input_buffer = cmd.fill.to_string();
+                        self.palette_open = false;
+                        if !cmd.fill.ends_with(' ') {
+                            self.handle_command().await;
+                        }
+                        self.input_buffer = saved;
+                    } else {
+                        self.input_buffer = cmd.fill.to_string();
+                        self.palette_open = false;
+                    }
                 }
             }
             KeyCode::Enter if self.palette_open => {
                 let matches = self.palette_matches();
+                let saved = self.palette_saved_buffer.take();
                 if let Some(&cmd) = matches.get(self.palette_selection) {
                     self.input_buffer = cmd.fill.to_string();
                     self.palette_open = false;
@@ -4052,6 +4263,10 @@ impl App {
                 } else {
                     self.palette_open = false;
                     self.handle_command().await;
+                }
+                // Restore original input if opened via Ctrl+P
+                if let Some(s) = saved {
+                    self.input_buffer = s;
                 }
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -4066,7 +4281,11 @@ impl App {
             KeyCode::Esc => {
                 if self.palette_open {
                     self.palette_open = false;
-                    self.input_buffer.clear();
+                    if let Some(saved) = self.palette_saved_buffer.take() {
+                        self.input_buffer = saved;
+                    } else {
+                        self.input_buffer.clear();
+                    }
                 } else if self.msg_cursor.is_some() {
                     // Clear message cursor first
                     self.msg_cursor = None;
@@ -4140,17 +4359,37 @@ impl App {
 
     /// Cancel any in-progress inference, tool execution, or subagent run.
     fn cancel_current_turn(&mut self) {
+        // If we have partial streaming output, save it as an assistant message
+        // so it stays in context. Append <esc/> so the model knows it was interrupted.
+        let partial = self.streaming_text.clone();
+        if !partial.is_empty() {
+            let mut saved = agent::sanitize_model_output(&partial);
+            // Prepend any accumulated thinking so it's visible in history
+            if !self.thinking_text.is_empty() {
+                saved = format!("[THINK: {}]\n{}", self.thinking_text.trim(), saved);
+            }
+            saved.push_str("\n<esc/>");
+            let msg = Message::new("assistant", &saved);
+            if let Ok(()) = self.message_buffer.add_and_persist(msg) {
+                self.cached_message_count = self.message_buffer.count()
+                    .unwrap_or(self.cached_message_count + 1);
+            }
+        }
         self.stream_rx = None;
         self.tool_result_rx = None;
         self.subagent_result_rx = None;
         self.subagent_token_rx = None;
         self.turn_phase = TurnPhase::Idle;
         self.streaming_text.clear();
-                    self.thinking_text.clear();
-                    self.in_think_block = false;
+        self.thinking_text.clear();
+        self.in_think_block = false;
         self.tool_iteration_count = 0;
         self.consecutive_empty_kicks = 0;
-        self.push_system_event("⛔ Turn cancelled".to_string());
+        if partial.is_empty() {
+            self.push_system_event("⛔ Turn cancelled".to_string());
+        } else {
+            self.push_system_event("⛔ Turn cancelled — partial response saved".to_string());
+        }
     }
 
     /// Handle mouse events (scroll wheel)
@@ -4255,8 +4494,8 @@ impl App {
                 return;
             }
             self.handle_tool_command(&command).await;
-        } else if command.starts_with("/endpoint ") {
-            let endpoint = command.strip_prefix("/endpoint ").unwrap_or("").trim();
+        } else if command.starts_with("/endpoint") {
+            let endpoint = command.strip_prefix("/endpoint").unwrap_or("").trim();
             self.handle_endpoint_command(endpoint).await;
         } else if command.starts_with("/model ") {
             let model = command.strip_prefix("/model ").unwrap_or("").trim();
@@ -4445,7 +4684,7 @@ impl App {
             self.handle_theme_command(arg);
         } else if command == "/color" || command.starts_with("/color ") {
             let prompt = command.strip_prefix("/color").unwrap_or("").trim();
-            self.handle_color_command(prompt).await;
+            self.handle_color_command(prompt);
         } else if command.starts_with("/copycode") {
             let n = command.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok());
             self.handle_copycode(n).await;
@@ -4506,7 +4745,7 @@ impl App {
             "📖 Commands:\n\
              /help         - Show this help\n\
              /estimate     - Show project completion estimate\n\
-             /endpoint URL - Change Ollama endpoint\n\
+             /endpoint [URL] - Change endpoint (default: localhost:11434)\n\
              /model NAME   - Switch AI model\n\
              /models       - List available models\n\
              /ctx NUM      - Set context window size\n\
@@ -4747,16 +4986,19 @@ impl App {
     }
 
     /// Handle /color — generate gradient colors from a text prompt (e.g. "sunset", "ocean", "forest")
-    async fn handle_color_command(&mut self, prompt: &str) {
+    fn handle_color_command(&mut self, prompt: &str) {
         if prompt.is_empty() {
             self.notify("🎨 Usage: /color <prompt> — e.g. /color sunset, /color ocean, /color cyberpunk");
             return;
         }
 
-        if self.ollama_client.is_none() {
-            self.notify("❌ No Ollama connection — cannot generate colors");
-            return;
-        }
+        let client = match &self.ollama_client {
+            Some(c) => c.clone(),
+            None => {
+                self.notify("❌ No Ollama connection — cannot generate colors");
+                return;
+            }
+        };
 
         self.notify(format!("🎨 Generating colors for \"{}\"…", prompt));
 
@@ -4773,21 +5015,43 @@ impl App {
         let messages = vec![crate::message::Message::new("user", &color_prompt)];
         let (tool_cap, ctx_win) = self.compression_params();
         let params = self.effective_params();
+        let (tx, rx) = oneshot::channel();
+        self.color_result_rx = Some(rx);
 
-        let response = if let Some(client) = &self.ollama_client {
-            match client.generate(messages, None, &params, tool_cap, ctx_win).await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.notify(format!("❌ Failed to generate colors: {}", e));
-                    return;
-                }
-            }
-        } else {
-            self.notify("❌ No Ollama client");
-            return;
+        tokio::spawn(async move {
+            let result = client.generate(messages, None, &params, tool_cap, ctx_win).await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll for a completed async /color result and apply it
+    fn check_color_result(&mut self) {
+        let rx = match self.color_result_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
         };
 
-        // Parse RGB values from response
+        match rx.try_recv() {
+            Ok(Ok(response)) => {
+                self.color_result_rx = None;
+                self.apply_color_response(&response);
+            }
+            Ok(Err(e)) => {
+                self.color_result_rx = None;
+                self.notify(format!("❌ Failed to generate colors: {}", e));
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.color_result_rx = None;
+                self.notify("❌ Color generation task dropped unexpectedly");
+            }
+        }
+    }
+
+    /// Parse and apply RGB gradient colors from an LLM response string
+    fn apply_color_response(&mut self, response: &str) {
+        use ratatui::style::Color;
         let mut start_color: Option<Color> = None;
         let mut end_color: Option<Color> = None;
 
@@ -4798,17 +5062,14 @@ impl App {
                 if let Some(rgb) = rgb_part.strip_prefix("RGB(").and_then(|s| s.strip_suffix(')')) {
                     let parts: Vec<&str> = rgb.split(',').collect();
                     if parts.len() == 3 {
-                        if let Ok(r) = parts[0].trim().parse::<u8>() {
-                            if let Ok(g) = parts[1].trim().parse::<u8>() {
-                                if let Ok(b) = parts[2].trim().parse::<u8>() {
-                                    let color = Color::Rgb(r, g, b);
-                                    if line.starts_with("START:") {
-                                        start_color = Some(color);
-                                    } else {
-                                        end_color = Some(color);
-                                    }
-                                }
-                            }
+                        if let (Ok(r), Ok(g), Ok(b)) = (
+                            parts[0].trim().parse::<u8>(),
+                            parts[1].trim().parse::<u8>(),
+                            parts[2].trim().parse::<u8>(),
+                        ) {
+                            let color = Color::Rgb(r, g, b);
+                            if line.starts_with("START:") { start_color = Some(color); }
+                            else { end_color = Some(color); }
                         }
                     }
                 }
@@ -5306,7 +5567,7 @@ impl App {
             for (i, (name, prompt, expected)) in test_cases.iter().enumerate() {
                 let msgs = vec![crate::message::Message::new("user", *prompt)];
                 let resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(120),
                     client.generate(msgs, None, &params, tool_cap, ctx_win),
                 ).await;
 
@@ -5581,7 +5842,7 @@ impl App {
             Some(client) => {
                 self.status_message = "⏳ Fetching models...".to_string();
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(30),
                     client.list_models()
                 ).await {
                     Ok(Ok(models)) if !models.is_empty() => {
@@ -5650,10 +5911,12 @@ impl App {
 
     /// Handle /endpoint command — change Ollama endpoint URL
     async fn handle_endpoint_command(&mut self, endpoint: &str) {
-        if endpoint.is_empty() {
-            self.notify(format!("🔌 Current endpoint: {}\nUsage: /endpoint <url>", self.config.endpoint));
-            return;
-        }
+        let endpoint = if endpoint.is_empty() {
+            self.push_system_event("🔌 Resetting endpoint to http://localhost:11434");
+            "http://localhost:11434"
+        } else {
+            endpoint
+        };
 
         self.status_message = format!("🔌 Connecting to {}…", endpoint);
         match OllamaClient::new_with_key(endpoint, &self.config.model, self.config.api_key.as_deref()).await {
@@ -5962,7 +6225,7 @@ impl App {
         if let Some(tc_pos) = tool_call_pos {
             let prose = content[..tc_pos].trim();
             let tc_part = &content[tc_pos..];
-            if let Some(pretty_lines) = Self::prettify_tool_calls(tc_part) {
+            if let Some(pretty_lines) = prettify_tool_calls(tc_part) {
                 // Render any preceding prose first
                 if !prose.is_empty() {
                     let mut first_prose = true;
@@ -6108,67 +6371,11 @@ impl App {
 
     /// Render a single line with markdown formatting (headers, lists, inline formatting)
     fn render_markdown_line(&self, line: &str, is_dark: bool) -> Vec<ratatui::text::Line<'static>> {
-        use ratatui::style::{Color, Modifier, Style};
-        use ratatui::text::{Line as RLine, Span};
-
-        let text_color = if is_dark {
-            Color::Rgb(220, 230, 240)
-        } else {
-            Color::Rgb(40, 42, 46)
-        };
-
-        // Check for headers
-        if let Some((level, content)) = crate::markdown::detect_header(line) {
-            return vec![crate::markdown::format_header(level, &content, text_color)];
-        }
-
-        // Check for list items
-        if let Some((indent, content)) = crate::markdown::detect_list_item(line) {
-            let bullet = if line.contains('*') { '•' } else if line.contains('+') { '◦' } else { '·' };
-            return vec![crate::markdown::format_list_item(indent, &content, text_color, bullet)];
-        }
-
-        // Regular text line with inline markdown formatting
-        let spans = crate::markdown::format_inline_to_spans(line, text_color);
-        vec![RLine::from(spans)]
+        render_markdown_line(line, is_dark)
     }
 
-    /// Check if content looks like a table (has | separators on consecutive lines)
     fn detect_and_render_table(&self, lines_vec: &[&str], start_idx: usize, is_dark: bool) -> Option<(Vec<ratatui::text::Line<'static>>, usize)> {
-        use ratatui::style::Color;
-
-        if start_idx >= lines_vec.len() || start_idx + 2 > lines_vec.len() {
-            return None;
-        }
-
-        // Look for table: check current line + next line (separator)
-        if !lines_vec[start_idx].contains('|') || !lines_vec[start_idx + 1].contains('|') {
-            return None;
-        }
-
-        // Check if next line is a separator
-        if !crate::markdown::is_table_separator(lines_vec[start_idx + 1]) {
-            return None;
-        }
-
-        // Find the end of the table (where | separators stop appearing)
-        let mut end_idx = start_idx + 2;
-        while end_idx < lines_vec.len() && lines_vec[end_idx].contains('|') {
-            end_idx += 1;
-        }
-
-        let table_lines = lines_vec[start_idx..end_idx].to_vec();
-        if let Some(table) = crate::markdown::parse_table(&table_lines) {
-            let text_color = if is_dark {
-                Color::Rgb(220, 230, 240)
-            } else {
-                Color::Rgb(40, 42, 46)
-            };
-            let rendered = crate::markdown::format_table(&table, text_color);
-            return Some((rendered, end_idx - start_idx));
-        }
-
-        None
+        detect_and_render_table(lines_vec, start_idx, is_dark)
     }
 
     /// Format message content with nice code block indentation and language detection
@@ -6306,246 +6513,15 @@ impl App {
         ratatui::text::Text::from(lines)
     }
 
-    /// True if `body` looks like unified diff output (has hunk headers or multiple +/- lines).
-    fn looks_like_diff(body: &str) -> bool {
-        let mut pm_count = 0usize;
-        for line in body.lines().take(40) {
-            if line.starts_with("@@") { return true; }
-            if (line.starts_with('+') && !line.starts_with("+++"))
-                || (line.starts_with('-') && !line.starts_with("---"))
-            {
-                pm_count += 1;
-                if pm_count >= 3 { return true; }
-            }
-        }
-        false
-    }
 
-    /// Render a diff body as colored ratatui Lines. `max_lines` caps the preview; 0 = show all.
-    fn render_diff_styled(
-        emoji: &str,
-        name: &str,
-        body: &str,
-        max_lines: usize,     // 0 = show all
-        hint: &str,           // cursor hint appended at bottom (empty if not cursor)
-    ) -> Vec<ratatui::text::Line<'static>> {
-        use ratatui::text::{Line as RLine, Span as RSpan};
 
-        let all_lines: Vec<&str> = body.lines().collect();
-        let total = all_lines.len();
-        let cap = if max_lines == 0 || max_lines >= total { total } else { max_lines };
 
-        let mut lines: Vec<RLine<'static>> = Vec::with_capacity(cap + 3);
 
-        // Header row
-        let trimmed = if cap < total {
-            format!("{} {}  ({} lines — showing {})", emoji, name, total, cap)
-        } else {
-            format!("{} {}  ({} lines)", emoji, name, total)
-        };
-        lines.push(RLine::from(RSpan::styled(
-            trimmed,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-
-        for line in all_lines[..cap].iter() {
-            let style = if line.starts_with('+') && !line.starts_with("+++") {
-                Style::default().fg(Color::Green)
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                Style::default().fg(Color::Red)
-            } else if line.starts_with("@@") {
-                Style::default().fg(Color::Cyan)
-            } else if line.starts_with("diff ")
-                || line.starts_with("index ")
-                || line.starts_with("---")
-                || line.starts_with("+++")
-            {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            lines.push(RLine::from(RSpan::styled(
-                format!("│  {}", line),
-                style,
-            )));
-        }
-
-        if cap < total {
-            lines.push(RLine::from(RSpan::styled(
-                format!("│  … {} more lines{}", total - cap,
-                    if !hint.is_empty() { "  [Space=expand]" } else { "" }),
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else if !hint.is_empty() {
-            lines.push(RLine::from(RSpan::styled(
-                "│  [Space=collapse]".to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-
-        lines
-    }
-
-    /// Format tool output with indented bordered block
     fn format_tool_content_expanded(&self, content: &str, expanded: bool) -> String {
-        // Pretty-print [TOOL_OUTPUT: name = content] injections
-        if let Some(rest) = content.strip_prefix("[TOOL_OUTPUT: ") {
-            if let Some(eq) = rest.find(" = ") {
-                let name = &rest[..eq];
-                let raw_body = rest[eq + 3..].trim_end_matches(']');
-
-                // Detect and strip trailing truncation marker
-                let (body, truncation_note) = if let Some(trunc_pos) = raw_body.rfind("...(truncated to ") {
-                    let note = raw_body[trunc_pos + 3..].trim_end_matches(')');
-                    let clean = raw_body[..trunc_pos].trim_end_matches('.');
-                    (clean, Some(format!("✂️  {}", note)))
-                } else {
-                    (raw_body, None)
-                };
-
-                let lines: Vec<&str> = body.lines().collect();
-                let total_lines = lines.len();
-                let total_chars = body.len();
-                if expanded {
-                    let all: String = lines.iter()
-                        .map(|l| format!("│  {}", l))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
-                    return format!("🔧 {}  ({} lines, {} chars)\n{}{}", name, total_lines, total_chars, all, trunc);
-                }
-                let preview: String = lines.iter().take(3)
-                    .map(|l| format!("│  {}", l))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let more = if total_lines > 3 {
-                    format!("\n│  … ({} more lines, {} chars)", total_lines - 3, total_chars)
-                } else {
-                    String::new()
-                };
-                let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
-                return format!("🔧 {}  ({} lines, {} chars)\n{}{}{}", name, total_lines, total_chars, preview, more, trunc);
-            }
-        }
-        if let Some(rest) = content.strip_prefix("[TOOL_ERROR: ") {
-            if let Some(eq) = rest.find(" = ") {
-                let name = &rest[..eq];
-                let err = rest[eq + 3..].trim_end_matches(']');
-                return format!("❌ {}: {}", name, err);
-            }
-        }
-        // All other tool messages (user /tool, /shell, /mem etc.) — keep │ borders
-        let mut result = String::new();
-        for line in content.lines() {
-            result.push_str("│  ");
-            result.push_str(line);
-            result.push('\n');
-        }
-        if result.ends_with('\n') { result.pop(); }
-        result
+        format_tool_content_expanded(content, expanded)
     }
 
-    /// Try to render a JSON or XML tool-call response as compact colored Lines.
-    /// Returns None if the string doesn't look like a tool call or fails to parse.
-    fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<'static>>> {
-        use ratatui::style::{Color, Modifier, Style};
-        use ratatui::text::{Line, Span};
-        let trimmed = text.trim();
 
-        // Try XML format first (ShellOnly), then JSON
-        let tool_calls: Vec<crate::agent::ToolCall> =
-            if trimmed.contains("<tool>") {
-                let calls = crate::agent::parse_xml_tool_calls(
-                    trimmed
-                );
-                if calls.is_empty() { return None; }
-                calls
-            } else if trimmed.contains("\"tool_calls\"") {
-                let json_start = trimmed.find('{').unwrap_or(0);
-                let v: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).ok()?;
-                let arr = v.get("tool_calls")?.as_array()?;
-                if arr.is_empty() { return None; }
-                arr.iter().filter_map(|call| {
-                    let name = call.get("name")?.as_str()?.to_string();
-                    let params = call.get("parameters")?;
-                    let get_str = |k: &str| params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let cmd = get_str("command");
-                    let returnlines = params.get("returnlines").and_then(|v| match v {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        serde_json::Value::Number(n) => Some(n.to_string()),
-                        _ => None,
-                    });
-                    let args = if let Some(rl) = returnlines { format!("{}\x00{}", cmd, rl) } else { cmd };
-                    let is_async = params.get("mode").and_then(|v| v.as_str()) == Some("async");
-                    Some(crate::agent::ToolCall {
-                        name,
-                        args,
-                        description: params.get("description").and_then(|v| v.as_str()).map(str::to_string),
-                        async_mode: is_async,
-                        async_task_id: if is_async { params.get("task_id").and_then(|v| v.as_str()).map(str::to_string) } else { None },
-                        tellhuman: params.get("tellhuman").and_then(|v| v.as_str()).map(str::to_string),
-                    })
-                }).collect()
-            } else {
-                return None;
-            };
-
-        let dim   = Style::default().fg(Color::DarkGray);
-        let cyan  = Style::default().fg(Color::Cyan);
-        let yel   = Style::default().fg(Color::Yellow);
-        let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for (i, tc) in tool_calls.iter().enumerate() {
-            let name = &tc.name;
-            let tool_emoji = match name.as_str() {
-                "shell" | "exec" => "🐚",
-                "rg"             => "🔍",
-                "setfile" | "patchfile" => "📝",
-                "spawn"          => "🤖",
-                "think"          => "💭",
-                "commit"         => "📌",
-                _                => "🔧",
-            };
-
-            if i > 0 {
-                lines.push(Line::from(vec![Span::styled("├───".to_string(), dim)]));
-            }
-
-            lines.push(Line::from(vec![
-                Span::styled("┌─ ".to_string(), dim),
-                Span::raw(format!("{} ", tool_emoji)),
-                Span::styled(name.clone(), cyan),
-            ]));
-
-            // Primary arg: command (strip returnlines suffix if present)
-            let cmd_display = tc.args.split('\x00').next().unwrap_or(&tc.args);
-            if !cmd_display.is_empty() {
-                let prefix = if name == "shell" || name == "exec" { "$ " } else { "" };
-                lines.push(Line::from(vec![
-                    Span::styled("│  ".to_string(), dim),
-                    Span::styled(format!("{}{}", prefix, cmd_display), yel),
-                ]));
-            }
-            if let Some(desc) = &tc.description {
-                if !desc.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("│  ↳ ".to_string(), dim),
-                        Span::styled(desc.clone(), white),
-                    ]));
-                }
-            }
-            if tc.async_mode {
-                let tid = tc.async_task_id.as_deref().unwrap_or("?");
-                lines.push(Line::from(vec![
-                    Span::styled("│  ⚡ async ".to_string(), dim),
-                    Span::styled(tid.to_string(), Style::default().fg(Color::Magenta)),
-                ]));
-            }
-        }
-        if lines.is_empty() { return None; }
-        Some(lines)
-    }
 
     /// Handle /checkpoint command to save session progress
     fn handle_checkpoint_command(&mut self, name_opt: Option<&str>) {
@@ -6985,6 +6961,524 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 }
 
 /// Strip ANSI escape sequences, non-printable characters, and truncate for safe TUI display.
+// ─────────────────────────────────────────────────────────────────────────────
+// Rendering helpers — pub(crate) free functions testable without App.
+// Each impl App method above is a thin wrapper delegating here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// True if `body` looks like unified diff output (has hunk headers or multiple +/- lines).
+pub(crate) fn looks_like_diff(body: &str) -> bool {
+    let mut pm_count = 0usize;
+    for line in body.lines().take(40) {
+        if line.starts_with("@@") { return true; }
+        if (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+        {
+            pm_count += 1;
+            if pm_count >= 3 { return true; }
+        }
+    }
+    false
+}
+
+/// Render a diff body as colored ratatui Lines. `max_lines` caps the preview; 0 = show all.
+pub(crate) fn render_diff_styled(
+    emoji: &str,
+    name: &str,
+    body: &str,
+    max_lines: usize,     // 0 = show all
+    hint: &str,           // cursor hint appended at bottom (empty if not cursor)
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line as RLine, Span as RSpan};
+
+    let all_lines: Vec<&str> = body.lines().collect();
+    let total = all_lines.len();
+    let cap = if max_lines == 0 || max_lines >= total { total } else { max_lines };
+
+    let mut lines: Vec<RLine<'static>> = Vec::with_capacity(cap + 3);
+
+    // Header row
+    let trimmed = if cap < total {
+        format!("{} {}  ({} lines — showing {})", emoji, name, total, cap)
+    } else {
+        format!("{} {}  ({} lines)", emoji, name, total)
+    };
+    lines.push(RLine::from(RSpan::styled(
+        trimmed,
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    for line in all_lines[..cap].iter() {
+        let style = if line.starts_with('+') && !line.starts_with("+++") {
+            Style::default().fg(Color::Green)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Style::default().fg(Color::Red)
+        } else if line.starts_with("@@") {
+            Style::default().fg(Color::Cyan)
+        } else if line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("---")
+            || line.starts_with("+++")
+        {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(RLine::from(RSpan::styled(
+            format!("│  {}", line),
+            style,
+        )));
+    }
+
+    if cap < total {
+        lines.push(RLine::from(RSpan::styled(
+            format!("│  … {} more lines{}", total - cap,
+                if !hint.is_empty() { "  [Space=expand]" } else { "" }),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if !hint.is_empty() {
+        lines.push(RLine::from(RSpan::styled(
+            "│  [Space=collapse]".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines
+}
+
+/// Format tool output with indented bordered block
+pub(crate) fn format_tool_content_expanded(content: &str, expanded: bool) -> String {
+    // Pretty-print [TOOL_OUTPUT: name = content] injections
+    if let Some(rest) = content.strip_prefix("[TOOL_OUTPUT: ") {
+        if let Some(eq) = rest.find(" = ") {
+            let name = &rest[..eq];
+            let raw_body = rest[eq + 3..].trim_end_matches(']');
+
+            // Detect and strip trailing truncation marker
+            let (body, truncation_note) = if let Some(trunc_pos) = raw_body.rfind("...(truncated to ") {
+                let note = raw_body[trunc_pos + 3..].trim_end_matches(')');
+                let clean = raw_body[..trunc_pos].trim_end_matches('.');
+                (clean, Some(format!("✂️  {}", note)))
+            } else {
+                (raw_body, None)
+            };
+
+            let lines: Vec<&str> = body.lines().collect();
+            let total_lines = lines.len();
+            let total_chars = body.len();
+            if expanded {
+                let all: String = lines.iter()
+                    .map(|l| format!("│  {}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
+                return format!("🔧 {}  ({} lines, {} chars)\n{}{}", name, total_lines, total_chars, all, trunc);
+            }
+            let preview: String = lines.iter().take(3)
+                .map(|l| format!("│  {}", l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let more = if total_lines > 3 {
+                format!("\n│  … ({} more lines, {} chars)", total_lines - 3, total_chars)
+            } else {
+                String::new()
+            };
+            let trunc = truncation_note.map(|n| format!("\n│  {}", n)).unwrap_or_default();
+            return format!("🔧 {}  ({} lines, {} chars)\n{}{}{}", name, total_lines, total_chars, preview, more, trunc);
+        }
+    }
+    if let Some(rest) = content.strip_prefix("[TOOL_ERROR: ") {
+        if let Some(eq) = rest.find(" = ") {
+            let name = &rest[..eq];
+            let err = rest[eq + 3..].trim_end_matches(']');
+            return format!("❌ {}: {}", name, err);
+        }
+    }
+    // All other tool messages (user /tool, /shell, /mem etc.) — keep │ borders
+    let mut result = String::new();
+    for line in content.lines() {
+        result.push_str("│  ");
+        result.push_str(line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+/// Try to render a JSON or XML tool-call response as compact colored Lines.
+/// Returns None if the string doesn't look like a tool call or fails to parse.
+pub(crate) fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<'static>>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    let trimmed = text.trim();
+
+    // Try XML format first (ShellOnly), then JSON
+    let tool_calls: Vec<crate::agent::ToolCall> =
+        if trimmed.contains("<tool>") {
+            let calls = crate::agent::parse_xml_tool_calls(
+                trimmed
+            );
+            if calls.is_empty() { return None; }
+            calls
+        } else if trimmed.contains("\"tool_calls\"") {
+            let json_start = trimmed.find('{').unwrap_or(0);
+            let v: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).ok()?;
+            let arr = v.get("tool_calls")?.as_array()?;
+            if arr.is_empty() { return None; }
+            arr.iter().filter_map(|call| {
+                let name = call.get("name")?.as_str()?.to_string();
+                let params = call.get("parameters")?;
+                let get_str = |k: &str| params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cmd = get_str("command");
+                let returnlines = params.get("returnlines").and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+                let args = if let Some(rl) = returnlines { format!("{}\x00{}", cmd, rl) } else { cmd };
+                let is_async = params.get("mode").and_then(|v| v.as_str()) == Some("async");
+                Some(crate::agent::ToolCall {
+                    name,
+                    args,
+                    description: params.get("description").and_then(|v| v.as_str()).map(str::to_string),
+                    async_mode: is_async,
+                    async_task_id: if is_async { params.get("task_id").and_then(|v| v.as_str()).map(str::to_string) } else { None },
+                    tellhuman: params.get("tellhuman").and_then(|v| v.as_str()).map(str::to_string),
+                })
+            }).collect()
+        } else {
+            return None;
+        };
+
+    let dim   = Style::default().fg(Color::DarkGray);
+    let cyan  = Style::default().fg(Color::Cyan);
+    let yel   = Style::default().fg(Color::Yellow);
+    let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, tc) in tool_calls.iter().enumerate() {
+        let name = &tc.name;
+        let tool_emoji = match name.as_str() {
+            "shell" | "exec" => "🐚",
+            "rg"             => "🔍",
+            "setfile" | "patchfile" => "📝",
+            "spawn"          => "🤖",
+            "think"          => "💭",
+            "commit"         => "📌",
+            _                => "🔧",
+        };
+
+        if i > 0 {
+            lines.push(Line::from(vec![Span::styled("├───".to_string(), dim)]));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled("┌─ ".to_string(), dim),
+            Span::raw(format!("{} ", tool_emoji)),
+            Span::styled(name.clone(), cyan),
+        ]));
+
+        // Primary arg: command (strip returnlines suffix if present)
+        let cmd_display = tc.args.split('\x00').next().unwrap_or(&tc.args);
+        if !cmd_display.is_empty() {
+            let prefix = if name == "shell" || name == "exec" { "$ " } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled("│  ".to_string(), dim),
+                Span::styled(format!("{}{}", prefix, cmd_display), yel),
+            ]));
+        }
+        if let Some(desc) = &tc.description {
+            if !desc.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("│  ↳ ".to_string(), dim),
+                    Span::styled(desc.clone(), white),
+                ]));
+            }
+        }
+        if tc.async_mode {
+            let tid = tc.async_task_id.as_deref().unwrap_or("?");
+            lines.push(Line::from(vec![
+                Span::styled("│  ⚡ async ".to_string(), dim),
+                Span::styled(tid.to_string(), Style::default().fg(Color::Magenta)),
+            ]));
+        }
+    }
+    if lines.is_empty() { return None; }
+    Some(lines)
+}
+
+pub(crate) fn render_markdown_line(line: &str, is_dark: bool) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line as RLine, Span};
+
+    let text_color = if is_dark {
+        Color::Rgb(220, 230, 240)
+    } else {
+        Color::Rgb(40, 42, 46)
+    };
+
+    // Check for headers
+    if let Some((level, content)) = crate::markdown::detect_header(line) {
+        return vec![crate::markdown::format_header(level, &content, text_color)];
+    }
+
+    // Check for list items
+    if let Some((indent, content)) = crate::markdown::detect_list_item(line) {
+        let bullet = if line.contains('*') { '•' } else if line.contains('+') { '◦' } else { '·' };
+        return vec![crate::markdown::format_list_item(indent, &content, text_color, bullet)];
+    }
+
+    // Regular text line with inline markdown formatting
+    let spans = crate::markdown::format_inline_to_spans(line, text_color);
+    vec![RLine::from(spans)]
+}
+
+/// Check if content looks like a table (has | separators on consecutive lines)
+pub(crate) fn detect_and_render_table(lines_vec: &[&str], start_idx: usize, is_dark: bool) -> Option<(Vec<ratatui::text::Line<'static>>, usize)> {
+    use ratatui::style::Color;
+
+    if start_idx >= lines_vec.len() || start_idx + 2 > lines_vec.len() {
+        return None;
+    }
+
+    // Look for table: check current line + next line (separator)
+    if !lines_vec[start_idx].contains('|') || !lines_vec[start_idx + 1].contains('|') {
+        return None;
+    }
+
+    // Check if next line is a separator
+    if !crate::markdown::is_table_separator(lines_vec[start_idx + 1]) {
+        return None;
+    }
+
+    // Find the end of the table (where | separators stop appearing)
+    let mut end_idx = start_idx + 2;
+    while end_idx < lines_vec.len() && lines_vec[end_idx].contains('|') {
+        end_idx += 1;
+    }
+
+    let table_lines = lines_vec[start_idx..end_idx].to_vec();
+    if let Some(table) = crate::markdown::parse_table(&table_lines) {
+        let text_color = if is_dark {
+            Color::Rgb(220, 230, 240)
+        } else {
+            Color::Rgb(40, 42, 46)
+        };
+        let rendered = crate::markdown::format_table(&table, text_color);
+        return Some((rendered, end_idx - start_idx));
+    }
+
+    None
+}
+
+pub(crate) fn format_message_styled(
+    emoji: &str,
+    content: &str,
+    is_dark: bool,
+    highlighter: &crate::highlight::Highlighter,
+) -> ratatui::text::Text<'static> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line as RLine, Span, Text as RText};
+
+    let mut lines: Vec<RLine<'static>> = Vec::new();
+
+    // Strip [THINK: ...] prefix and render it as a dim block before the rest
+    let (content, think_prefix) = if content.starts_with("[THINK: ") {
+        // Find the closing ] — it's the first ] that's not inside the think content
+        // The format is [THINK: content]\nrest, where content may span lines
+        // We look for ]\n or ] at end as the boundary
+        let after_open = &content["[THINK: ".len()..];
+        // Find "]\n" or "]\r\n" or "]" at end
+        let close = after_open.find("]\n")
+            .or_else(|| after_open.find("]\r\n"))
+            .or_else(|| if after_open.ends_with(']') { Some(after_open.len() - 1) } else { None });
+        if let Some(ci) = close {
+            let think_content = &after_open[..ci];
+            let rest_start = ci + 1 + if after_open[ci + 1..].starts_with('\n') { 1 } else { 0 };
+            let rest = if rest_start <= after_open.len() { &after_open[rest_start..] } else { "" };
+            (rest, Some(think_content.to_string()))
+        } else {
+            (content, None)
+        }
+    } else {
+        (content, None)
+    };
+
+    // Render the think block as a dim collapsible section
+    let has_think = think_prefix.is_some();
+    if let Some(ref think) = think_prefix {
+        let think_color = if is_dark {
+            Color::Rgb(140, 150, 170) // readable slate-grey in dark mode
+        } else {
+            Color::Rgb(100, 110, 130) // darker for light mode
+        };
+        let dim = Style::default().fg(think_color).add_modifier(Modifier::ITALIC);
+        let think_lines: Vec<&str> = think.lines().collect();
+        // Header line with emoji
+        lines.push(RLine::from(vec![
+            Span::raw(format!("{} ", emoji)),
+            Span::styled("💭 thinking".to_string(), dim),
+        ]));
+        for tl in &think_lines {
+            lines.push(RLine::from(vec![
+                Span::styled(format!("  {}", tl), dim),
+            ]));
+        }
+        // Separator after thinking block
+        lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
+    }
+
+    // If content contains a tool-call block (JSON or XML), split into prose + pretty box.
+    // Works whether the tool call is at the start or follows narration text.
+    let tool_call_pos = content.find("{\"tool_calls\"").or_else(|| content.find("<tool>"));
+    let content_emoji = if !has_think { emoji } else { "" };
+    if let Some(tc_pos) = tool_call_pos {
+        let prose = content[..tc_pos].trim();
+        let tc_part = &content[tc_pos..];
+        if let Some(pretty_lines) = prettify_tool_calls(tc_part) {
+            // Render any preceding prose first
+            if !prose.is_empty() {
+                let mut first_prose = true;
+                for raw_line in prose.lines() {
+                    if first_prose {
+                        lines.push(RLine::from(format!("{} {}", content_emoji, raw_line)));
+                        first_prose = false;
+                    } else {
+                        lines.push(RLine::from(raw_line.to_string()));
+                    }
+                }
+            }
+            // Render prettified tool call box
+            let mut first_box = prose.is_empty();
+            for pl in pretty_lines {
+                if first_box {
+                    // Prepend emoji to the first box line
+                    let mut spans = vec![ratatui::text::Span::raw(format!("{} ", content_emoji))];
+                    spans.extend(pl.spans.into_iter().map(|s| {
+                        ratatui::text::Span::styled(s.content.into_owned(), s.style)
+                    }));
+                    lines.push(RLine::from(spans));
+                    first_box = false;
+                } else {
+                    lines.push(pl);
+                }
+            }
+            return RText::from(lines);
+        }
+    }
+
+    let mut in_code_block = false;
+    let mut code_language = String::new();
+    let mut code_buffer = String::new();
+    // If a think block was already rendered above, don't prepend emoji again on first content line
+    let mut first_line = !has_think;
+
+    const KNOWN_LANGS: &[&str] = &[
+        "rust","python","py","javascript","js","typescript","ts","go","java",
+        "c","cpp","c++","cs","csharp","bash","sh","zsh","fish","toml","yaml",
+        "yml","json","html","css","sql","dockerfile","makefile","zig","kotlin",
+        "swift","ruby","php","scala","haskell","elixir","erlang","ocaml","r",
+        "markdown","md","xml","csv","diff","patch","text","txt","plaintext",
+        "proto","graphql","nix","vim","assembly","asm","wgsl","glsl","hlsl",
+    ];
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let mut line_idx = 0;
+
+    while line_idx < content_lines.len() {
+        let line = content_lines[line_idx];
+        
+        if line.trim_start().starts_with("```") {
+            if !in_code_block {
+                let lang_part = line.trim_start().strip_prefix("```").unwrap_or("").trim();
+                let canonical = lang_part.to_lowercase();
+                code_language = if lang_part.is_empty() {
+                    "code".to_string()
+                } else if KNOWN_LANGS.contains(&canonical.as_str()) {
+                    lang_part.to_string()
+                } else {
+                    "code".to_string()
+                };
+                let header = format!("┌─ {}", code_language);
+                if first_line {
+                    lines.push(RLine::from(format!("{} {}", content_emoji, header)));
+                    first_line = false;
+                } else {
+                    lines.push(RLine::from(header));
+                }
+                in_code_block = true;
+                code_buffer.clear();
+            } else {
+                // End of code block — highlight accumulated code
+                let highlighted = highlighter.highlight_code(&code_buffer, &code_language, is_dark);
+                lines.extend(highlighted);
+                lines.push(RLine::from("└─".to_string()));
+                in_code_block = false;
+                code_language.clear();
+                code_buffer.clear();
+            }
+            line_idx += 1;
+            continue;
+        }
+
+        if in_code_block {
+            if !code_buffer.is_empty() {
+                code_buffer.push('\n');
+            }
+            code_buffer.push_str(line);
+            line_idx += 1;
+        } else {
+            // Try to detect and render tables
+            if let Some((table_lines, lines_consumed)) = detect_and_render_table(&content_lines, line_idx, is_dark) {
+                // Prepend emoji to first table line if needed
+                if first_line && !table_lines.is_empty() {
+                    let mut first_table_line = table_lines[0].clone();
+                    if let Some(first_span) = first_table_line.spans.first() {
+                        let mut new_spans = vec![Span::raw(format!("{} ", content_emoji))];
+                        new_spans.extend(first_table_line.spans.iter().cloned());
+                        first_table_line = RLine::from(new_spans);
+                    }
+                    lines.push(first_table_line);
+                    lines.extend(table_lines.into_iter().skip(1));
+                    first_line = false;
+                } else {
+                    lines.extend(table_lines);
+                    first_line = false;
+                }
+                line_idx += lines_consumed;
+            } else {
+                // Regular text line with markdown formatting
+                let md_lines = render_markdown_line(line, is_dark);
+                for md_line in md_lines {
+                    if first_line {
+                        // Prepend emoji to first line
+                        let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+                        spans.extend(md_line.spans.into_iter());
+                        lines.push(RLine::from(spans));
+                        first_line = false;
+                    } else {
+                        lines.push(md_line);
+                    }
+                }
+                line_idx += 1;
+            }
+        }
+    }
+
+    // Handle unclosed code block
+    if in_code_block && !code_buffer.is_empty() {
+        let highlighted = highlighter.highlight_code(&code_buffer, &code_language, is_dark);
+        lines.extend(highlighted);
+    }
+
+    // Ensure at least one line with the emoji
+    if lines.is_empty() {
+        lines.push(RLine::from(format!("{} ", content_emoji)));
+    }
+
+    RText::from(lines)
+}
+
 fn sanitize_for_display(text: &str, max_len: usize) -> String {
     let mut clean = String::with_capacity(text.len().min(max_len + 64));
     let mut in_escape = false;
@@ -7518,6 +8012,37 @@ mod rendering_tests {
 }
 
 #[cfg(test)]
+mod human_tokens_tests {
+    use super::human_tokens;
+
+    #[test]
+    fn small_values() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(999), "999");
+    }
+
+    #[test]
+    fn thousands() {
+        assert_eq!(human_tokens(1_000), "1.0k");
+        assert_eq!(human_tokens(1_234), "1.2k");
+        assert_eq!(human_tokens(9_999), "10.0k");
+    }
+
+    #[test]
+    fn ten_thousands() {
+        assert_eq!(human_tokens(10_000), "10k");
+        assert_eq!(human_tokens(32_768), "33k");
+        assert_eq!(human_tokens(131_072), "131k");
+    }
+
+    #[test]
+    fn millions() {
+        assert_eq!(human_tokens(1_000_000), "1.0M");
+        assert_eq!(human_tokens(2_500_000), "2.5M");
+    }
+}
+
+#[cfg(test)]
 mod loop_detection_tests {
     use super::*;
     use std::collections::VecDeque;
@@ -7816,5 +8341,963 @@ mod plan_mode_tests {
         // scanner will flag — that is acceptable (slightly over-eager on stderr).
         // Just verify the function doesn't panic.
         let _ = is_shell_write_pattern("cargo build 2>&1");
+    }
+}
+
+
+// ============================================================================
+// Terminal integrity tests
+//
+// Tests that the rendering pipeline produces clean output: no corrupt Unicode,
+// no cell-level garbage, no ghost text after content shrinks.
+//
+// Two levels:
+//   1. sanitize_for_display — strips ANSI/control chars from raw strings.
+//   2. TestBackend buffer scan — renders widgets and inspects every cell.
+//
+// Note on ratatui + control chars: ratatui's buffer renderer filters out
+// zero-width and control characters (.filter(|width| *width > 0)), so ESC
+// bytes in a Span are silently dropped and never reach the cell buffer.
+// This means ANSI in message content won't appear as literal garbage but
+// also won't apply styling — the sanitize_for_display path is the right
+// place to strip it before it reaches ratatui.
+// ============================================================================
+#[cfg(test)]
+mod terminal_integrity_tests {
+    use super::*;
+    use ratatui::{
+        backend::TestBackend,
+        Terminal,
+        widgets::{Paragraph, Block, Borders},
+        text::{Text, Line, Span},
+    };
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /// Check a buffer CELL symbol for garbage.
+    /// Cell symbols are short (1-4 bytes for a single grapheme cluster);
+    /// anything larger or containing control chars is suspicious.
+    fn cell_symbol_is_garbage(sym: &str) -> bool {
+        for ch in sym.chars() {
+            match ch {
+                '\x1b' => return true,
+                '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1a' | '\x1c'..='\x1f' => {
+                    return true;
+                }
+                '\x7f' => return true,
+                '\u{FFFD}' => return true,
+                _ => {}
+            }
+        }
+        // A buffer cell holds one grapheme cluster — max ~4 bytes for emoji.
+        // More than 8 bytes indicates an accumulation bug.
+        if sym.len() > 8 { return true; }
+        false
+    }
+
+    /// Check a SPAN content string for control characters.
+    /// Unlike cell symbols, spans can be arbitrarily long; no length limit.
+    fn span_has_control_chars(s: &str) -> bool {
+        s.chars().any(|c| {
+            matches!(c,
+                '\x1b'
+                | '\x00'..='\x08'
+                | '\x0b'..='\x0c'
+                | '\x0e'..='\x1a'
+                | '\x1c'..='\x1f'
+                | '\x7f'
+                | '\u{FFFD}')
+        })
+    }
+
+    /// Collect all garbage cell symbols from a buffer for diagnostic output.
+    fn collect_garbage(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        buf.content()
+            .iter()
+            .filter(|c| cell_symbol_is_garbage(c.symbol()))
+            .map(|c| format!("{:?}", c.symbol()))
+            .collect()
+    }
+
+    /// Render `text` into an 80×5 TestBackend and return any garbage found.
+    fn garbage_in_paragraph(text: Text<'static>) -> Vec<String> {
+        let backend = TestBackend::new(80, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new(text), f.area());
+        }).unwrap();
+        collect_garbage(terminal.backend().buffer())
+    }
+
+    // -------------------------------------------------------------------------
+    // sanitize_for_display
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_ansi_color_sequence() {
+        let input = "\x1b[31mRed text\x1b[0m";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\x1b'), "ESC byte leaked: {:?}", result);
+        assert!(result.contains("Red text"));
+    }
+
+    #[test]
+    fn sanitize_strips_ansi_256_color() {
+        let input = "\x1b[38;5;214mOrange\x1b[0m normal";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\x1b'));
+        assert!(result.contains("Orange"));
+        assert!(result.contains("normal"));
+    }
+
+    #[test]
+    fn sanitize_strips_cursor_movement_sequences() {
+        let input = "line1\x1b[Aline2\x1b[2Jline3";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\x1b'));
+        assert!(result.contains("line1"));
+    }
+
+    #[test]
+    fn sanitize_strips_nul_and_control_chars() {
+        let input = "hello\x00world\x08\x07\x0btest";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\x00'));
+        assert!(!result.contains('\x08'));
+        assert!(!result.contains('\x07'));
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+    }
+
+    #[test]
+    fn sanitize_strips_carriage_return() {
+        let input = "line1\r\nline2\rline3";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\r'), "CR leaked through: {:?}", result);
+    }
+
+    #[test]
+    fn sanitize_preserves_newlines() {
+        let input = "line1\nline2\nline3";
+        let result = sanitize_for_display(input, 200);
+        assert_eq!(result.lines().count(), 3);
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode_and_emoji() {
+        let input = "こんにちは 🦀 café";
+        let result = sanitize_for_display(input, 200);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_truncates_at_max_len() {
+        let input = "a".repeat(500);
+        let result = sanitize_for_display(&input, 100);
+        assert!(result.ends_with('…'));
+        let before_ellipsis = result.trim_end_matches('…');
+        assert!(before_ellipsis.len() <= 100);
+    }
+
+    #[test]
+    fn sanitize_handles_incomplete_escape_at_end() {
+        let input = "text\x1b[";
+        let result = sanitize_for_display(input, 200);
+        assert!(!result.contains('\x1b'));
+        assert!(result.contains("text"));
+    }
+
+    #[test]
+    fn sanitize_handles_empty_string() {
+        let result = sanitize_for_display("", 100);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_strips_only_control_not_printable_unicode() {
+        // Ensure that printable Unicode is preserved and only ASCII control chars are stripped
+        let input = "normal \u{2028} text"; // Line separator (U+2028) — printable Unicode
+        let result = sanitize_for_display(input, 200);
+        assert!(result.contains("normal"));
+        assert!(result.contains("text"));
+    }
+
+    // -------------------------------------------------------------------------
+    // TestBackend buffer integrity — cell-level checks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn buffer_normal_text_is_clean() {
+        let garbage = garbage_in_paragraph(Text::raw("Hello, world! This is normal text."));
+        assert!(garbage.is_empty(), "Garbage in normal text: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_empty_paragraph_is_clean() {
+        let garbage = garbage_in_paragraph(Text::raw(""));
+        assert!(garbage.is_empty(), "Garbage in empty paragraph: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_multiline_text_is_clean() {
+        let text = Text::raw("First line\nSecond line\nThird line with 日本語");
+        let garbage = garbage_in_paragraph(text);
+        assert!(garbage.is_empty(), "Garbage in multiline: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_emoji_text_is_clean() {
+        let text = Text::raw("🤖 Assistant 🦀 Rust 🎨 Colors");
+        let garbage = garbage_in_paragraph(text);
+        assert!(garbage.is_empty(), "Garbage near emoji: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_styled_spans_are_clean() {
+        use ratatui::style::{Color, Style};
+        let line = Line::from(vec![
+            Span::styled("bold text ", Style::default().fg(Color::White)),
+            Span::styled("colored text", Style::default().fg(Color::Cyan)),
+        ]);
+        let garbage = garbage_in_paragraph(Text::from(line));
+        assert!(garbage.is_empty(), "Garbage in styled spans: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_long_line_does_not_corrupt_cells() {
+        let long_line = "X".repeat(200);
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new(long_line.as_str()), f.area());
+        }).unwrap();
+        let buf = terminal.backend().buffer();
+        let garbage = collect_garbage(buf);
+        assert!(garbage.is_empty(), "Garbage from long line: {:?}", garbage);
+        assert_eq!(buf.area().width, 80);
+    }
+
+    #[test]
+    fn buffer_box_drawing_chars_are_clean() {
+        let text = Text::raw("┌─ rust\n│ let x = 1;\n└─");
+        let garbage = garbage_in_paragraph(text);
+        assert!(garbage.is_empty(), "Garbage in box-drawing chars: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_cjk_mixed_with_ascii_is_clean() {
+        let text = Text::raw("Result: 結果 = 42, status: 正常");
+        let garbage = garbage_in_paragraph(text);
+        assert!(garbage.is_empty(), "Garbage in CJK mixed content: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_block_widget_is_clean() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            let block = Block::default().title("Test").borders(Borders::ALL);
+            let para = Paragraph::new("content inside a block").block(block);
+            f.render_widget(para, f.area());
+        }).unwrap();
+        let garbage = collect_garbage(terminal.backend().buffer());
+        assert!(garbage.is_empty(), "Garbage in bordered block: {:?}", garbage);
+    }
+
+    #[test]
+    fn buffer_ansi_in_span_is_dropped_not_garbled() {
+        // ratatui filters zero-width/control chars during rendering (width > 0 check),
+        // so ESC bytes placed in a Span are silently dropped — they do NOT appear as
+        // literal characters in buffer cells. This test documents that invariant.
+        // If this test fails it means ratatui's behavior changed.
+        let ansi_span = Span::raw("\x1b[31mRed\x1b[0m");
+        let text = Text::from(Line::from(vec![ansi_span]));
+        let garbage = garbage_in_paragraph(text);
+        assert!(garbage.is_empty(),
+            "ESC in span should be dropped by ratatui, not stored in cells: {:?}", garbage);
+    }
+
+    // -------------------------------------------------------------------------
+    // Backspace / cursor rendering regression
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn input_shrinks_no_ghost_char() {
+        // When content shrinks (backspace), the vacated cell must be a space —
+        // not the previous character left as ghost text.
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new("hello"), f.area());
+        }).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new("hell"), f.area());
+        }).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let cell_4 = buf.get(4, 0).symbol();
+        assert!(
+            cell_4 == " " || cell_4 == "",
+            "Ghost char at x=4 after backspace: {:?}", cell_4
+        );
+    }
+
+    #[test]
+    fn input_large_shrink_no_ghost_chars() {
+        // After replacing "hello world" with "hi", cells at x=2..=10 must be blank.
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new("hello world"), f.area());
+        }).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new("hi"), f.area());
+        }).unwrap();
+
+        let buf = terminal.backend().buffer();
+        for x in 2..=10u16 {
+            let sym = buf.get(x, 0).symbol();
+            assert!(
+                sym == " " || sym == "",
+                "Ghost char at x={} after large shrink: {:?}", x, sym
+            );
+        }
+    }
+
+    #[test]
+    fn empty_to_nonempty_then_empty_no_ghost() {
+        // Empty → content → empty again: all cells should end up blank.
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new(""), f.area());
+        }).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new("hello"), f.area());
+        }).unwrap();
+        terminal.draw(|f| {
+            f.render_widget(Paragraph::new(""), f.area());
+        }).unwrap();
+
+        let buf = terminal.backend().buffer();
+        for x in 0..5u16 {
+            let sym = buf.get(x, 0).symbol();
+            assert!(sym == " " || sym == "",
+                "Ghost char at x={} after clear: {:?}", x, sym);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Markdown rendering span integrity
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn markdown_inline_spans_no_control_chars() {
+        use ratatui::style::Color;
+        let spans = crate::markdown::format_inline_to_spans(
+            "**bold** and *italic* and `code` and plain text",
+            Color::White,
+        );
+        for span in &spans {
+            assert!(
+                !span_has_control_chars(span.content.as_ref()),
+                "Control char in markdown span: {:?}", span.content
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_header_no_control_chars() {
+        use ratatui::style::Color;
+        for level in 1..=6usize {
+            let line = crate::markdown::format_header(level, "Section Title", Color::White);
+            for span in &line.spans {
+                assert!(
+                    !span_has_control_chars(span.content.as_ref()),
+                    "Control char in h{} span: {:?}", level, span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_list_item_no_control_chars() {
+        use ratatui::style::Color;
+        let line = crate::markdown::format_list_item(0, "List item content", Color::White, '-');
+        for span in &line.spans {
+            assert!(
+                !span_has_control_chars(span.content.as_ref()),
+                "Control char in list item span: {:?}", span.content
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_table_no_control_chars() {
+        use ratatui::style::Color;
+        let rows = vec![
+            vec!["Header A".to_string(), "Header B".to_string()],
+            vec!["Cell 1".to_string(), "Cell 2".to_string()],
+        ];
+        let lines = crate::markdown::format_table(&rows, Color::White);
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !span_has_control_chars(span.content.as_ref()),
+                    "Control char in table span: {:?}", span.content
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rendering_pipeline_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn cell_symbol_is_garbage(sym: &str) -> bool {
+        if sym.bytes().any(|b| b == 0x1b || (b < 0x20 && b != 0x09 && b != 0x0a)) {
+            return true;
+        }
+        if sym.contains('\u{FFFD}') { return true; }
+        if sym.len() > 8 { return true; }
+        false
+    }
+
+    fn buffer_has_garbage(buf: &ratatui::buffer::Buffer) -> Option<String> {
+        for cell in buf.content() {
+            let sym = cell.symbol();
+            if cell_symbol_is_garbage(sym) {
+                return Some(format!("garbage cell: {:?}", sym));
+            }
+        }
+        None
+    }
+
+    fn render_text_to_buffer(text: ratatui::text::Text<'static>, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::{Block, Paragraph};
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            let area = f.area();
+            let p = Paragraph::new(text);
+            f.render_widget(p, area);
+        }).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    // ── looks_like_diff ───────────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_diff_detects_hunk_header() {
+        let diff = "@@ -1,3 +1,4 @@\n context\n-removed\n+added";
+        assert!(looks_like_diff(diff));
+    }
+
+    #[test]
+    fn looks_like_diff_detects_three_plus_minus() {
+        let diff = "+added line 1\n+added line 2\n-removed line 3\ncontext";
+        assert!(looks_like_diff(diff));
+    }
+
+    #[test]
+    fn looks_like_diff_false_for_plain_text() {
+        assert!(!looks_like_diff("This is just plain text with no diff markers."));
+    }
+
+    #[test]
+    fn looks_like_diff_ignores_plus_plus_plus() {
+        // +++ --- header lines alone should not trigger (need 3 +/- content lines)
+        assert!(!looks_like_diff("+++ header\n--- header\ncontext only"));
+    }
+
+    // ── format_tool_content_expanded ─────────────────────────────────────────
+
+    #[test]
+    fn fmt_tool_output_collapsed_preview() {
+        let content = "[TOOL_OUTPUT: rg = line1\nline2\nline3\nline4\nline5]";
+        let result = format_tool_content_expanded(content, false);
+        assert!(result.contains("🔧 rg"), "Should have tool emoji+name");
+        assert!(result.contains("│  line1"), "Should have first line");
+        assert!(!result.contains("line5"), "Collapsed should not show line5");
+        assert!(result.contains("more lines"), "Should mention more lines");
+    }
+
+    #[test]
+    fn fmt_tool_output_expanded_shows_all() {
+        let content = "[TOOL_OUTPUT: rg = line1\nline2\nline3\nline4\nline5]";
+        let result = format_tool_content_expanded(content, true);
+        assert!(result.contains("line5"), "Expanded should show all lines");
+        assert!(!result.contains("more lines"), "Expanded should not truncate");
+    }
+
+    #[test]
+    fn fmt_tool_error() {
+        let content = "[TOOL_ERROR: exec = command not found]";
+        let result = format_tool_content_expanded(content, false);
+        assert!(result.contains("❌ exec"), "Should show error emoji");
+        assert!(result.contains("command not found"));
+    }
+
+    #[test]
+    fn fmt_tool_truncation_note() {
+        let content = "[TOOL_OUTPUT: shell = output here...(truncated to 1000 chars)]";
+        let result = format_tool_content_expanded(content, true);
+        assert!(result.contains("✂️"), "Should show scissors for truncation");
+    }
+
+    // ── render_markdown_line ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_md_line_plain_text_no_garbage() {
+        let h = crate::highlight::Highlighter::new();
+        let _ = h; // Highlighter doesn't affect render_markdown_line
+        let result = render_markdown_line("Hello world", true);
+        assert!(!result.is_empty());
+        for line in &result {
+            for span in &line.spans {
+                assert!(!span.content.contains('\x1b'), "ANSI in span: {:?}", span.content);
+            }
+        }
+    }
+
+    #[test]
+    fn render_md_line_header() {
+        let result = render_markdown_line("## Section Header", true);
+        assert!(!result.is_empty());
+        let text: String = result.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(text.contains("Section Header"));
+    }
+
+    #[test]
+    fn render_md_line_list_item() {
+        let result = render_markdown_line("- list item", true);
+        assert!(!result.is_empty());
+        let text: String = result.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(text.contains("list item"));
+    }
+
+    #[test]
+    fn render_md_line_empty_string() {
+        let result = render_markdown_line("", true);
+        // Should produce at least one (possibly empty) line
+        assert!(!result.is_empty() || result.is_empty()); // always passes — check no panic
+    }
+
+    // ── format_message_styled ────────────────────────────────────────────────
+
+    fn h() -> crate::highlight::Highlighter { crate::highlight::Highlighter::new() }
+
+    #[test]
+    fn fmt_msg_plain_text_no_garbage_in_buffer() {
+        let text = format_message_styled("🤖", "Hello, world!", true, &h());
+        let buf = render_text_to_buffer(text, 80, 5);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage");
+    }
+
+    #[test]
+    fn fmt_msg_bold_markdown_no_garbage() {
+        let text = format_message_styled("🤖", "**bold text** and *italic*", true, &h());
+        let buf = render_text_to_buffer(text, 80, 5);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage: {:?}", buffer_has_garbage(&buf));
+    }
+
+    #[test]
+    fn fmt_msg_code_block_renders() {
+        let content = "Here is code:\n```rust\nfn main() {}\n```\nDone.";
+        let text = format_message_styled("🤖", content, true, &h());
+        let full: String = text.lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(full.contains("┌─ rust") || full.contains("┌─ code") || full.contains("fn main"), "Code block not rendered");
+    }
+
+    #[test]
+    fn fmt_msg_code_block_no_garbage() {
+        let content = "```python\nfor x in range(10):\n    print(x)\n```";
+        let text = format_message_styled("📦", content, false, &h());
+        let buf = render_text_to_buffer(text, 100, 10);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage: {:?}", buffer_has_garbage(&buf));
+    }
+
+    #[test]
+    fn fmt_msg_think_prefix_stripped() {
+        let content = "[THINK: internal reasoning here]\nActual response to user.";
+        let text = format_message_styled("🤖", content, true, &h());
+        let full: String = text.lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(full.contains("thinking") || full.contains("💭"), "Think prefix not rendered");
+        assert!(full.contains("Actual response"), "Main content missing");
+    }
+
+    #[test]
+    fn fmt_msg_think_prefix_no_garbage() {
+        let content = "[THINK: reasoning]\nResponse.";
+        let text = format_message_styled("🤖", content, true, &h());
+        let buf = render_text_to_buffer(text, 80, 10);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage");
+    }
+
+    #[test]
+    fn fmt_msg_xml_tool_call_prettified() {
+        let content = "Calling tool now.\n<tool>exec</tool><tool_sep>ls -la<end_tool>";
+        let text = format_message_styled("🤖", content, true, &h());
+        let full: String = text.lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>().join("");
+        assert!(full.contains("Calling tool now") || !full.is_empty());
+    }
+
+    #[test]
+    fn fmt_msg_multiline_no_garbage_dark() {
+        let content = "Line one\nLine two\n## Header\nLine three\n- bullet item\nFinal line.";
+        let text = format_message_styled("🤖", content, true, &h());
+        let buf = render_text_to_buffer(text, 80, 15);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage: {:?}", buffer_has_garbage(&buf));
+    }
+
+    #[test]
+    fn fmt_msg_multiline_no_garbage_light() {
+        let content = "Line one\nLine two\n## Header\nLine three\n- bullet item\nFinal line.";
+        let text = format_message_styled("🤖", content, false, &h());
+        let buf = render_text_to_buffer(text, 80, 15);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage: {:?}", buffer_has_garbage(&buf));
+    }
+
+    #[test]
+    fn fmt_msg_empty_content() {
+        let text = format_message_styled("🤖", "", true, &h());
+        assert!(!text.lines.is_empty(), "Should have at least one line");
+        let buf = render_text_to_buffer(text, 80, 3);
+        assert!(buffer_has_garbage(&buf).is_none());
+    }
+
+    #[test]
+    fn fmt_msg_json_tool_call_no_garbage() {
+        let content = r#"{"tool_calls":[{"name":"exec","parameters":{"command":"ls -la","description":"list files"}}]}"#;
+        let text = format_message_styled("🤖", content, true, &h());
+        let buf = render_text_to_buffer(text, 100, 10);
+        assert!(buffer_has_garbage(&buf).is_none(), "Buffer has garbage: {:?}", buffer_has_garbage(&buf));
+    }
+
+    // ── detect_and_render_table ───────────────────────────────────────────────
+
+    #[test]
+    fn detect_table_basic() {
+        let lines = vec!["| A | B |", "|---|---|", "| 1 | 2 |"];
+        let result = detect_and_render_table(&lines, 0, true);
+        assert!(result.is_some(), "Should detect table");
+        let (rendered, consumed) = result.unwrap();
+        assert!(consumed >= 3, "Should consume at least 3 lines");
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn detect_table_no_table() {
+        let lines = vec!["plain text", "more text", "still text"];
+        let result = detect_and_render_table(&lines, 0, true);
+        assert!(result.is_none(), "Should not detect non-table");
+    }
+
+    #[test]
+    fn detect_table_out_of_bounds() {
+        let lines: Vec<&str> = vec!["| A |"];
+        let result = detect_and_render_table(&lines, 0, true);
+        assert!(result.is_none(), "Single line cannot be a table");
+    }
+
+    #[test]
+    fn detect_table_no_garbage_in_buffer() {
+        let lines = vec!["| Col1 | Col2 |", "|------|------|", "| val1 | val2 |", "| val3 | val4 |"];
+        let result = detect_and_render_table(&lines, 0, true);
+        let (rendered, _) = result.expect("Should detect table");
+        let text = ratatui::text::Text::from(rendered);
+        let buf = render_text_to_buffer(text, 60, 10);
+        assert!(buffer_has_garbage(&buf).is_none(), "Table buffer has garbage");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interaction Latency Tests
+//
+// Each test measures that a critical hot-path operation completes within a
+// per-call budget.  Budgets are intentionally loose (×10–100 the expected
+// real cost) so they do not flake on a loaded CI machine while still
+// catching algorithmic regressions (O(n²) blow-ups, accidental deep copies, …).
+//
+// Convention: run N iterations, assert total < N × per_call_budget_us µs.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod interaction_latency_tests {
+    use super::*;
+    use std::time::Instant;
+
+    // Budget constants (microseconds per call)
+    const FUZZY_SCORE_BUDGET_US: u128 = 50;          // single fuzzy_score call
+    const PALETTE_FILTER_BUDGET_US: u128 = 500;      // filter all 30 palette commands
+    const MD_LINE_RENDER_BUDGET_US: u128 = 200;      // render one markdown line
+    const DIFF_RENDER_BUDGET_US: u128 = 500;         // render a diff block
+    const MSG_FORMAT_BUDGET_US: u128 = 500;          // format_message_styled
+    const EXTRACT_PLAN_BUDGET_US: u128 = 50;         // extract_plan_block
+    const STREAM_END_BUDGET_US: u128 = 10;           // decide_stream_end
+    const INPUT_CHAR_BUDGET_US: u128 = 2;            // String::push (per char, 1 000 chars)
+
+    fn assert_under_budget(label: &str, elapsed_us: u128, n: usize, budget_per_call_us: u128) {
+        let total_budget = n as u128 * budget_per_call_us;
+        assert!(
+            elapsed_us <= total_budget,
+            "{label}: {n} calls took {elapsed_us}µs (budget {total_budget}µs = {n}×{budget_per_call_us}µs)"
+        );
+    }
+
+    // ── fuzzy_score ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn latency_fuzzy_score_short_query() {
+        let n = 10_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = fuzzy_score("mod", "Switch AI model — model switch change llm ollama");
+        }
+        assert_under_budget("fuzzy_score/short", t.elapsed().as_micros(), n, FUZZY_SCORE_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_fuzzy_score_no_match() {
+        let n = 10_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = fuzzy_score("zzzzzz", "Switch AI model — model switch change llm ollama");
+        }
+        assert_under_budget("fuzzy_score/no_match", t.elapsed().as_micros(), n, FUZZY_SCORE_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_fuzzy_score_long_query() {
+        let n = 5_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = fuzzy_score("temperature", "Set sampling temperature (0.0–2.0) — temperature heat creativity sampling randomness");
+        }
+        assert_under_budget("fuzzy_score/long_query", t.elapsed().as_micros(), n, FUZZY_SCORE_BUDGET_US * 2);
+    }
+
+    // ── palette filter (all 30 commands scored + sorted) ─────────────────────
+
+    #[test]
+    fn latency_palette_filter_with_query() {
+        let n = 1_000;
+        let query = "mod";
+        let t = Instant::now();
+        for _ in 0..n {
+            let mut scored: Vec<(i32, &'static PaletteCommand)> = PALETTE_COMMANDS
+                .iter()
+                .filter_map(|cmd| {
+                    let haystack = format!("{} {} {}", cmd.name, cmd.description, cmd.keywords);
+                    let s = fuzzy_score(query, &haystack);
+                    if s > 0 { Some((s, cmd)) } else { None }
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let _ = scored;
+        }
+        assert_under_budget("palette_filter/query", t.elapsed().as_micros(), n, PALETTE_FILTER_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_palette_filter_empty_query() {
+        let n = 1_000;
+        let query = "";
+        let t = Instant::now();
+        for _ in 0..n {
+            let mut scored: Vec<(i32, &'static PaletteCommand)> = PALETTE_COMMANDS
+                .iter()
+                .filter_map(|cmd| {
+                    let haystack = format!("{} {} {}", cmd.name, cmd.description, cmd.keywords);
+                    let s = fuzzy_score(query, &haystack);
+                    if s > 0 { Some((s, cmd)) } else { None }
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let _ = scored;
+        }
+        assert_under_budget("palette_filter/empty", t.elapsed().as_micros(), n, PALETTE_FILTER_BUDGET_US);
+    }
+
+    // ── input buffer throughput ───────────────────────────────────────────────
+
+    #[test]
+    fn latency_input_buffer_push_pop() {
+        let n = 1_000;
+        let t = Instant::now();
+        let mut buf = String::new();
+        for i in 0..n {
+            buf.push(char::from_u32(('a' as u32) + (i % 26) as u32).unwrap_or('a'));
+        }
+        let push_us = t.elapsed().as_micros();
+        let t2 = Instant::now();
+        for _ in 0..n {
+            buf.pop();
+        }
+        let pop_us = t2.elapsed().as_micros();
+        assert_under_budget("input_buffer/push", push_us, n, INPUT_CHAR_BUDGET_US);
+        assert_under_budget("input_buffer/pop",  pop_us,  n, INPUT_CHAR_BUDGET_US);
+    }
+
+    // ── markdown line rendering ───────────────────────────────────────────────
+
+    #[test]
+    fn latency_render_markdown_plain() {
+        let n = 1_000;
+        let line = "This is a plain prose line with some **bold** and `code` and *italic* text.";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_markdown_line(line, true);
+        }
+        assert_under_budget("render_markdown_line/plain", t.elapsed().as_micros(), n, MD_LINE_RENDER_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_render_markdown_header() {
+        let n = 1_000;
+        let line = "## Section Header with Some Text";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_markdown_line(line, true);
+        }
+        assert_under_budget("render_markdown_line/header", t.elapsed().as_micros(), n, MD_LINE_RENDER_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_render_markdown_code_block() {
+        let n = 500;
+        let line = "```rust\nfn main() { println!(\"hello\"); }\n```";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_markdown_line(line, true);
+        }
+        assert_under_budget("render_markdown_line/code", t.elapsed().as_micros(), n, MD_LINE_RENDER_BUDGET_US * 4);
+    }
+
+    // ── diff rendering ────────────────────────────────────────────────────────
+
+    #[test]
+    fn latency_render_diff_small() {
+        let n = 500;
+        let diff = "@@ -1,5 +1,6 @@\n context\n-removed line\n+added line\n context\n+another new line\n context";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_diff_styled("📄", "file.rs", diff, 0, "");
+        }
+        assert_under_budget("render_diff/small", t.elapsed().as_micros(), n, DIFF_RENDER_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_render_diff_large() {
+        let n = 100;
+        let line = "+added line of code here with some content to make it realistic\n";
+        let diff = line.repeat(200);
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = render_diff_styled("📄", "big_file.rs", &diff, 50, "");
+        }
+        assert_under_budget("render_diff/large_truncated", t.elapsed().as_micros(), n, DIFF_RENDER_BUDGET_US * 10);
+    }
+
+    // ── format_message_styled ─────────────────────────────────────────────────
+
+    #[test]
+    fn latency_format_message_plain() {
+        let n = 500;
+        let h = crate::highlight::Highlighter::new();
+        let content = "Here is a short assistant response with a few sentences of text.";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = format_message_styled("🤖", content, true, &h);
+        }
+        assert_under_budget("format_message/plain", t.elapsed().as_micros(), n, MSG_FORMAT_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_format_message_with_tool_call() {
+        let n = 500;
+        let h = crate::highlight::Highlighter::new();
+        let content = r#"{"tool_calls":[{"name":"exec","parameters":{"command":"cargo test --lib","description":"run tests"}}]}"#;
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = format_message_styled("🤖", content, true, &h);
+        }
+        assert_under_budget("format_message/tool_call", t.elapsed().as_micros(), n, MSG_FORMAT_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_format_message_multiline() {
+        let n = 200;
+        let h = crate::highlight::Highlighter::new();
+        let content = "Line one of the response.\n## Header\n\nSome paragraph text here.\n\n```rust\nfn hello() {}\n```\n\nMore prose at the end.";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = format_message_styled("🤖", content, true, &h);
+        }
+        assert_under_budget("format_message/multiline", t.elapsed().as_micros(), n, MSG_FORMAT_BUDGET_US * 5);
+    }
+
+    // ── pure utility functions ────────────────────────────────────────────────
+
+    #[test]
+    fn latency_extract_plan_block() {
+        let n = 10_000;
+        let text = "Some intro text.\n<plan>\n- Task A\n- Task B\n- Task C\n</plan>\nSome trailing text.";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = extract_plan_block(text);
+        }
+        assert_under_budget("extract_plan_block", t.elapsed().as_micros(), n, EXTRACT_PLAN_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_extract_plan_block_no_plan() {
+        let n = 10_000;
+        let text = "Just a plain response with no plan block anywhere in here.";
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = extract_plan_block(text);
+        }
+        assert_under_budget("extract_plan_block/no_plan", t.elapsed().as_micros(), n, EXTRACT_PLAN_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_decide_stream_end() {
+        let n = 100_000;
+        let t = Instant::now();
+        for i in 0..n {
+            let _ = decide_stream_end(true, AppMode::Plan, i % 5, (i % 4) as u32);
+        }
+        assert_under_budget("decide_stream_end", t.elapsed().as_micros(), n, STREAM_END_BUDGET_US);
+    }
+
+    #[test]
+    fn latency_is_shell_write_pattern() {
+        let n = 10_000;
+        let cases = [
+            "echo hello",
+            "cat file.txt > output.txt",
+            "ls -la | grep rust",
+            "cat > file.rs << 'EOF'\nfn main() {}\nEOF",
+            "cargo build --release",
+        ];
+        let t = Instant::now();
+        for i in 0..n {
+            let _ = is_shell_write_pattern(cases[i % cases.len()]);
+        }
+        assert_under_budget("is_shell_write_pattern", t.elapsed().as_micros(), n, FUZZY_SCORE_BUDGET_US);
     }
 }

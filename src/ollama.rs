@@ -11,9 +11,31 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Detect endpoint type for display in status bar.
-/// Returns: "Ollama", "OpenAI", "llama.cpp", etc.
+/// Returns: "Ollama-local", "Ollama-external", "OpenRouter", "llama.cpp", etc.
 pub fn detect_endpoint_type(endpoint: &str) -> String {
     let lower = endpoint.to_lowercase();
+    let is_local = lower.contains("localhost") 
+        || lower.contains("127.0.0.1") 
+        || lower.contains("::1")
+        || lower.contains("192.168.") 
+        || lower.contains("10.")
+        || lower.contains("172.16.")
+        || lower.contains("172.17.")
+        || lower.contains("172.18.")
+        || lower.contains("172.19.")
+        || lower.contains("172.20.")
+        || lower.contains("172.21.")
+        || lower.contains("172.22.")
+        || lower.contains("172.23.")
+        || lower.contains("172.24.")
+        || lower.contains("172.25.")
+        || lower.contains("172.26.")
+        || lower.contains("172.27.")
+        || lower.contains("172.28.")
+        || lower.contains("172.29.")
+        || lower.contains("172.30.")
+        || lower.contains("172.31.");
+    
     if lower.contains("openrouter") {
         "OpenRouter".to_string()
     } else if lower.contains("groq") {
@@ -24,17 +46,18 @@ pub fn detect_endpoint_type(endpoint: &str) -> String {
         "OpenAI-compat".to_string()
     } else if lower.contains("localhost:8080") || lower.contains("127.0.0.1:8080") {
         "llama.cpp".to_string()
-    } else if lower.contains("192.168.") || lower.contains("10.") {
-        // Extract IP address from the endpoint
+    } else if is_local {
+        // Local network Ollama instance
         let url = endpoint.trim_start_matches("http://").trim_start_matches("https://");
         let host = url.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
         if !host.is_empty() {
-            host.to_string()
+            format!("Ollama ({})", host)
         } else {
-            "Ollama".to_string()
+            "Ollama-local".to_string()
         }
     } else {
-        "Ollama".to_string()
+        // External network endpoint
+        "Ollama-external".to_string()
     }
 }
 
@@ -69,6 +92,17 @@ fn openai_chat_url(endpoint: &str) -> String {
     }
 }
 
+/// Return the `/v1`-normalised base URL for use with `async_openai::OpenAIConfig::with_api_base`.
+/// async-openai appends `/chat/completions` itself, so we only return the base up to `/v1`.
+fn openai_api_base(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{}/v1", base)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ApiFormat { Ollama, OpenAI, LlamaCpp }
 
@@ -100,6 +134,9 @@ pub struct OllamaClient {
     /// Native context length reported by /api/show for the current model.
     /// None until fetch_native_ctx() is called.
     native_ctx: Arc<Mutex<Option<u32>>>,
+    /// Whether the model advertises "thinking" in its capabilities.
+    /// None until fetch_native_ctx() is called; defaults to false for non-Ollama backends.
+    supports_thinking: Arc<Mutex<Option<bool>>>,
 }
 
 /// Model information from Ollama API
@@ -350,6 +387,172 @@ struct LlamaCppStreamChunk {
     stop: bool,
 }
 
+// ---- Streaming parser helpers ----
+
+/// Accumulated state for an OpenAI SSE stream (carries across chunk boundaries).
+#[derive(Default)]
+pub(crate) struct OaiStreamState {
+    pub had_thinking: bool,
+    pub prompt_tokens: u32,
+    pub gen_tokens: u32,
+}
+
+/// Result of parsing one `data:` line from an OpenAI SSE stream.
+pub(crate) enum SseDataResult {
+    /// Zero or more intermediate events (Token / ThinkToken).
+    Events(Vec<StreamEvent>),
+    /// Terminal event — caller must send it and return.
+    Done(StreamEvent),
+    /// Nothing to emit (empty line, SSE comment, JSON parse error).
+    Skip,
+}
+
+/// Split `buffer` on newlines.  Returns complete trimmed lines and the
+/// still-incomplete remainder (no trailing newline yet).
+pub(crate) fn split_newline_buffer(buffer: &str) -> (Vec<String>, String) {
+    let mut lines = Vec::new();
+    let mut remaining = buffer;
+    while let Some(pos) = remaining.find('\n') {
+        lines.push(remaining[..pos].trim().to_string());
+        remaining = &remaining[pos + 1..];
+    }
+    (lines, remaining.to_string())
+}
+
+/// Parse one NDJSON line from the Ollama `/api/chat` streaming response.
+/// Returns zero or more events; empty vec means skip (blank or malformed).
+/// `context_trimmed` / `msgs_dropped` are forwarded into the `Done` event.
+pub(crate) fn parse_ollama_chunk(
+    line: &str,
+    had_thinking: &mut bool,
+    context_trimmed: bool,
+    msgs_dropped: usize,
+) -> Vec<StreamEvent> {
+    if line.is_empty() {
+        return vec![];
+    }
+    match serde_json::from_str::<StreamChunk>(line) {
+        Ok(chunk) => {
+            let mut events = Vec::new();
+            if let Some(msg) = &chunk.message {
+                if !msg.thinking.is_empty() {
+                    *had_thinking = true;
+                    events.push(StreamEvent::ThinkToken(msg.thinking.clone()));
+                }
+                if !msg.content.is_empty() {
+                    events.push(StreamEvent::Token(msg.content.clone()));
+                }
+            }
+            if chunk.done {
+                events.push(StreamEvent::Done {
+                    prompt_tokens: chunk.prompt_eval_count.unwrap_or(0),
+                    gen_tokens: chunk.eval_count.unwrap_or(0),
+                    had_thinking: *had_thinking,
+                    eval_duration_ns: chunk.eval_duration,
+                    context_trimmed,
+                    msgs_dropped,
+                });
+            }
+            events
+        }
+        Err(_) => vec![],
+    }
+}
+
+/// Parse one `data:` payload from an OpenAI SSE stream.
+/// The caller is responsible for stripping the `data: ` prefix and filtering
+/// empty lines / SSE comments before calling this function.
+pub(crate) fn parse_openai_sse_data(
+    data: &str,
+    state: &mut OaiStreamState,
+    context_trimmed: bool,
+    msgs_dropped: usize,
+) -> SseDataResult {
+    if data == "[DONE]" {
+        return SseDataResult::Done(StreamEvent::Done {
+            prompt_tokens: state.prompt_tokens,
+            gen_tokens: state.gen_tokens,
+            had_thinking: state.had_thinking,
+            eval_duration_ns: None,
+            context_trimmed,
+            msgs_dropped,
+        });
+    }
+    match serde_json::from_str::<OAIStreamChunk>(data) {
+        Ok(chunk) => {
+            if let Some(usage) = &chunk.usage {
+                state.prompt_tokens = usage.prompt_tokens;
+                state.gen_tokens = usage.completion_tokens;
+            }
+            let mut events = Vec::new();
+            for choice in &chunk.choices {
+                if !choice.delta.reasoning_content.is_empty() {
+                    state.had_thinking = true;
+                    events.push(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
+                }
+                if !choice.delta.content.is_empty() {
+                    events.push(StreamEvent::Token(choice.delta.content.clone()));
+                }
+            }
+            SseDataResult::Events(events)
+        }
+        Err(_) => SseDataResult::Skip,
+    }
+}
+
+/// Process one already-deserialized OpenAI stream chunk (from `async_openai` byot stream).
+/// Updates `state` with usage and thinking flag; returns Token/ThinkToken events.
+/// The caller is responsible for emitting `StreamEvent::Done` when the stream ends.
+pub(crate) fn process_oai_chunk(chunk: &OAIStreamChunk, state: &mut OaiStreamState) -> Vec<StreamEvent> {
+    if let Some(usage) = &chunk.usage {
+        state.prompt_tokens = usage.prompt_tokens;
+        state.gen_tokens = usage.completion_tokens;
+    }
+    let mut events = Vec::new();
+    for choice in &chunk.choices {
+        if !choice.delta.reasoning_content.is_empty() {
+            state.had_thinking = true;
+            events.push(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
+        }
+        if !choice.delta.content.is_empty() {
+            events.push(StreamEvent::Token(choice.delta.content.clone()));
+        }
+    }
+    events
+}
+
+/// Parse one NDJSON line from the llama.cpp `/completion` streaming response.
+/// Returns zero or more events; empty vec means skip (blank or malformed).
+pub(crate) fn parse_llamacpp_chunk(
+    line: &str,
+    context_trimmed: bool,
+    msgs_dropped: usize,
+) -> Vec<StreamEvent> {
+    if line.is_empty() {
+        return vec![];
+    }
+    match serde_json::from_str::<LlamaCppStreamChunk>(line) {
+        Ok(chunk) => {
+            let mut events = Vec::new();
+            if !chunk.content.is_empty() {
+                events.push(StreamEvent::Token(chunk.content.clone()));
+            }
+            if chunk.stop {
+                events.push(StreamEvent::Done {
+                    prompt_tokens: 0,
+                    gen_tokens: 0,
+                    had_thinking: false,
+                    eval_duration_ns: None,
+                    context_trimmed,
+                    msgs_dropped,
+                });
+            }
+            events
+        }
+        Err(_) => vec![],
+    }
+}
+
 fn build_openai_request(model: &str, messages: Vec<OllamaMessage>, params: &crate::config::ModelParams) -> OAIRequest {
     OAIRequest {
         model: model.to_string(),
@@ -363,26 +566,28 @@ fn build_openai_request(model: &str, messages: Vec<OllamaMessage>, params: &crat
 }
 
 async fn stream_openai(
-    client: reqwest::Client,
-    url: String,
+    endpoint: String,
     api_key: String,
     mut request: OAIRequest,
     tx: mpsc::UnboundedSender<StreamEvent>,
     context_trimmed: bool,
     msgs_dropped: usize,
 ) {
+    use async_openai::{Client as OAIClient, config::OpenAIConfig};
+    use futures_util::StreamExt;
+
     request.stream = true;
-    crate::dlog!("stream_openai: POST {} model={} msgs={} api_key_set={}",
-        url, request.model, request.messages.len(), !api_key.is_empty());
-    let response = match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-    {
-        Ok(r) => r,
+    let api_base = openai_api_base(&endpoint);
+    crate::dlog!("stream_openai: POST {}/chat/completions model={} msgs={} api_key_set={}",
+        api_base, request.model, request.messages.len(), !api_key.is_empty());
+
+    let config = OpenAIConfig::new()
+        .with_api_base(&api_base)
+        .with_api_key(&api_key);
+    let oai_client = OAIClient::with_config(config);
+
+    let mut stream = match oai_client.chat().create_stream_byot::<OAIRequest, OAIStreamChunk>(request).await {
+        Ok(s) => s,
         Err(e) => {
             crate::dlog!("stream_openai: request failed: {}", e);
             let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e)));
@@ -390,83 +595,18 @@ async fn stream_openai(
         }
     };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        crate::dlog!("stream_openai: HTTP {}: {}", status, body);
-        let _ = tx.send(StreamEvent::Error(format!("OpenAI error {}: {}", status, body)));
-        return;
-    }
-    crate::dlog!("stream_openai: HTTP OK, reading SSE stream");
-
-    use futures_util::StreamExt;
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    let mut had_thinking = false;
-    let mut prompt_tokens = 0u32;
-    let mut gen_tokens = 0u32;
+    let mut state = OaiStreamState::default();
     let mut chunks_seen = 0u32;
     let mut content_chunks = 0u32;
-    let mut parse_errors = 0u32;
 
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(bytes) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim().to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
-
-                    if line.is_empty() || line.starts_with(':') { continue; }
-
-                    let data = if let Some(rest) = line.strip_prefix("data: ") {
-                        rest
-                    } else {
-                        continue;
-                    };
-
-                    if data == "[DONE]" {
-                        crate::dlog!("stream_openai: </done> received chunks={} content_chunks={} prompt_tokens={} gen_tokens={} had_thinking={}",
-                            chunks_seen, content_chunks, prompt_tokens, gen_tokens, had_thinking);
-                        let _ = tx.send(StreamEvent::Done {
-                            prompt_tokens,
-                            gen_tokens,
-                            had_thinking,
-                            eval_duration_ns: None,
-                            context_trimmed,
-                            msgs_dropped,
-                        });
-                        return;
-                    }
-
-                    chunks_seen += 1;
-                    match serde_json::from_str::<OAIStreamChunk>(data) {
-                        Ok(chunk) => {
-                            if let Some(usage) = &chunk.usage {
-                                prompt_tokens = usage.prompt_tokens;
-                                gen_tokens = usage.completion_tokens;
-                            }
-                            for choice in &chunk.choices {
-                                if !choice.delta.reasoning_content.is_empty() {
-                                    had_thinking = true;
-                                    let _ = tx.send(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
-                                }
-                                if !choice.delta.content.is_empty() {
-                                    content_chunks += 1;
-                                    if tx.send(StreamEvent::Token(choice.delta.content.clone())).is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            parse_errors += 1;
-                            if parse_errors <= 3 {
-                                crate::dlog!("stream_openai: parse error #{}: {} | data: {}", parse_errors, e, &data.chars().take(200).collect::<String>());
-                            }
-                        }
-                    }
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(chunk) => {
+                chunks_seen += 1;
+                let events = process_oai_chunk(&chunk, &mut state);
+                for event in events {
+                    if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
+                    if tx.send(event).is_err() { return; }
                 }
             }
             Err(e) => {
@@ -476,12 +616,13 @@ async fn stream_openai(
             }
         }
     }
-    crate::dlog!("stream_openai: stream ended without </done> chunks={} content_chunks={}", chunks_seen, content_chunks);
+    crate::dlog!("stream_openai: stream ended chunks={} content_chunks={} prompt_tokens={} gen_tokens={} had_thinking={}",
+        chunks_seen, content_chunks, state.prompt_tokens, state.gen_tokens, state.had_thinking);
 
     let _ = tx.send(StreamEvent::Done {
-        prompt_tokens,
-        gen_tokens,
-        had_thinking,
+        prompt_tokens: state.prompt_tokens,
+        gen_tokens: state.gen_tokens,
+        had_thinking: state.had_thinking,
         eval_duration_ns: None,
         context_trimmed,
         msgs_dropped,
@@ -531,37 +672,22 @@ async fn stream_llamacpp(
         match chunk_result {
             Ok(bytes) => {
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
+                let (lines, remainder) = split_newline_buffer(&buffer);
+                buffer = remainder;
 
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim().to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
-
+                for line in lines {
                     if line.is_empty() { continue; }
-
                     chunks_seen += 1;
-                    match serde_json::from_str::<LlamaCppStreamChunk>(&line) {
-                        Ok(chunk) => {
-                            if !chunk.content.is_empty() {
-                                content_chunks += 1;
-                                if tx.send(StreamEvent::Token(chunk.content.clone())).is_err() {
-                                    return;
-                                }
-                            }
-                            if chunk.stop {
-                                crate::dlog!("stream_llamacpp: stop received chunks={} content_chunks={}", chunks_seen, content_chunks);
-                                let _ = tx.send(StreamEvent::Done {
-                                    prompt_tokens: 0,
-                                    gen_tokens: 0,
-                                    had_thinking: false,
-                                    eval_duration_ns: None,
-                                    context_trimmed,
-                                    msgs_dropped,
-                                });
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            crate::dlog!("stream_llamacpp: parse error on line (chunk #{}): {} -> {}", chunks_seen, e, line);
+                    let events = parse_llamacpp_chunk(&line, context_trimmed, msgs_dropped);
+                    for event in events {
+                        let is_done = matches!(event, StreamEvent::Done { .. });
+                        if is_done {
+                            crate::dlog!("stream_llamacpp: stop received chunks={} content_chunks={}", chunks_seen, content_chunks);
+                            let _ = tx.send(event);
+                            return;
+                        } else {
+                            if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
+                            if tx.send(event).is_err() { return; }
                         }
                     }
                 }
@@ -619,6 +745,7 @@ impl OllamaClient {
             http_client,
             model: model.to_string(),
             native_ctx: Arc::new(Mutex::new(None)),
+            supports_thinking: Arc::new(Mutex::new(None)),
         };
 
         match ollama_client.list_models().await {
@@ -667,6 +794,7 @@ impl OllamaClient {
             http_client,
             model: model.to_string(),
             native_ctx: Arc::new(Mutex::new(None)),
+            supports_thinking: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -676,11 +804,12 @@ impl OllamaClient {
 
     /// Reuse an existing validated client but switch to a different model name.
     /// No network round-trip — the underlying reqwest::Client is Arc-backed and cheap to clone.
-    /// native_ctx is reset to None since the model changed (call fetch_native_ctx to re-detect).
+    /// native_ctx and supports_thinking are reset to None since the model changed (call fetch_native_ctx to re-detect).
     pub fn new_with_existing(existing: Self, model: &str) -> Self {
         Self {
             model: model.to_string(),
             native_ctx: Arc::new(Mutex::new(None)),
+            supports_thinking: Arc::new(Mutex::new(None)),
             ..existing
         }
     }
@@ -743,9 +872,10 @@ impl OllamaClient {
         }
     }
 
-    /// Fetch the native context length for the current model from Ollama's /api/show endpoint.
+    /// Fetch the native context length and thinking capability for the current model from Ollama's /api/show endpoint.
     /// Looks for any key ending in `.context_length` in `model_info` (e.g. `qwen35.context_length`).
-    /// Stores the result internally so get_native_ctx() can return it without another network call.
+    /// Checks `capabilities` array for `"thinking"` to set supports_thinking.
+    /// Stores results internally so getters can return them without another network call.
     /// Returns None immediately for OpenAI-compatible backends.
     pub async fn fetch_native_ctx(&self) -> Option<u32> {
         let (endpoint, client) = match &self.backend {
@@ -756,11 +886,18 @@ impl OllamaClient {
         #[derive(Deserialize)]
         struct ShowResponse {
             model_info: Option<std::collections::HashMap<String, serde_json::Value>>,
+            #[serde(default)]
+            capabilities: Vec<String>,
         }
         let url = format!("{}/api/show", endpoint);
         let body = serde_json::json!({"model": self.model});
         let resp = client.post(&url).json(&body).send().await.ok()?;
         let show: ShowResponse = resp.json().await.ok()?;
+
+        let thinks = show.capabilities.iter().any(|c| c == "thinking");
+        *self.supports_thinking.lock().unwrap() = Some(thinks);
+        dlog!("🧠 {} supports_thinking={}", self.model, thinks);
+
         let info = show.model_info?;
         let ctx = info.iter()
             .find(|(k, _)| k.ends_with(".context_length"))
@@ -774,6 +911,20 @@ impl OllamaClient {
     /// Return the previously fetched native context length (None if fetch_native_ctx not yet called).
     pub fn get_native_ctx(&self) -> Option<u32> {
         *self.native_ctx.lock().unwrap()
+    }
+
+    /// Whether the model supports native thinking (detected via /api/show capabilities).
+    pub fn supports_thinking(&self) -> bool {
+        self.supports_thinking.lock().unwrap().unwrap_or(false)
+    }
+
+    /// Resolve the `think` parameter: if user explicitly set it, use that;
+    /// otherwise auto-enable for models that advertise thinking capability.
+    pub fn resolve_think(&self, params_think: Option<bool>) -> Option<bool> {
+        match params_think {
+            Some(v) => Some(v),
+            None => if self.supports_thinking() { Some(true) } else { None },
+        }
     }
 
     pub async fn get_last_loaded_model(&self) -> Result<String> {
@@ -1027,7 +1178,7 @@ impl OllamaClient {
                     messages: ollama_messages,
                     stream: true,
                     options,
-                    think: params.think,
+                    think: self.resolve_think(params.think),
                 };
                 let url = format!("{}/api/chat", endpoint);
                 let client = self.http_client.clone();
@@ -1056,39 +1207,21 @@ impl OllamaClient {
                         match chunk_result {
                             Ok(bytes) => {
                                 buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
-                                    if line.is_empty() { continue; }
-                                    match serde_json::from_str::<StreamChunk>(&line) {
-                                        Ok(chunk) => {
-                                            if let Some(msg) = &chunk.message {
-                                                if !msg.thinking.is_empty() {
-                                                    had_thinking = true;
-                                                    let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
-                                                }
-                                                if !msg.content.is_empty() {
-                                                    if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            if chunk.done {
-                                                let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
-                                                let gen_tokens = chunk.eval_count.unwrap_or(0);
+                                let (lines, remainder) = split_newline_buffer(&buffer);
+                                buffer = remainder;
+                                for line in lines {
+                                    let events = parse_ollama_chunk(&line, &mut had_thinking, context_trimmed, msgs_dropped);
+                                    for event in events {
+                                        let is_done = matches!(event, StreamEvent::Done { .. });
+                                        if is_done {
+                                            if let StreamEvent::Done { prompt_tokens, gen_tokens, .. } = &event {
                                                 dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
-                                                let _ = tx.send(StreamEvent::Done {
-                                                    prompt_tokens,
-                                                    gen_tokens,
-                                                    had_thinking,
-                                                    eval_duration_ns: chunk.eval_duration,
-                                                    context_trimmed,
-                                                    msgs_dropped,
-                                                });
-                                                return;
                                             }
+                                            let _ = tx.send(event);
+                                            return;
+                                        } else if tx.send(event).is_err() {
+                                            return;
                                         }
-                                        Err(_) => {}
                                     }
                                 }
                             }
@@ -1110,11 +1243,10 @@ impl OllamaClient {
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let request = build_openai_request(&model, ollama_messages, &params);
-                let url = openai_chat_url(endpoint);
-                let client = self.http_client.clone();
+                let endpoint = endpoint.clone();
                 let api_key = api_key.clone();
                 tokio::spawn(async move {
-                    stream_openai(client, url, api_key, request, tx, context_trimmed, msgs_dropped).await;
+                    stream_openai(endpoint, api_key, request, tx, context_trimmed, msgs_dropped).await;
                 });
             }
             Backend::LlamaCpp { endpoint } => {
@@ -1123,72 +1255,17 @@ impl OllamaClient {
                     .map(|m| format!("{}: {}", m.role, m.content))
                     .collect::<Vec<_>>()
                     .join("\n");
+                let request = LlamaCppRequest {
+                    prompt,
+                    n_predict: params.num_predict,
+                    stream: true,
+                    temperature: params.temperature,
+                    top_p: params.top_p,
+                };
                 let url = format!("{}/completion", endpoint.trim_end_matches('/'));
                 let client = self.http_client.clone();
                 tokio::spawn(async move {
-                    let request = serde_json::json!({
-                        "prompt": prompt,
-                        "stream": true,
-                        "n_predict": params.num_predict.unwrap_or(1024),
-                    });
-                    let response = match client.post(&url).json(&request).send().await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let _ = tx.send(StreamEvent::Error(format!("llama.cpp request failed: {}", e)));
-                            return;
-                        }
-                    };
-                    if !response.status().is_success() {
-                        let _ = tx.send(StreamEvent::Error(format!("llama.cpp returned {}", response.status())));
-                        return;
-                    }
-                    use futures_util::StreamExt;
-                    let mut stream = response.bytes_stream();
-                    let mut buffer = String::new();
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
-                                    if line.is_empty() { continue; }
-                                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
-                                        if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
-                                            if !content.is_empty() {
-                                                if tx.send(StreamEvent::Token(content.to_string())).is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        if obj.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            let _ = tx.send(StreamEvent::Done {
-                                                prompt_tokens: 0,
-                                                gen_tokens: 0,
-                                                had_thinking: false,
-                                                eval_duration_ns: None,
-                                                context_trimmed,
-                                                msgs_dropped,
-                                            });
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(StreamEvent::Error(format!("llama.cpp stream error: {}", e)));
-                                return;
-                            }
-                        }
-                    }
-                    let _ = tx.send(StreamEvent::Done {
-                        prompt_tokens: 0,
-                        gen_tokens: 0,
-                        had_thinking: false,
-                        eval_duration_ns: None,
-                        context_trimmed,
-                        msgs_dropped,
-                    });
+                    stream_llamacpp(client, url, request, tx, context_trimmed, msgs_dropped).await;
                 });
             }
         }
@@ -1212,7 +1289,7 @@ impl OllamaClient {
                     messages,
                     stream: true,
                     options: OllamaOptions::from_params(params, self.get_native_ctx()),
-                    think: params.think,
+                    think: self.resolve_think(params.think),
                 };
                 let url = format!("{}/api/chat", endpoint);
                 let client = self.http_client.clone();
@@ -1238,38 +1315,18 @@ impl OllamaClient {
                         match chunk_result {
                             Ok(bytes) => {
                                 buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
-                                    if line.is_empty() { continue; }
-                                    match serde_json::from_str::<StreamChunk>(&line) {
-                                        Ok(chunk) => {
-                                            if let Some(msg) = &chunk.message {
-                                                if !msg.thinking.is_empty() {
-                                                    had_thinking = true;
-                                                    let _ = tx.send(StreamEvent::ThinkToken(msg.thinking.clone()));
-                                                }
-                                                if !msg.content.is_empty() {
-                                                    if tx.send(StreamEvent::Token(msg.content.clone())).is_err() {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            if chunk.done {
-                                                let p = chunk.prompt_eval_count.unwrap_or(0);
-                                                let g = chunk.eval_count.unwrap_or(0);
-                                                let _ = tx.send(StreamEvent::Done {
-                                                    prompt_tokens: p,
-                                                    gen_tokens: g,
-                                                    had_thinking,
-                                                    eval_duration_ns: chunk.eval_duration,
-                                                    context_trimmed: false,
-                                                    msgs_dropped: 0,
-                                                });
-                                                return;
-                                            }
+                                let (lines, remainder) = split_newline_buffer(&buffer);
+                                buffer = remainder;
+                                for line in lines {
+                                    let events = parse_ollama_chunk(&line, &mut had_thinking, false, 0);
+                                    for event in events {
+                                        let is_done = matches!(event, StreamEvent::Done { .. });
+                                        if is_done {
+                                            let _ = tx.send(event);
+                                            return;
+                                        } else if tx.send(event).is_err() {
+                                            return;
                                         }
-                                        Err(_) => {}
                                     }
                                 }
                             }
@@ -1291,11 +1348,10 @@ impl OllamaClient {
             }
             Backend::OpenAI { endpoint, api_key } => {
                 let request = build_openai_request(model, messages, params);
-                let url = openai_chat_url(endpoint);
-                let client = self.http_client.clone();
+                let endpoint = endpoint.clone();
                 let api_key = api_key.clone();
                 tokio::spawn(async move {
-                    stream_openai(client, url, api_key, request, tx, false, 0).await;
+                    stream_openai(endpoint, api_key, request, tx, false, 0).await;
                 });
             }
             Backend::LlamaCpp { endpoint } => {
@@ -1347,7 +1403,7 @@ impl OllamaClient {
                     messages: ollama_messages,
                     stream: false,
                     options,
-                    think: params.think,
+                    think: self.resolve_think(params.think),
                 };
                 let url = format!("{}/api/chat", endpoint);
                 let response = self.http_client.post(&url).json(&request).send().await
@@ -1364,28 +1420,23 @@ impl OllamaClient {
                 Ok(merge_thinking(data.message.content, data.message.thinking))
             }
             Backend::OpenAI { endpoint, api_key } => {
+                use async_openai::{Client as OAIClient, config::OpenAIConfig};
+                let api_base = openai_api_base(endpoint);
+                let config = OpenAIConfig::new()
+                    .with_api_base(&api_base)
+                    .with_api_key(api_key.as_str());
+                let oai_client = OAIClient::with_config(config);
                 let mut request = build_openai_request(&self.model, ollama_messages, params);
                 request.stream = false;
                 request.stream_options = None;
-                let url = openai_chat_url(endpoint);
-                let response = self.http_client.post(&url)
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .header("Content-Type", "application/json")
-                    .json(&request)
-                    .send().await
-                    .map_err(|e| anyhow!("Failed to send request to OpenAI at {}: {}", endpoint, e))?;
-                if !response.status().is_success() {
-                    return Err(anyhow!(
-                        "OpenAI returned error: {} - {}",
-                        response.status(),
-                        response.text().await.unwrap_or_default()
-                    ));
-                }
-                let data: OAINonStreamResponse = response.json().await
-                    .map_err(|e| anyhow!("Failed to parse OpenAI response: {}", e))?;
+                let data: OAINonStreamResponse = oai_client.chat()
+                    .create_byot::<OAIRequest, OAINonStreamResponse>(request)
+                    .await
+                    .map_err(|e| anyhow!("OpenAI request failed: {}", e))?;
                 let choice = data.choices.into_iter().next()
                     .ok_or_else(|| anyhow!("OpenAI returned no choices"))?;
-                Ok(choice.message.content)
+                let thinking = choice.message.reasoning_content.unwrap_or_default();
+                Ok(merge_thinking(choice.message.content, thinking))
             }
             Backend::LlamaCpp { endpoint } => {
                 let prompt = ollama_messages
@@ -1435,7 +1486,7 @@ impl OllamaClient {
                     messages,
                     stream: false,
                     options: OllamaOptions::from_params(params, self.get_native_ctx()),
-                    think: params.think,
+                    think: self.resolve_think(params.think),
                 };
                 let url = format!("{}/api/chat", endpoint);
                 let response = self.http_client.post(&url).json(&request).send().await
@@ -1938,5 +1989,267 @@ mod tests {
         let usage = chunk.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 14);
         assert_eq!(usage.completion_tokens, 10);
+    }
+
+    // ---- split_newline_buffer ----
+
+    #[test]
+    fn test_split_newline_single_complete() {
+        let (lines, remainder) = split_newline_buffer("hello\n");
+        assert_eq!(lines, vec!["hello"]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn test_split_newline_line_and_partial() {
+        let (lines, remainder) = split_newline_buffer("hello\nwor");
+        assert_eq!(lines, vec!["hello"]);
+        assert_eq!(remainder, "wor");
+    }
+
+    #[test]
+    fn test_split_newline_multi_with_partial() {
+        let (lines, remainder) = split_newline_buffer("a\nb\nc\npar");
+        assert_eq!(lines, vec!["a", "b", "c"]);
+        assert_eq!(remainder, "par");
+    }
+
+    // ---- merge_thinking ----
+
+    #[test]
+    fn test_merge_thinking_content_wins() {
+        assert_eq!(merge_thinking("hi".into(), "thought".into()), "hi");
+    }
+
+    #[test]
+    fn test_merge_thinking_fallback_to_think_tag() {
+        assert_eq!(merge_thinking("".into(), "thought".into()), "<think>thought</think>");
+    }
+
+    #[test]
+    fn test_merge_thinking_both_empty() {
+        assert_eq!(merge_thinking("".into(), "".into()), "");
+    }
+
+    // ---- parse_ollama_chunk ----
+
+    #[test]
+    fn test_parse_ollama_chunk_token() {
+        let line = r#"{"model":"q","created_at":"","message":{"role":"assistant","content":"Hello"},"done":false}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::Token(ref s) if s == "Hello"));
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_think_token() {
+        let line = r#"{"model":"q","created_at":"","message":{"role":"assistant","content":"","thinking":"step1"},"done":false}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::ThinkToken(ref s) if s == "step1"));
+        assert!(ht);
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_dual_think_and_content() {
+        let line = r#"{"model":"q","created_at":"","message":{"role":"assistant","content":"ans","thinking":"t1"},"done":false}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::ThinkToken(_)));
+        assert!(matches!(events[1], StreamEvent::Token(_)));
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_done_with_stats() {
+        let line = r#"{"model":"q","created_at":"","message":null,"done":true,"prompt_eval_count":10,"eval_count":20,"eval_duration":1000}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Done { prompt_tokens, gen_tokens, eval_duration_ns, .. } => {
+                assert_eq!(*prompt_tokens, 10);
+                assert_eq!(*gen_tokens, 20);
+                assert_eq!(*eval_duration_ns, Some(1000));
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_done_no_stats() {
+        let line = r#"{"model":"q","created_at":"","done":true}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Done { prompt_tokens, gen_tokens, .. } => {
+                assert_eq!(*prompt_tokens, 0);
+                assert_eq!(*gen_tokens, 0);
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_empty_content_no_event() {
+        let line = r#"{"model":"q","created_at":"","message":{"role":"assistant","content":""},"done":false}"#;
+        let mut ht = false;
+        let events = parse_ollama_chunk(line, &mut ht, false, 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_malformed_no_panic() {
+        let mut ht = false;
+        let events = parse_ollama_chunk("not json {{{{", &mut ht, false, 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ollama_chunk_empty_line() {
+        let mut ht = false;
+        let events = parse_ollama_chunk("", &mut ht, false, 0);
+        assert!(events.is_empty());
+    }
+
+    // ---- parse_openai_sse_data ----
+
+    #[test]
+    fn test_sse_data_content_token() {
+        let data = r#"{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data(data, &mut state, false, 0);
+        match result {
+            SseDataResult::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0], StreamEvent::Token(ref s) if s == "hi"));
+            }
+            _ => panic!("expected Events"),
+        }
+    }
+
+    #[test]
+    fn test_sse_data_reasoning_content() {
+        let data = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"think","content":""},"finish_reason":null}]}"#;
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data(data, &mut state, false, 0);
+        match result {
+            SseDataResult::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0], StreamEvent::ThinkToken(ref s) if s == "think"));
+                assert!(state.had_thinking);
+            }
+            _ => panic!("expected Events"),
+        }
+    }
+
+    #[test]
+    fn test_sse_data_usage_chunk() {
+        let data = r#"{"id":"x","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":8}}"#;
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data(data, &mut state, false, 0);
+        match result {
+            SseDataResult::Events(events) => {
+                assert!(events.is_empty());
+                assert_eq!(state.prompt_tokens, 5);
+                assert_eq!(state.gen_tokens, 8);
+            }
+            _ => panic!("expected Events"),
+        }
+    }
+
+    #[test]
+    fn test_sse_data_done_with_prior_usage() {
+        let mut state = OaiStreamState { prompt_tokens: 3, gen_tokens: 7, had_thinking: false };
+        let result = parse_openai_sse_data("[DONE]", &mut state, false, 0);
+        match result {
+            SseDataResult::Done(StreamEvent::Done { prompt_tokens, gen_tokens, .. }) => {
+                assert_eq!(prompt_tokens, 3);
+                assert_eq!(gen_tokens, 7);
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn test_sse_data_done_no_prior_usage() {
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data("[DONE]", &mut state, false, 0);
+        match result {
+            SseDataResult::Done(StreamEvent::Done { prompt_tokens, gen_tokens, .. }) => {
+                assert_eq!(prompt_tokens, 0);
+                assert_eq!(gen_tokens, 0);
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn test_sse_data_malformed_skip() {
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data("not json", &mut state, false, 0);
+        assert!(matches!(result, SseDataResult::Skip));
+    }
+
+    #[test]
+    fn test_sse_data_empty_skip() {
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data("", &mut state, false, 0);
+        assert!(matches!(result, SseDataResult::Skip));
+    }
+
+    #[test]
+    fn test_sse_data_multi_choice() {
+        let data = r#"{"id":"x","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null},{"index":1,"delta":{"content":"b"},"finish_reason":null}]}"#;
+        let mut state = OaiStreamState::default();
+        let result = parse_openai_sse_data(data, &mut state, false, 0);
+        match result {
+            SseDataResult::Events(events) => {
+                assert_eq!(events.len(), 2);
+            }
+            _ => panic!("expected Events"),
+        }
+    }
+
+    // ---- parse_llamacpp_chunk ----
+
+    #[test]
+    fn test_llamacpp_content_token() {
+        let line = r#"{"content":"hello","stop":false}"#;
+        let events = parse_llamacpp_chunk(line, false, 0);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::Token(ref s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_llamacpp_stop_with_content() {
+        let line = r#"{"content":"last","stop":true}"#;
+        let events = parse_llamacpp_chunk(line, false, 0);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::Token(ref s) if s == "last"));
+        assert!(matches!(events[1], StreamEvent::Done { .. }));
+    }
+
+    #[test]
+    fn test_llamacpp_stop_empty_content() {
+        let line = r#"{"content":"","stop":true}"#;
+        let events = parse_llamacpp_chunk(line, false, 0);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::Done { .. }));
+    }
+
+    #[test]
+    fn test_llamacpp_malformed_no_panic() {
+        let events = parse_llamacpp_chunk("{bad json", false, 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_llamacpp_empty_line() {
+        let events = parse_llamacpp_chunk("", false, 0);
+        assert!(events.is_empty());
     }
 }

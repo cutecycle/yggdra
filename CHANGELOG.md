@@ -5,6 +5,56 @@ All notable changes to Yggdra will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-04-25
+
+### Added
+
+- **async-openai integration**: OpenAI/OpenRouter backend now uses the
+  `async-openai` library with the `byot` feature for proper SSE streaming.
+  Replaces the hand-rolled reqwest streaming path.
+- **Terminal integrity tests**: 35 tests using ratatui `TestBackend` for
+  cell-level garbage detection — catches rendering corruption that unit tests
+  miss.
+- **Rendering pipeline tests**: 27 tests covering `format_message_styled`,
+  `format_tool_content_expanded`, `render_markdown_line`,
+  `detect_and_render_table`, `prettify_tool_calls`, and `looks_like_diff`.
+- **Interaction latency tests**: 18 tests asserting per-call budgets for fuzzy
+  score, palette filter, input buffer, markdown/diff rendering, and message
+  formatting. Total test count: **472**.
+- **Think auto-detection**: `OllamaClient` queries `/api/show` capabilities on
+  connect and auto-enables `think: true` only for models that support it (e.g.
+  qwen3.5-thinking). Non-thinking models are never sent `think: true`, avoiding
+  the `"model does not support thinking"` error.
+- **ESC partial save**: Pressing ESC mid-inference now saves the partial
+  response as an assistant message with an `<esc/>` marker so the model retains
+  context of the interrupted turn.
+
+### Changed
+
+- `/color` command is now async/non-blocking — no longer freezes the TUI
+  event loop while cycling themes.
+- Rendering pipeline: 7 rendering functions extracted from `impl App` to
+  `pub(crate)` free functions for testability and reduced coupling.
+- **Header removed, status bar consolidated**: The top "Status" header is gone.
+  Mode, connection icon, model name, context usage, inference rate, message
+  count, and endpoint are all shown in the bottom status bar with responsive
+  width tiers (≥80 / ≥50 / ≥30 / minimal).
+- `/endpoint` with no argument now resets the endpoint to
+  `http://localhost:11434`.
+- All Ollama/OpenAI timeouts set to infinite — no more mid-inference timeouts
+  on slow or large models.
+- Outside-inference warning banner is now lowercase.
+
+### Removed
+
+- JSON tests removed from the model gauntlet (`test_models`); only XML,
+  discipline, and humor benchmarks remain.
+- Redundant documentation: `MARKDOWN_IMPLEMENTATION_SUMMARY.md`,
+  `MARKDOWN_RENDERING.md`, `IMPLEMENTATION_NOTES.md` consolidated and
+  removed (session artifacts with overlapping content).
+
+---
+
 ## [0.2.1] - 2026-04-21
 
 ### Added

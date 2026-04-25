@@ -152,7 +152,7 @@ impl Default for ModelParams {
             tool_output_cap: None,
             think: None,
             reasoning_effort: Some("xhigh".to_string()),
-            ambiguity_threshold: None,
+            ambiguity_threshold: Some(10),
         }
     }
 }

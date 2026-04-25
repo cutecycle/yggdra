@@ -93,16 +93,16 @@ Located at `~/.yggdra/config.json`:
 
 ### OpenRouter API Key
 Embedded in the wrapper script:
-`/Users/cutecycle/Library/LaunchAgents/start-openrouter-proxy.sh`
+`~/Library/LaunchAgents/start-openrouter-proxy.sh`
 
 The key is set as `OPENROUTER_API_KEY` environment variable.
 
 ### Service Configuration
-Location: `/Users/cutecycle/Library/LaunchAgents/com.yggdra.openrouter-proxy.plist`
+Location: `~/Library/LaunchAgents/com.yggdra.openrouter-proxy.plist`
 
 - Port: 11435
 - Auto-restart: Yes (KeepAlive + RunAtLoad)
-- Working directory: `/Users/cutecycle/source/repos/yggdra`
+- Working directory: `~/source/repos/yggdra`
 
 ## Troubleshooting
 

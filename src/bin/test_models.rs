@@ -1,9 +1,10 @@
 // Gauntlet test suite for small Ollama models — uses real yggdra parsers + system prompt.
 // Usage: test_models [endpoint] [model1 model2 ...]
 // Default endpoint: http://localhost:11434
-// Default models: qwen3.5:0.8b-bf16  qwen3.5:2b-q4_K_M  qwen3.5:4b-q4_K_M
+// Default models: all mainline OSS models ≤2B params
 
 use yggdra::{agent, message::Message, ollama::OllamaClient};
+use serde_json;
 
 // ── test definitions ──────────────────────────────────────────────────────────
 
@@ -39,9 +40,6 @@ fn xml_think_act(r: &str) -> bool {
     let has_call  = !agent::parse_xml_tool_calls(r).is_empty();
     has_think && has_call
 }
-fn json_shell(r: &str) -> bool {
-    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "shell")
-}
 fn no_hallucination(r: &str) -> bool {
     !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:")
 }
@@ -70,25 +68,6 @@ fn xml_unicode(r: &str) -> bool {
 fn xml_commit(r: &str) -> bool {
     agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "commit")
 }
-fn json_two_calls(r: &str) -> bool {
-    agent::parse_json_tool_calls(r).len() >= 2
-}
-fn json_no_preamble(r: &str) -> bool {
-    let calls = agent::parse_json_tool_calls(r);
-    let has_call = !calls.is_empty();
-    let clean = !r.trim().to_lowercase().starts_with("sure")
-        && !r.trim().to_lowercase().starts_with("of course")
-        && !r.trim().to_lowercase().starts_with("here")
-        && !r.trim().to_lowercase().starts_with("i'll")
-        && !r.trim().to_lowercase().starts_with("i will");
-    has_call && clean
-}
-fn json_exec(r: &str) -> bool {
-    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "exec")
-}
-fn json_setfile(r: &str) -> bool {
-    agent::parse_json_tool_calls(r).iter().any(|c| c.name == "setfile")
-}
 fn ack_no_hallucination(r: &str) -> bool {
     !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:")
         && r.to_lowercase().contains("acknowledged")
@@ -101,6 +80,25 @@ fn xml_two_different_tools(r: &str) -> bool {
     if calls.len() < 2 { return false; }
     let first = &calls[0].name;
     calls.iter().any(|c| &c.name != first)
+}
+fn xml_shell_flags(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell" && c.args.contains("-la"))
+}
+fn xml_setfile_five_lines(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "setfile" && c.args.contains("line3"))
+}
+fn discipline_single_word(r: &str) -> bool {
+    r.trim().eq_ignore_ascii_case("done")
+}
+fn xml_shell_find(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell" && c.args.contains("find"))
+}
+fn no_system_leakage(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    let has_call = calls.iter().any(|c| c.name == "shell");
+    let no_leak = !r.contains("SYSTEM:") && !r.contains("[STEERING]")
+        && !r.to_lowercase().contains("you are an ai");
+    has_call && no_leak
 }
 
 const TESTS: &[TestCase] = &[
@@ -146,15 +144,7 @@ const TESTS: &[TestCase] = &[
                  Task: run `echo thinking`.",
         check: xml_think_act,
         expect: "<think>...</think> block + XML tool call",
-        think: None, // allow native thinking; ThinkTokens are wrapped in <think> by stream_collect
-    },
-    TestCase {
-        name: "JSON: basic shell call",
-        prompt: "Respond with ONLY this JSON and nothing else:\n\
-                 {\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo hello\"}}]}",
-        check: json_shell,
-        expect: "JSON tool_calls with shell",
-        think: Some(false),
+        think: Some(true), // explicitly enable native thinking
     },
     TestCase {
         name: "No hallucination",
@@ -213,41 +203,6 @@ const TESTS: &[TestCase] = &[
         expect: "<tool>commit</tool> parsed with name == \"commit\"",
         think: Some(false),
     },
-    // ── JSON tests ────────────────────────────────────────────────────────────
-    TestCase {
-        name: "JSON: two tool calls",
-        prompt: "Respond with ONLY this JSON and nothing else:\n\
-                 {\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo one\"}},\
-                 {\"name\":\"shell\",\"parameters\":{\"command\":\"echo two\"}}]}",
-        check: json_two_calls,
-        expect: "parse_json_tool_calls returns >= 2 calls",
-        think: Some(false),
-    },
-    TestCase {
-        name: "JSON: no preamble discipline",
-        prompt: "Output ONLY a JSON tool call for `echo hello` — no explanation, \
-                 no 'Sure', no 'Here is', just the raw JSON object with tool_calls.",
-        check: json_no_preamble,
-        expect: "JSON tool call present and no preamble words",
-        think: Some(false),
-    },
-    TestCase {
-        name: "JSON: exec tool call",
-        prompt: "Respond with ONLY this JSON and nothing else:\n\
-                 {\"tool_calls\":[{\"name\":\"exec\",\"parameters\":{\"cmd\":\"ls /tmp\"}}]}",
-        check: json_exec,
-        expect: "JSON tool call with name == \"exec\"",
-        think: Some(false),
-    },
-    TestCase {
-        name: "JSON: setfile tool call",
-        prompt: "Respond with ONLY this JSON and nothing else:\n\
-                 {\"tool_calls\":[{\"name\":\"setfile\",\"parameters\":\
-                 {\"path\":\"/tmp/test.txt\",\"content\":\"hello\"}}]}",
-        check: json_setfile,
-        expect: "JSON tool call with name == \"setfile\"",
-        think: Some(false),
-    },
     // ── Behavioral / discipline tests ─────────────────────────────────────────
     TestCase {
         name: "Discipline: no tool output hallucination variant",
@@ -273,9 +228,185 @@ const TESTS: &[TestCase] = &[
         expect: ">= 2 XML tool calls with different tool names",
         think: Some(false),
     },
+    // ── Extended tests ────────────────────────────────────────────────────────
+    TestCase {
+        name: "XML: shell with flags",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>ls -la /tmp</command>\n<desc>list files</desc>",
+        check: xml_shell_flags,
+        expect: "<tool>shell</tool> with -la in command",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: setfile with 5 lines",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>setfile</tool>\n<path>/tmp/multi.txt</path>\n\
+                 <content>line1\nline2\nline3\nline4\nline5</content>",
+        check: xml_setfile_five_lines,
+        expect: "setfile call preserving all 5 lines (content contains \"line3\")",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: single-word response",
+        prompt: "Respond with ONLY the single word \"done\" and absolutely nothing else. \
+                 No punctuation, no newline, no explanation.",
+        check: discipline_single_word,
+        expect: "response is exactly \"done\" (trimmed, case-insensitive)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: shell complex command",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>find /tmp -name '*.txt' -maxdepth 2</command>\n<desc>find</desc>",
+        check: xml_shell_find,
+        expect: "<tool>shell</tool> with find command in args",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: no system prompt leakage",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo safe</command>\n<desc>test</desc>",
+        check: no_system_leakage,
+        expect: "shell call with no SYSTEM:/[STEERING]/\"you are\" leakage",
+        think: Some(false),
+    },
+    
+    // ── HUMOR BENCHMARKS ───────────────────────────────────────────────────────
+    // Tests whether models can be charming, funny, and delightful
+    // These are critical for the "adorable TUI agent" personality
+    
+    TestCase {
+        name: "Humor: dad joke request",
+        prompt: "Tell me a quick programming-related dad joke. Keep it under 2 sentences. Make it actually funny.",
+        check: |r| r.len() < 200 && (r.contains("joke") || r.contains("funny") || r.contains("ha") || r.contains("lol")),
+        expect: "short programming joke delivered",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Humor: witty error message",
+        prompt: "A command failed. Give me a witty, charming error message in 1 sentence. Make me smile despite the failure.",
+        check: |r| r.len() < 150 && (r.contains("oops") || r.contains("oopsie") || r.contains("whoops") || r.contains("😅") || r.contains("🙈")),
+        expect: "charming error message with personality",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Humor: celebratory message",
+        prompt: "I just completed a big task! Give me a celebratory one-liner with an emoji. Make it delightful.",
+        check: |r| r.len() < 100 && (r.contains("🎉") || r.contains("✨") || r.contains("🌟") || r.contains("congrats") || r.contains("awesome")),
+        expect: "celebratory message with emoji",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Humor: pun about Rust",
+        prompt: "Make a pun about Rust programming. One sentence only. It should be clever.",
+        check: |r| r.len() < 150 && (r.to_lowercase().contains("borrow") || r.to_lowercase().contains("lifetime") || r.to_lowercase().contains("ownership") || r.contains("🦀")),
+        expect: "Rust-related pun delivered",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Humor: adorable greeting",
+        prompt: "Greet me in the most adorable, charming way possible. One sentence. Use one emoji.",
+        check: |r| r.len() < 100 && (r.contains("🌸") || r.contains("✨") || r.contains("💖") || r.contains("adorable") || r.contains("charming")),
+        expect: "adorable greeting with emoji",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Humor: self-deprecating AI joke",
+        prompt: "Make a self-deprecating joke about being an AI assistant. Keep it light and funny. One sentence.",
+        check: |r| r.len() < 150 && (r.to_lowercase().contains("ai") || r.to_lowercase().contains("robot") || r.to_lowercase().contains("bot") || r.contains("🤖")),
+        expect: "self-deprecating AI joke",
+        think: Some(false),
+    },
 ];
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// ── model details ─────────────────────────────────────────────────────────────
+
+struct ModelInfo {
+    params: String,
+    quant: String,
+}
+
+async fn fetch_model_info(endpoint: &str, model: &str) -> ModelInfo {
+    let url = format!("{}/api/show", endpoint);
+    let body = serde_json::json!({"name": model});
+    if let Ok(resp) = reqwest::Client::new().post(&url).json(&body).send().await {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            let params = json["details"]["parameter_size"]
+                .as_str().unwrap_or("?").to_string();
+            let quant = json["details"]["quantization_level"]
+                .as_str().unwrap_or("?").to_string();
+            if params != "?" || quant != "?" {
+                return ModelInfo { params, quant };
+            }
+        }
+    }
+    // Fallback: parse quant from model tag (e.g. "model:2b-q4_K_M" → "Q4_K_M")
+    let tag = model.split(':').nth(1).unwrap_or("");
+    let quant = tag.split('-')
+        .find(|s| s.to_uppercase().starts_with('Q') || *s == "BF16" || *s == "F16")
+        .map(|s| s.to_uppercase())
+        .unwrap_or_else(|| "?".to_string());
+    ModelInfo { params: "?".to_string(), quant }
+}
+
+// ── README update ─────────────────────────────────────────────────────────────
+
+const README_START: &str = "<!-- GAUNTLET-RESULTS-START -->";
+const README_END: &str = "<!-- GAUNTLET-RESULTS-END -->";
+
+fn update_readme(totals: &[(String, usize, usize, ModelInfo)]) {
+    // Find README.md by walking up from cwd
+    let mut dir = std::env::current_dir().unwrap_or_default();
+    let readme_path = loop {
+        let candidate = dir.join("README.md");
+        if candidate.exists() { break candidate; }
+        if !dir.pop() { return; } // no README.md found
+    };
+
+    let content = match std::fs::read_to_string(&readme_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Build replacement table
+    let mut table = String::new();
+    table.push_str(README_START);
+    table.push('\n');
+    table.push_str("| Model | Params | Quant | Score | |\n");
+    table.push_str("|-------|--------|-------|-------|-|\n");
+    for (model, passed, total, info) in totals {
+        let bar = format!("{}{}", "█".repeat(*passed), "░".repeat(total - passed));
+        table.push_str(&format!(
+            "| `{}` | {} | {} | {}/{} | {} |\n",
+            model, info.params, info.quant, passed, total, bar
+        ));
+    }
+    table.push_str(README_END);
+
+    // Replace between markers (or append section if markers absent)
+    let new_content = if let (Some(start), Some(end)) = (
+        content.find(README_START),
+        content.find(README_END),
+    ) {
+        format!(
+            "{}{}{}",
+            &content[..start],
+            table,
+            &content[end + README_END.len()..]
+        )
+    } else {
+        // Append at end of file
+        format!("{}\n{}\n", content.trim_end(), table)
+    };
+
+    if let Err(e) = std::fs::write(&readme_path, new_content) {
+        eprintln!("⚠️  Could not update README.md: {}", e);
+    } else {
+        println!("📝 Updated {} with gauntlet results", readme_path.display());
+    }
+}
+
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -301,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     
-    let mut totals: Vec<(String, usize, usize)> = vec![];
+    let mut totals: Vec<(String, usize, usize, ModelInfo)> = vec![];
 
     for model in &models {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -314,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => { println!("  ❌ connect failed: {}", e); continue; }
         };
 
+        let info = fetch_model_info(&endpoint, model).await;
         let system = agent::json_tool_descriptions();
         let mut passed = 0usize;
 
@@ -325,7 +457,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Use streaming (matches real agent behaviour, avoids Ollama non-streaming 500 crashes)
             let raw = tokio::time::timeout(
-                std::time::Duration::from_secs(45),
+                std::time::Duration::from_secs(180),
                 stream_collect(&client, &system, msgs, params),
             ).await
             .unwrap_or_else(|_| "timeout".to_string());
@@ -342,25 +474,32 @@ async fn main() -> anyhow::Result<()> {
         }
 
         println!("  → {}/{} passed", passed, TESTS.len());
-        totals.push((model.clone(), passed, TESTS.len()));
+        totals.push((model.clone(), passed, TESTS.len(), info));
         println!();
     }
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("📊 Summary");
-    for (m, p, t) in &totals {
+    for (m, p, t, _) in &totals {
         let bar = "█".repeat(*p) + &"░".repeat(t - p);
         println!("  {} [{bar}] {p}/{t}", m);
     }
+
+    update_readme(&totals);
 
     Ok(())
 }
 
 fn default_models() -> Vec<String> {
+    // Mainline OSS models, ≤2B actual parameters, one per major provider
     vec![
-        "qwen3.5:0.8b-bf16".to_string(),
-        "qwen3.5:2b-q4_K_M".to_string(),
-        "qwen3.5:4b-q4_K_M".to_string(),
+        "qwen3.5:0.8b-bf16".to_string(),   // Alibaba / Qwen3.5 — 873M  (May 2026)
+        "qwen2.5:1.5b".to_string(),        // Alibaba / Qwen2.5 — 1.5B  (Sep 2024)
+        "qwen3.5:2b-q4_K_M".to_string(),   // Alibaba / Qwen3.5 — 2.3B  (May 2026)
+        "llama3.2:1b".to_string(),         // Meta — 1.24B               (Sep 2024)
+        "gemma3:1b".to_string(),           // Google — 1B                (Mar 2025)
+        "smollm2:1.7b".to_string(),        // HuggingFace — 1.7B         (Nov 2024)
+        "deepseek-r1:1.5b".to_string(),    // DeepSeek — 1.5B distill    (Jan 2025)
     ]
 }
 

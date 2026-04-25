@@ -8,7 +8,7 @@ files without internet access.
 
 ```sh
 cargo build --release      # release binary → target/release/yggdra
-cargo test --lib           # 264 tests, must stay green
+cargo test --lib           # 450 tests, must stay green
 make install               # copies binary to ~/.local/bin/yggdra
 ```
 

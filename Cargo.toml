@@ -1,6 +1,6 @@
 [package]
 name = "yggdra"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Airgapped agentic TUI for local LLM inference with tool execution"
 authors = ["Nina Reynolds <nina@girlhours.info>"]
@@ -50,13 +50,14 @@ libc = "0.2.184"
 notify = "6.1.1"
 unicode-width = "0.2"
 url = "2.5"
+async-openai = { version = "0.36.0", features = ["byot", "chat-completion"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.14.0"
 
 [features]
 default = ["inference-only"]
-inference-only = ["reqwest"]
+inference-only = ["reqwest", "async-openai"]
 
 [profile.release]
 opt-level = 3

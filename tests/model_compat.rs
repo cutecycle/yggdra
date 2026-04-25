@@ -10,7 +10,6 @@
 /// Run one model: cargo test --test model_compat gemma_heretic -- --ignored
 
 use yggdra::agent::parse_tool_calls;
-use yggdra::config::CapabilityProfile;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 
@@ -169,7 +168,7 @@ fn test_gemma_heretic_bracket_format_works() {
     let (content, _thinking, done_reason) = chat(GEMMA_HERETIC, Some(bracket_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     assert!(!content.is_empty(), "bracket format should produce content");
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     assert!(!calls.is_empty(), "should parse at least one tool call, got content: {:?}", content);
     assert_eq!(calls[0].name, "readfile");
 }
@@ -188,7 +187,7 @@ fn test_gemma_heretic_writefile_multiline() {
         EXAMPLE: [TOOL: writefile src/hello.rs\nfn main() {}\n]";
     let (content, _thinking, _) = chat(GEMMA_HERETIC, Some(system),
         "Write a Rust hello world to src/hello.rs");
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     let wf = calls.iter().find(|c| c.name == "writefile");
     assert!(wf.is_some(), "should have a writefile call, content: {:?}", content);
     let args = &wf.unwrap().args;
@@ -228,7 +227,7 @@ fn test_qwen35_4b_json_format_emits_content() {
         "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     eprintln!("qwen3.5:4b json response: {:?}", &content[..content.len().min(200)]);
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     assert!(!calls.is_empty(), "should parse JSON tool calls");
 }
 
@@ -259,7 +258,7 @@ fn test_qwen3_8b_standard_format_emits_content() {
     let (content, _thinking, done_reason) = chat(QWEN3_8B, Some(std_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     assert!(!content.is_empty(), "qwen3:8b should emit content with <|tool> prompt");
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     assert!(!calls.is_empty(), "should parse tool call, content: {:?}", content);
 }
 
@@ -364,7 +363,7 @@ fn test_qwen35_9b_standard_format_tool_call() {
     assert_eq!(done_reason, "stop");
     // qwen3.5:9b may place tool calls in content or thinking depending on prompt
     let combined = format!("{}\n{}", content, thinking);
-    let calls = parse_tool_calls(&combined, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&combined);
     eprintln!("qwen3.5:9b standard format — content: {:?} thinking: {:?} calls: {}", 
         &content[..content.len().min(100)], &thinking[..thinking.len().min(100)], calls.len());
     // Informational test — not all models follow the <|tool> format reliably
@@ -380,7 +379,7 @@ fn test_qwen35_9b_bracket_format_tool_call() {
     let (content, _thinking, done_reason) = chat(QWEN35_9B, Some(bracket_tool_system()), "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     // qwen3.5:9b prefers <|tool> standard format even when told to use brackets
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     eprintln!("qwen3.5:9b bracket test — calls: {} content: {:?}", calls.len(), &content[..content.len().min(200)]);
     assert!(!calls.is_empty(), "should parse some tool call, content: {:?}", content);
 }
@@ -417,7 +416,7 @@ fn test_qwen35_2b_json_format_tool_call() {
         "Read the file src/main.rs");
     assert_eq!(done_reason, "stop");
     eprintln!("qwen3.5:2b json response: {:?}", &content[..content.len().min(200)]);
-    let calls = parse_tool_calls(&content, CapabilityProfile::Standard);
+    let calls = parse_tool_calls(&content);
     assert!(!calls.is_empty(), "should parse JSON tool calls");
 }
 

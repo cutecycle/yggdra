@@ -21,6 +21,9 @@ a local model.
 
 ~6k lines of Rust · 4.8 MB binary · <50 MB RAM · zero network dependencies
 
+**Optimized for small language models** — tested against sub-2B models from
+Qwen, Llama, Gemma, SmolLM, and DeepSeek. If it works on qwen3.5:0.8b, it works.
+
 ---
 
 ## Why?
@@ -174,11 +177,11 @@ separator. Both files are watched live — edits are picked up without restart.
 
 ### OpenAI-compatible endpoints (OpenRouter, etc.)
 
-Yggdra speaks Ollama's API by default but works with any OpenAI-compatible
-server. Point `endpoint` in `~/.yggdra/config.json` at a local proxy — for
-example, an OpenRouter proxy on `http://localhost:11435` — and yggdra will
-talk to it like it's Ollama. Useful for hosted models when you're not strictly
-airgapped.
+Yggdra speaks Ollama's API by default and also supports the OpenAI chat
+completions API via the `async-openai` library (with SSE streaming). Point
+`endpoint` in `~/.yggdra/config.json` at any OpenAI-compatible server —
+OpenRouter, a local proxy, or anything that speaks `/v1/chat/completions`.
+Useful for hosted models when you're not strictly airgapped.
 
 ---
 
@@ -220,12 +223,50 @@ Run `/test_notification` inside yggdra to confirm.
 
 ```bash
 cargo build --release            # optimized binary (LTO, stripped)
-cargo test --lib                 # run the test suite — keep it green
+cargo test --lib                 # 450 tests — keep them green
 make install                     # copy to ~/.local/bin/
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev guide and
+The test suite includes terminal integrity tests (ratatui `TestBackend` for
+cell-level garbage detection), rendering pipeline tests, and the model
+gauntlet. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev guide and
 [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
+
+---
+
+## Model gauntlet
+
+`src/bin/test_models.rs` runs 28 capability tests per model — XML tool calls,
+JSON tool calls, discipline (no preamble, no hallucination, no code fences),
+multi-call, thinking, and instruction following.
+
+The default model set covers mainline OSS models ≤2B parameters, one from each major
+provider:
+
+| Provider | Model | Params | Released |
+|----------|-------|--------|---------|
+| Alibaba / Qwen | `qwen3.5:0.8b-bf16` | 873M | May 2026 |
+| Alibaba / Qwen | `qwen2.5:1.5b` | 1.5B | Sep 2024 |
+| Alibaba / Qwen | `qwen3.5:2b-q4_K_M` | 2.3B | May 2026 |
+| Meta | `llama3.2:1b` | 1.24B | Sep 2024 |
+| Google | `gemma3:1b` | 1B | Mar 2025 |
+| HuggingFace | `smollm2:1.7b` | 1.7B | Nov 2024 |
+| DeepSeek | `deepseek-r1:1.5b` | 1.5B | Jan 2025 |
+
+Run it with:
+
+```bash
+./target/release/test_models http://localhost:11434        # all default models
+./target/release/test_models http://host:11434 model:tag  # specific model
+```
+
+Results below are updated by the gauntlet itself after each run:
+
+<!-- GAUNTLET-RESULTS-START -->
+| Model | Params | Quant | Score | |
+|-------|--------|-------|-------|-|
+| `qwen3.5:2b-q4_K_M` | 2.3B | Q4_K_M | 17/26 | █████████████████░░░░░░░░░ |
+<!-- GAUNTLET-RESULTS-END -->
 
 ---
 

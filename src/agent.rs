@@ -49,6 +49,20 @@ pub fn sanitize_model_output(text: &str) -> String {
         }
     }
 
+    // Strip UI control signals that the model sometimes echoes as literal text.
+    // These are internal protocol tags that must never appear in stored messages.
+    const SIGNAL_TAGS: &[&str] = &["</done>", "</understood>"];
+    for tag in SIGNAL_TAGS {
+        text = text.replace(tag, "");
+    }
+    // Strip <percent>N</percent> progress markers
+    while let Some(start) = text.find("<percent>") {
+        let end = text[start..].find("</percent>")
+            .map(|rel| start + rel + "</percent>".len())
+            .unwrap_or(text.len());
+        text.replace_range(start..end, "");
+    }
+
     // Truncate at generation stop tokens
     const STOP_MARKERS: &[&str] = &[
         "<|endoftext|>",
@@ -56,6 +70,9 @@ pub fn sanitize_model_output(text: &str) -> String {
         "<|im_end|>",
         "<|eot_id|>",
         "<|end_of_turn|>",
+        "<|EOT|>",
+        "<｜end▁of▁sentence｜>",
+        "<|end|>",
     ];
     let mut earliest = text.len();
     for marker in STOP_MARKERS {
@@ -775,9 +792,12 @@ impl Agent {
         self
     }
 
-    /// Parse tool calls from LLM output (delegates to module-level function)
-    fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
-        parse_tool_calls(output)
+    /// Parse tool calls from LLM output.
+    /// Note: JSON format is deprecated and being phased out.
+    pub fn parse_tool_calls(output: &str) -> Vec<ToolCall> {
+        let xml = parse_xml_tool_calls(output);
+        if !xml.is_empty() { return xml; }
+        parse_json_tool_calls(output)
     }
 
     /// Get current tool output truncation limit (unlimited — no cap applied)

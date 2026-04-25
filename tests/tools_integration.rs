@@ -3,8 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use yggdra::tools::{Tool, ToolRegistry, RipgrepTool, CommitTool, EditfileTool, PythonTool, ExecTool, RusteTool};
-    use yggdra::config::CapabilityProfile;
+    use yggdra::tools::{Tool, ToolRegistry, CommitTool, EditfileTool, PythonTool, ExecTool, RusteTool};
     use std::fs;
     use tempfile::TempDir;
     #[allow(unused_imports)]
@@ -12,18 +11,16 @@ mod tests {
 
     #[test]
     fn test_tool_registry_all_tools_present() {
-        let registry = ToolRegistry::new(CapabilityProfile::Standard);
+        let registry = ToolRegistry::new();
         let tools = registry.list_tools();
 
-        // The `spawn` tool was renamed to `exec`; `editfile` was split into
-        // `setfile`/`patchfile`. Assert the current canonical tool set.
-        assert!(tools.contains(&"rg"), "rg tool not in registry");
-        assert!(tools.contains(&"exec"), "exec tool not in registry");
+        // ShellOnly profile: shell, setfile, patchfile, commit.
+        assert!(tools.contains(&"shell"), "shell tool not in registry");
         assert!(tools.contains(&"setfile"), "setfile tool not in registry");
         assert!(tools.contains(&"patchfile"), "patchfile tool not in registry");
         assert!(tools.contains(&"commit"), "commit tool not in registry");
-        assert!(tools.contains(&"python"), "python tool not in registry");
-        assert!(tools.contains(&"ruste"), "ruste tool not in registry");
+        // exec, rg, python, ruste are NOT in the default registry
+        assert!(!tools.contains(&"exec"), "exec should not be in ShellOnly registry");
     }
 
     // Removed test_ripgrep_blocks_dangerous_patterns: rg's validate_input no longer scans
@@ -100,7 +97,7 @@ print("Hello, World!")
 
     #[test]
     fn test_tool_registry_dispatch() {
-        let registry = ToolRegistry::new(CapabilityProfile::Standard);
+        let registry = ToolRegistry::new();
         
         // Dispatch to unknown tool should fail
         let result = registry.execute("nonexistent", "args");
@@ -108,21 +105,21 @@ print("Hello, World!")
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
         
         // Dispatch with empty args to known tool should fail validation
-        let result = registry.execute("rg", "");
-        assert!(result.is_err(), "rg should reject empty args");
+        let result = registry.execute("commit", "");
+        assert!(result.is_err(), "commit should reject empty args");
     }
 
     #[test]
     fn test_tool_network_escapes_blocked() {
-        let registry = ToolRegistry::new(CapabilityProfile::Standard);
+        let registry = ToolRegistry::new();
         
-        // Try to execute curl via rg - should be blocked
-        let result = registry.execute("rg", "curl http://evil.com .");
-        assert!(result.is_err(), "Should block curl attempt");
+        // Unknown tools not in the ShellOnly registry should fail
+        let result = registry.execute("rg", "pattern .");
+        assert!(result.is_err(), "rg not in ShellOnly registry");
+        assert!(result.unwrap_err().to_string().contains("unknown tool"));
         
-        // Try to execute wget via python - should be blocked by import scan
-        let result = registry.execute("python", "/tmp/nonexistent_wget_script.py");
-        assert!(result.is_err(), "Should reject nonexistent file");
+        let result = registry.execute("python", "/tmp/script.py");
+        assert!(result.is_err(), "python not in ShellOnly registry");
     }
 
     // Removed test_tool_safety_chain: same rationale as test_ripgrep_blocks_dangerous_patterns —

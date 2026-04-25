@@ -6,10 +6,10 @@ mod spawn_shell_patterns {
     use std::fs;
     use std::path::PathBuf;
 
-    /// Helper: run spawn with a command and return output or error
+    /// Helper: run exec tool with a command and return output or error
     fn run_spawn(command: &str) -> Result<String, String> {
-        let registry = yggdra::tools::ToolRegistry::new(yggdra::config::CapabilityProfile::Standard);
-        registry.execute("exec", command)
+        use yggdra::tools::Tool;
+        yggdra::tools::ExecTool.execute(command)
             .map_err(|e| e.to_string())
     }
 

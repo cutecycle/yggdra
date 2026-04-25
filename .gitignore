@@ -24,6 +24,13 @@ Thumbs.db
 # Test artifacts
 /tests/fixtures/temp/
 *.tmp
+test_output.txt
+
+# Junk / temporary files
+index.html.*
+inject_agents*.py
+models.json
+*.bak
 
 # Per-project yggdra runtime data (logs, session state, symlinks)
 .yggdra/config.toml

@@ -481,4 +481,98 @@ mod tests {
         assert_eq!(indent, 0);
         assert_eq!(content, "First item");
     }
+
+    // -------------------------------------------------------------------------
+    // Span / Line content integrity
+    // -------------------------------------------------------------------------
+
+    fn span_has_control(s: &str) -> bool {
+        s.chars().any(|c| c == '\x1b' || (c.is_control() && c != '\n' && c != '\t'))
+    }
+
+    #[test]
+    fn format_inline_spans_no_control_chars() {
+        let spans = format_inline_to_spans("**bold** and *italic* and `code`", Color::White);
+        for s in &spans {
+            assert!(!span_has_control(s.content.as_ref()),
+                "Control char in span: {:?}", s.content);
+        }
+    }
+
+    #[test]
+    fn format_inline_spans_with_url_no_control_chars() {
+        let spans = format_inline_to_spans(
+            "Visit https://example.com for more info", Color::White);
+        for s in &spans {
+            assert!(!span_has_control(s.content.as_ref()),
+                "Control char in URL span: {:?}", s.content);
+        }
+    }
+
+    #[test]
+    fn format_header_all_levels_no_control_chars() {
+        for level in 1..=6 {
+            let line = format_header(level, "Section Content", Color::White);
+            for s in &line.spans {
+                assert!(!span_has_control(s.content.as_ref()),
+                    "Control char in h{} span: {:?}", level, s.content);
+            }
+        }
+    }
+
+    #[test]
+    fn format_list_item_various_bullets_no_control_chars() {
+        for bullet in ['-', '*', '+', '•'] {
+            let line = format_list_item(0, "List item text", Color::White, bullet);
+            for s in &line.spans {
+                assert!(!span_has_control(s.content.as_ref()),
+                    "Control char with bullet {:?}: {:?}", bullet, s.content);
+            }
+        }
+    }
+
+    #[test]
+    fn format_table_no_control_chars() {
+        let rows = vec![
+            vec!["Name".to_string(), "Value".to_string()],
+            vec!["foo".to_string(), "bar".to_string()],
+            vec!["long content here".to_string(), "123".to_string()],
+        ];
+        let lines = format_table(&rows, Color::White);
+        for line in &lines {
+            for s in &line.spans {
+                assert!(!span_has_control(s.content.as_ref()),
+                    "Control char in table span: {:?}", s.content);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_inline_does_not_panic_on_tricky_input() {
+        // These inputs have historically caused issues in markdown parsers
+        let tricky = [
+            "**unclosed bold",
+            "*unclosed italic",
+            "`unclosed code",
+            "**nested *italic* bold**",
+            "****",
+            "``",
+            "",
+            "**",
+            "* ",
+        ];
+        for input in &tricky {
+            // Must not panic
+            let _ = parse_inline(input);
+        }
+    }
+
+    #[test]
+    fn parse_inline_empty_markers_no_garbage() {
+        let spans = format_inline_to_spans("**** and `` and __", Color::White);
+        for s in &spans {
+            assert!(!span_has_control(s.content.as_ref()),
+                "Control char in empty-marker span: {:?}", s.content);
+        }
+    }
 }
