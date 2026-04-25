@@ -122,13 +122,15 @@ DB and sync via polling — you'll see messages appear in both windows.
 
 ## The knowledge base
 
-Symlink `.yggdra/knowledge` to a local docs folder and the model can search
-it. The default setup points at `~/source/repos/offlinebase` — 135,000+ files
-across 73 categories (Rust docs, Godot tutorials, spacecraft systems, whatever
-you've curated).
+Symlink `.yggdra/knowledge` to any local docs folder and the model can search
+it with `rg` — no indexing server, no vector DB.
 
-The model searches it with `rg` like any other directory. No indexing server,
-no vector DB, just rg.
+```sh
+ln -s ~/my-docs .yggdra/knowledge
+```
+
+The model treats it like any other directory. Point it at API references,
+textbooks, man pages, whatever you've got locally.
 
 ---
 
@@ -236,9 +238,9 @@ gauntlet. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev guide and
 
 ## Model gauntlet
 
-`src/bin/test_models.rs` runs 28 capability tests per model — XML tool calls,
-JSON tool calls, discipline (no preamble, no hallucination, no code fences),
-multi-call, thinking, and instruction following.
+`src/bin/test_models.rs` runs 26 capability tests per model — XML tool calls,
+discipline (no preamble, no hallucination, no code fences), multi-call,
+thinking, and humor/personality.
 
 The default model set covers mainline OSS models ≤2B parameters, one from each major
 provider:
@@ -265,7 +267,11 @@ Results below are updated by the gauntlet itself after each run:
 <!-- GAUNTLET-RESULTS-START -->
 | Model | Params | Quant | Score | |
 |-------|--------|-------|-------|-|
-| `qwen3.5:2b-q4_K_M` | 2.3B | Q4_K_M | 17/26 | █████████████████░░░░░░░░░ |
+| `qwen3.5:2b-q4_K_M` | 2.3B | Q4_K_M | 19/26 | ███████████████████░░░░░░░ |
+| `gemma:2b` | 3B | Q4_0 | 3/26 | ███░░░░░░░░░░░░░░░░░░░░░░░ |
+| `qwen3.5:4b-q4_K_M` | 4.7B | Q4_K_M | 21/26 | █████████████████████░░░░░ |
+| `gemma4:latest` | 8.0B | Q4_K_M | 20/26 | ████████████████████░░░░░░ |
+| `qwen3.5:9b-q4_K_M` | 9.7B | Q4_K_M | 21/26 | █████████████████████░░░░░ |
 <!-- GAUNTLET-RESULTS-END -->
 
 ---
