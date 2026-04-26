@@ -33,7 +33,6 @@ use tokio::sync::{mpsc, oneshot};
 type _TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 const MAX_TOOL_ITERATIONS: usize = 30;
-const DEFAULT_TOOL_OUTPUT_CAP: usize = 600;
 
 /// Parse an RGB color string in format "r,g,b" into a Color
 fn parse_rgb_string(s: &str) -> Option<Color> {
@@ -177,6 +176,7 @@ pub(crate) fn is_shell_write_pattern(cmd: &str) -> bool {
 
 /// Truncate output to at most `cap` chars, keeping the **tail** (most recent output).
 /// Compiler errors, test failures, etc. always appear at the end — the tail is what matters.
+/// Format: `…(N omitted)` for minimal display.
 fn truncate_tail(output: &str, cap: usize) -> String {
     let chars: Vec<char> = output.chars().collect();
     if chars.len() <= cap {
@@ -184,7 +184,7 @@ fn truncate_tail(output: &str, cap: usize) -> String {
     }
     let dropped = chars.len() - cap;
     let tail: String = chars[dropped..].iter().collect();
-    format!("…({} chars omitted)\n{}", dropped, tail)
+    format!("…({} omitted)\n{}", dropped, tail)
 }
 
 /// A command that can be invoked from the palette
@@ -527,6 +527,8 @@ pub struct App {
     file_viewer_active: usize,
     /// Persistent project stats — written to .yggdra/stats.json on exit.
     stats: crate::stats::Stats,
+    /// Tracks which thinking blocks are collapsed; key is message index in messages_cache
+    collapsed_thinking_blocks: std::collections::HashSet<usize>,
     /// Time this App was created — used to compute uptime on exit.
     session_start: std::time::Instant,
 
@@ -798,6 +800,7 @@ impl App {
             plan_understood: false,
             endpoint_type,
             needs_full_redraw: false,
+            collapsed_thinking_blocks: std::collections::HashSet::new(),
         }
     }
 
@@ -934,7 +937,7 @@ impl App {
                     ratatui::text::Text::from(text_str)
                 }
             } else {
-                self.format_message_styled(display_emoji, &msg.content)
+                self.format_message_styled(display_emoji, &msg.content, msg_idx)
             };
 
             let height = text_height_static(&content, area_width);
@@ -1782,7 +1785,7 @@ impl App {
                 let (tx, rx) = oneshot::channel::<ToolResult>();
                 let cap = Some(self.config.tool_output_cap
                     .or(self.config.params.tool_output_cap)
-                    .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP));
+                    .unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT));
                 tokio::spawn(async move {
                     let output = App::execute_tools_batch_async(calls, cap).await;
                     let _ = tx.send(ToolResult {
@@ -2251,8 +2254,8 @@ impl App {
             .take(3)
             .collect::<Vec<_>>()
             .join("\n");
-        let preview = if preview.chars().count() > 200 {
-            let truncated: String = preview.chars().take(200).collect();
+        let preview = if preview.chars().count() > crate::config::OUTPUT_CHARACTER_LIMIT {
+            let truncated: String = preview.chars().take(crate::config::OUTPUT_CHARACTER_LIMIT).collect();
             format!("{}…", truncated)
         } else {
             preview
@@ -2419,7 +2422,7 @@ impl App {
                             };
                             let cap = self.config.tool_output_cap
                                 .or(self.config.params.tool_output_cap)
-                                .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP);
+                                .unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT);
                             if model_output.chars().count() > cap {
                                 format!("[TOOL_OUTPUT: {} = {}]", result.tool_name, truncate_tail(model_output, cap))
                             } else {
@@ -2858,11 +2861,11 @@ impl App {
                 (inner.trim_end_matches(']'), "")
             };
             // Truncate command at 80 chars
-            let cmd_truncated: String = name_cmd.chars().take(80).collect();
+             let cmd_truncated: String = name_cmd.chars().take(80).collect();
             let cmd_ellipsis = if name_cmd.chars().count() > 80 { "…" } else { "" };
-            // Truncate result at 200 chars
-            let result_truncated: String = result.chars().take(200).collect();
-            let result_ellipsis = if result.chars().count() > 200 { "…" } else { "" };
+            // Truncate result at unified limit
+            let result_truncated: String = result.chars().take(crate::config::OUTPUT_CHARACTER_LIMIT).collect();
+            let result_ellipsis = if result.chars().count() > crate::config::OUTPUT_CHARACTER_LIMIT { "…" } else { "" };
             let marker = if is_error { "⚠ " } else { "" };
             out.push_str(&format!(
                 "{}LAST: {} → {}{}\n",
@@ -3121,7 +3124,7 @@ impl App {
     fn compression_params(&self) -> (Option<usize>, Option<u32>) {
         let cap = self.config.tool_output_cap
             .or(self.config.params.tool_output_cap)
-            .unwrap_or(DEFAULT_TOOL_OUTPUT_CAP);
+            .unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT);
         let native_ctx = self.ollama_client.as_ref().and_then(|c| c.get_native_ctx());
         (Some(cap), self.config.context_window.or(native_ctx).or(Some(32768)))
     }
@@ -3418,7 +3421,7 @@ impl App {
                         .join("\n");
                     // Prepend thinking if available
                     if !self.thinking_text.is_empty() {
-                        let think_preview: String = self.thinking_text.chars().take(200).collect();
+                        let think_preview: String = self.thinking_text.chars().take(crate::config::OUTPUT_CHARACTER_LIMIT).collect();
                         format!("🤖{} 💭 {}…\n{}▌", agent_badge, think_preview, preview)
                     } else {
                         format!("🤖{} {}▌", agent_badge, preview)
@@ -3905,8 +3908,19 @@ impl App {
             AppMode::One     => ("🎯ONE",     Color::Green),
         };
 
-        // Connection icon
-        let conn_icon = if self.ollama_client.is_some() { "🦙" } else { "❌" };
+        // Connection icon (varies by endpoint type)
+        let conn_icon = if self.ollama_client.is_some() {
+            match self.endpoint_type.as_str() {
+                "Ollama-local" | "Ollama" | "Ollama-external" => "🦙",
+                "OpenRouter" => "🌐",
+                "Groq" => "⚡",
+                "OpenAI" => "🤖",
+                "OpenAI-compat" => "🔌",
+                "llama.cpp" => "🦙",
+                "Offline" => "❌",
+                _ => "🔌",
+            }
+        } else { "❌" };
 
         // Endpoint type + color (only show if non-default)
         let (endpoint_display, endpoint_color) = match self.endpoint_type.as_str() {
@@ -4208,6 +4222,21 @@ impl App {
             KeyCode::Char(']') if self.input_buffer.is_empty() => {
                 self.move_msg_cursor(1);
             }
+            // Space — toggle expand/collapse on the cursor's tool message
+            KeyCode::Char(' ') if self.msg_cursor.is_some() && self.input_buffer.is_empty() => {
+                if let Some(idx) = self.msg_cursor {
+                    if self.expanded_msgs.contains(&idx) {
+                        self.expanded_msgs.remove(&idx);
+                    } else {
+                        self.expanded_msgs.insert(idx);
+                    }
+                    self.render_cache_dirty = true;
+                }
+            }
+            // 't' — toggle thinking block expand/collapse on cursor message
+            KeyCode::Char('t') if self.msg_cursor.is_some() && self.input_buffer.is_empty() => {
+                self.toggle_thinking_block(None);
+            }
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
                 if self.palette_open {
@@ -4296,17 +4325,6 @@ impl App {
                     self.input_buffer.clear();
                 }
             }
-            // Space — toggle expand/collapse on the cursor's tool message
-            KeyCode::Char(' ') if self.msg_cursor.is_some() && self.input_buffer.is_empty() => {
-                if let Some(idx) = self.msg_cursor {
-                    if self.expanded_msgs.contains(&idx) {
-                        self.expanded_msgs.remove(&idx);
-                    } else {
-                        self.expanded_msgs.insert(idx);
-                    }
-                    self.render_cache_dirty = true;
-                }
-            }
             KeyCode::PageUp => {
                 let half_page = crossterm::terminal::size().map(|(_, h)| h / 2).unwrap_or(10);
                 self.scroll_offset = self.scroll_offset.saturating_add(half_page);
@@ -4355,6 +4373,21 @@ impl App {
 
         self.msg_cursor = Some(new_cursor);
         self.render_cache_dirty = true;
+    }
+
+    /// Toggle the collapsed/expanded state of a thinking block in a specific message.
+    /// If msg_idx is None, toggles the cursor message's thinking block.
+    fn toggle_thinking_block(&mut self, msg_idx: Option<usize>) {
+        let target_idx = msg_idx.or(self.msg_cursor);
+        
+        if let Some(idx) = target_idx {
+            if self.collapsed_thinking_blocks.contains(&idx) {
+                self.collapsed_thinking_blocks.remove(&idx);
+            } else {
+                self.collapsed_thinking_blocks.insert(idx);
+            }
+            self.render_cache_dirty = true;
+        }
     }
 
     /// Cancel any in-progress inference, tool execution, or subagent run.
@@ -4441,7 +4474,8 @@ impl App {
     }
 
     /// Handle command submission
-    /// Cycle mode Plan→Build→One→Ask→Plan; if entering Build/One, kick the agent loop.
+    /// Cycle mode Plan→Build→One→Ask→Plan. 
+    /// Forever (Build) and One modes require explicit user input to start.
     async fn cycle_mode(&mut self) {
         self.mode = match self.mode {
             AppMode::Plan  => AppMode::Forever,
@@ -4462,11 +4496,6 @@ impl App {
         self.needs_full_redraw = true;
         if self.mode == AppMode::Ask {
             self.abort_active_turn();
-        }
-        if matches!(self.mode, AppMode::Forever | AppMode::One) {
-            if self.turn_phase == TurnPhase::Idle {
-                self.inject_continue_kick();
-            }
         }
     }
 
@@ -4666,12 +4695,12 @@ impl App {
                 let current = self.config.tool_output_cap.map(|n| n.to_string()).unwrap_or_else(|| "unlimited (default)".to_string());
                 self.notify(format!("❌ Usage: /toolcap <chars|off>  (current: {})", current));
             }
-        } else if command == "/zt" {
+         } else if command == "/zt" {
             self.zero_truncation = !self.zero_truncation;
             if self.zero_truncation {
                 self.notify("🔍 Zero-truncation ON — full raw tool output injected into context");
             } else {
-                let cap = self.config.tool_output_cap.unwrap_or(4000);
+                let cap = self.config.tool_output_cap.unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT);
                 self.notify(format!("✂️  Zero-truncation OFF — tool output capped at {} chars", cap));
             }
         } else if command == "/compress" {
@@ -4741,7 +4770,7 @@ impl App {
 
     /// Display help text with all available commands
     fn show_help(&mut self) {
-        self.status_message = 
+        self.status_message = format!(
             "📖 Commands:\n\
              /help         - Show this help\n\
              /estimate     - Show project completion estimate\n\
@@ -4749,7 +4778,7 @@ impl App {
              /model NAME   - Switch AI model\n\
              /models       - List available models\n\
              /ctx NUM      - Set context window size\n\
-             /toolcap NUM  - Cap tool outputs at N chars (or 'off'); default 3000\n\
+             /toolcap NUM  - Cap tool outputs at N chars (or 'off'); default {}\n\
              /zt           - Toggle zero-truncation: inject full raw tool output into context\n\
              /compress     - Summarize session → archive → inject summary\n\
              /set_params K=V - Set model params (temperature, top_k, etc.) — persists\n\
@@ -4783,7 +4812,9 @@ impl App {
              /copyprompt   - Copy current system prompt to clipboard\n\
              /showprompt   - Show full system prompt in chat (scrollable)\n\n\
              Modes: ⚡ Build (autonomous) | 🧠 Plan (interactive) | 🔍 Ask (read-only) | 🎯 One (one-off)\n\n\
-             Keybindings: Enter-Submit | Esc-Cancel/Clear | Ctrl+Q-Graceful exit | Ctrl+C-Force exit".to_string();
+             Keybindings: Enter-Submit | Esc-Cancel/Clear | Ctrl+Q-Graceful exit | Ctrl+C-Force exit",
+            crate::config::OUTPUT_CHARACTER_LIMIT
+        );
     }
 
     /// Render a vertical gradient background across the given area with interpolated colors
@@ -6165,7 +6196,7 @@ impl App {
     }
 
     /// Format message content as styled ratatui Text with syntax-highlighted code blocks
-    fn format_message_styled(&self, emoji: &str, content: &str) -> ratatui::text::Text<'static> {
+    fn format_message_styled(&self, emoji: &str, content: &str, msg_idx: usize) -> ratatui::text::Text<'static> {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line as RLine, Span, Text as RText};
 
@@ -6204,18 +6235,42 @@ impl App {
             };
             let dim = Style::default().fg(think_color).add_modifier(Modifier::ITALIC);
             let think_lines: Vec<&str> = think.lines().collect();
-            // Header line with emoji
+            
+            // Check if this thinking block is collapsed
+            let is_collapsed = self.collapsed_thinking_blocks.contains(&msg_idx);
+            
+            // Header line with emoji and toggle indicator
+            let toggle = if is_collapsed { "+ " } else { "- " };
             lines.push(RLine::from(vec![
                 Span::raw(format!("{} ", emoji)),
-                Span::styled("💭 thinking".to_string(), dim),
+                Span::styled(format!("{}💭 thinking", toggle), dim),
             ]));
-            for tl in &think_lines {
-                lines.push(RLine::from(vec![
-                    Span::styled(format!("  {}", tl), dim),
-                ]));
+            
+            // Show full content if expanded, or summary if collapsed
+            if !is_collapsed {
+                for tl in &think_lines {
+                    lines.push(RLine::from(vec![
+                        Span::styled(format!("  {}", tl), dim),
+                    ]));
+                }
+                // Separator after thinking block
+                lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
+            } else {
+                // Collapsed view: show first line + ellipsis
+                if !think_lines.is_empty() {
+                    let preview = think_lines[0];
+                    let truncated = if preview.len() > 50 {
+                        format!("{}…", &preview[..50])
+                    } else {
+                        preview.to_string()
+                    };
+                    lines.push(RLine::from(vec![
+                        Span::styled(format!("  {}", truncated), dim),
+                    ]));
+                }
+                // Separator for collapsed block
+                lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
             }
-            // Separator after thinking block
-            lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
         }
 
         // If content contains a tool-call block (JSON or XML), split into prose + pretty box.
@@ -6488,8 +6543,8 @@ impl App {
             let preview_lines = output_lines.iter().take(show_count).collect::<Vec<_>>();
             
             for line in preview_lines {
-                let truncated = if !self.zero_truncation && line.len() > 200 {
-                    format!("{}…", &line[..floor_char_boundary(line, 197)])
+                let truncated = if !self.zero_truncation && line.len() > crate::config::OUTPUT_CHARACTER_LIMIT {
+                    format!("{}…", &line[..floor_char_boundary(line, crate::config::OUTPUT_CHARACTER_LIMIT - 3)])
                 } else {
                     line.to_string()
                 };
@@ -7648,7 +7703,7 @@ mod rendering_tests {
     fn truncate_tail_keeps_tail_with_prefix() {
         let text = "0123456789";
         let result = truncate_tail(text, 3);
-        assert!(result.contains("…(7 chars omitted)"));
+        assert!(result.contains("…(7 omitted)"));
         assert!(result.contains("789"));
     }
 
@@ -7656,7 +7711,7 @@ mod rendering_tests {
     fn truncate_tail_shows_omitted_count() {
         let text = "abcdefghijklmnop";
         let result = truncate_tail(text, 4);
-        assert!(result.contains("12 chars omitted"));
+        assert!(result.contains("…(12 omitted)"));
         assert!(result.ends_with("mnop"));
     }
 
@@ -7672,7 +7727,7 @@ mod rendering_tests {
         let text = "🎨🎭🎪🎬🎤🎧"; // 6 emoji = 6 chars
         let result = truncate_tail(text, 3);
         // Should keep last 3 emoji: 🎬🎤🎧 (drop first 3)
-        assert!(result.contains("…(3 chars omitted)"));
+        assert!(result.contains("…(3 omitted)"));
         assert!(result.contains("🎬"));
         assert!(result.contains("🎤"));
         assert!(result.contains("🎧"));
@@ -7682,7 +7737,7 @@ mod rendering_tests {
     fn truncate_tail_single_char_cap() {
         let text = "hello";
         let result = truncate_tail(text, 1);
-        assert!(result.contains("…(4 chars omitted)"));
+        assert!(result.contains("…(4 omitted)"));
         assert!(result.contains("o"));
     }
 
@@ -7830,9 +7885,9 @@ mod rendering_tests {
         let output = "x".repeat(1000);
         let cap = 600;
         let truncated = truncate_tail(&output, cap);
-        assert!(truncated.contains("…(400 chars omitted)"));
-        // Prefix "…(400 chars omitted)\n" is 21 chars, plus 600 chars = 621 total
-        assert_eq!(truncated.chars().count(), 621);
+        assert!(truncated.contains("…(400 omitted)"));
+        // Prefix "…(400 omitted)\n" is 15 chars, plus 600 chars = 615 total
+        assert_eq!(truncated.chars().count(), 615);
     }
 
     #[test]
@@ -7846,8 +7901,8 @@ mod rendering_tests {
 
     #[test]
     fn tool_output_cap_respects_config() {
-        // Verify DEFAULT_TOOL_OUTPUT_CAP is 600
-        assert_eq!(DEFAULT_TOOL_OUTPUT_CAP, 600);
+        // Verify OUTPUT_CHARACTER_LIMIT is 1000 (unified across all subsystems)
+        assert_eq!(crate::config::OUTPUT_CHARACTER_LIMIT, 1000);
     }
 
     // ============================================================================

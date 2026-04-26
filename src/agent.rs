@@ -800,9 +800,9 @@ impl Agent {
         parse_json_tool_calls(output)
     }
 
-    /// Get current tool output truncation limit (unlimited — no cap applied)
+    /// Get current tool output truncation limit
     fn get_tool_output_limit(&self) -> usize {
-        self.current_params.tool_output_cap.unwrap_or(500)
+        self.current_params.tool_output_cap.unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT)
     }
 
     /// Execute a tool and return result, respecting ask-mode restrictions
@@ -825,6 +825,62 @@ impl Agent {
             Ok(msg) => format!("✅ {}", msg),
             Err(e) => format!("❌ {}", e),
         }
+    }
+
+    /// Extract recent tool results from message history to provide context.
+    /// Looks for [TOOL_OUTPUT: ...] and [TOOL_RESULT: ...] patterns in recent messages.
+    /// Returns up to last 3 results to provide context without bloating prompt.
+    fn extract_recent_context(messages: &[OllamaMessage]) -> String {
+        let mut recent_results = Vec::new();
+        
+        // Scan messages in reverse to get most recent results
+        for msg in messages.iter().rev() {
+            if msg.role == "assistant" || msg.role == "tool" {
+                // Look for tool output patterns
+                for line in msg.content.lines() {
+                    if line.contains("[TOOL_OUTPUT:") || line.contains("[TOOL_RESULT:") {
+                        recent_results.push(line.to_string());
+                    }
+                }
+            }
+            if recent_results.len() >= 3 {
+                break;
+            }
+        }
+        
+        if recent_results.is_empty() {
+            return String::new();
+        }
+        
+        let context = recent_results.iter()
+            .take(3)
+            .map(|s| format!("  {}", s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        format!("[RECENT CONTEXT]\n{}\n", context)
+    }
+
+    /// Build a structured prompt with sections for memory, plan, and task.
+    /// Ensures the TASK is always the final section to prevent model drift.
+    fn build_structured_query(
+        user_query: &str,
+        messages: &[OllamaMessage],
+        steering: &str,
+    ) -> String {
+        let recent_context = Self::extract_recent_context(messages);
+        
+        format!(
+            "{recent_context}\
+             [PLAN]\n\
+             Complete this task:\n\n\
+             [TASK]\n\
+             {query}\n\n\
+             {steering}",
+            recent_context = recent_context,
+            query = user_query,
+            steering = steering,
+        )
     }
 
     fn system_prompt_with_steering(&self) -> String {
@@ -861,7 +917,7 @@ impl Agent {
              \n\
              DIRECTIVES:\n\
              - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
-             - Constraints: Keep files < 200 lines. Use async for long tasks.\n\
+             - Constraints: Keep files under 1000 chars (~200 lines). Use async for long tasks.\n\
              - Completion: Summarize results when finished.\n\
              \n\
              {project_ctx}\n\
@@ -910,10 +966,10 @@ impl Agent {
              After execution, include results in your next response. \
              When the task is fully complete, respond with plain text summarising the result."
         );
-        let query_with_steering = format!(
-            "{}\n{}",
+        let query_with_steering = Self::build_structured_query(
             user_query,
-            steering.format_for_system_prompt()
+            &messages,
+            &steering.format_for_system_prompt()
         );
 
         messages.push(OllamaMessage {
@@ -991,7 +1047,8 @@ impl Agent {
                 let limit = self.get_tool_output_limit();
                 let result = if result.chars().count() > limit {
                     let truncated: String = result.chars().take(limit).collect();
-                    format!("{}...(truncated to {} chars)", truncated, limit)
+                    let dropped = result.chars().count() - limit;
+                    format!("{}…({} omitted)", truncated, dropped)
                 } else {
                     result
                 };
@@ -1030,10 +1087,10 @@ impl Agent {
              <desc>explanation</desc>\n\
              After execution, include results in your next response."
         );
-        let query_with_steering = format!(
-            "{}\n{}",
+        let query_with_steering = Self::build_structured_query(
             user_query,
-            steering.format_for_system_prompt()
+            &messages,
+            &steering.format_for_system_prompt()
         );
 
         messages.push(OllamaMessage {
@@ -1086,10 +1143,19 @@ impl Agent {
             }
 
             if tool_calls.is_empty() && spawn_calls.is_empty() {
-        // If no tools and not done, ask for completion
+        // If no tools and not done, ask for completion with structured prompt
+                let completion_query = "Have you completed the task? Respond with </done> when finished.";
+                let completion_steering = SteeringDirective::custom(
+                    "Check if the task is done. If yes, respond </done> to signal completion."
+                );
+                let structured_completion = Self::build_structured_query(
+                    completion_query,
+                    &messages,
+                    &completion_steering.format_for_system_prompt()
+                );
                 messages.push(OllamaMessage {
                     role: "user".to_string(),
-                    content: "Have you completed the task? Respond with </done> when finished.".to_string(),
+                    content: structured_completion,
                 });
                 continue;
             }
@@ -1116,7 +1182,8 @@ impl Agent {
                 let limit = self.get_tool_output_limit();
                 let result = if result.chars().count() > limit {
                     let truncated: String = result.chars().take(limit).collect();
-                    format!("{}...(truncated to {} chars)", truncated, limit)
+                    let dropped = result.chars().count() - limit;
+                    format!("{}…({} omitted)", truncated, dropped)
                 } else {
                     result
                 };

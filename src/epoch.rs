@@ -2,8 +2,9 @@
 //! it as context on the next startup.
 //!
 //! The summary lives at `.yggdra/epoch_summary.md` in the project directory.
-//! It is capped at 1600 chars (~400 tokens) and is only injected if the file
-//! is younger than 24 hours, keeping context fresh without growing stale.
+//! It is capped at 1600 chars (~400 tokens) — higher than OUTPUT_CHARACTER_LIMIT since
+//! these are injected only on startup (not real-time) and should be comprehensive.
+//! Summaries are only injected if the file is younger than 24 hours, keeping context fresh.
 
 use crate::message::Message;
 use std::path::{Path, PathBuf};

@@ -970,7 +970,7 @@ impl OllamaClient {
             });
         }
 
-        let cap = tool_output_cap.unwrap_or(usize::MAX);
+        let cap = tool_output_cap.unwrap_or(crate::config::OUTPUT_CHARACTER_LIMIT);
 
         // How many recent assistant turns to keep verbatim when rolling trim fires.
         const KEEP_RECENT_ASSISTANT: usize = 10;
@@ -997,7 +997,8 @@ impl OllamaClient {
                 let safe_cap = floor_char_boundary(&msg.content, cap);
                 let truncated = &msg.content[..safe_cap];
                 let cut = truncated.rfind('\n').unwrap_or(safe_cap);
-                format!("{}\n[...{} chars truncated]", &msg.content[..cut], msg.content.len() - cut)
+                let dropped = msg.content.len() - cut;
+                format!("{}\n…({} omitted)", &msg.content[..cut], dropped)
             } else {
                 msg.content.clone()
             };
@@ -1749,7 +1750,7 @@ mod tests {
         // The tool output message should be truncated
         let tool_msg = &result[2];
         assert!(tool_msg.content.len() < 5000 + 50);
-        assert!(tool_msg.content.contains("[...") && tool_msg.content.contains("chars truncated]"));
+        assert!(tool_msg.content.contains("…(") && tool_msg.content.contains("omitted)"));
     }
 
     #[test]

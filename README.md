@@ -1,5 +1,11 @@
 # 🌳 yggdra
 
+**⚠️ EARLY STAGE SOFTWARE — NOT PRODUCTION READY**
+
+Yggdra is an experimental, rapidly evolving project. Interfaces are unstable and may change dramatically without notice. Features, APIs, CLI flags, and behavior are subject to breaking changes between releases. Use at your own risk, especially with important or sensitive files.
+
+---
+
 Yggdra is an airgapped agentic TUI — a Rust app that connects to
 [Ollama](https://ollama.ai), gives your model a toolbox (ripgrep, git, python,
 file editing, even nested sub-agents), and lets it operate on your
@@ -23,6 +29,18 @@ a local model.
 
 **Optimized for small language models** — tested against sub-2B models from
 Qwen, Llama, Gemma, SmolLM, and DeepSeek. If it works on qwen3.5:0.8b, it works.
+
+---
+
+## ⚠️ Disclaimers
+
+- **Alpha/Beta Stage**: Yggdra is under active development. Expect breaking changes, missing features, and rough edges.
+- **Unstable Interfaces**: CLI arguments, configuration formats, data structures, and behavior may change without deprecation warnings.
+- **Experimental Features**: Features like thinking block display, sub-agents, and persistence mechanisms are prototype-grade.
+- **Use at Your Own Risk**: This tool gives an AI direct access to your filesystem. Always review what the agent is about to do before executing in non-Plan mode. Back up your data.
+- **No Backwards Compatibility Guarantees**: Session formats, config files, and stored data may become incompatible with future releases.
+
+If you need stability, mature tooling, or production guarantees, consider cloud-based alternatives. Yggdra is for explorers and people who value local-first automation over stability.
 
 ---
 

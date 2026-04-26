@@ -3,6 +3,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Unified character limit for all output truncation (tool outputs, summaries, displays).
+/// Approximately equivalent to 200 lines of code (~5 chars/line average).
+/// Prevents unbounded LLM context growth while preserving tail-end errors and important output.
+/// User-configurable via `/toolcap` command; persists in .yggdra/config.json.
+pub const OUTPUT_CHARACTER_LIMIT: usize = 1000;
+
 /// Models and parameters specified in AGENTS.md
 #[derive(Debug, Clone, Default)]
 pub struct AgentsConfig {
@@ -86,8 +92,9 @@ pub struct Config {
     pub model: String,
     /// Context window size in tokens (None = use model default)
     pub context_window: Option<u32>,
-    /// Max chars per tool output injected into context (None = unlimited).
+    /// Max chars per tool output injected into context (None = unlimited, default OUTPUT_CHARACTER_LIMIT).
     /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
+    /// Truncation format: `…(N omitted)` at end of output (tail-preserving).
     pub tool_output_cap: Option<usize>,
     /// Application mode: ask, build, plan, or one
     #[serde(default)]
@@ -122,8 +129,9 @@ pub struct ModelParams {
     /// Context window size forwarded to Ollama as num_ctx
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
-    /// Max chars per tool output injected into context (None = unlimited).
+    /// Max chars per tool output injected into context (None = unlimited, default OUTPUT_CHARACTER_LIMIT).
     /// Full output is always stored in SQLite; this only trims what's sent to Ollama.
+    /// Truncation format: `…(N omitted)` at end of output (tail-preserving).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output_cap: Option<usize>,
     /// Enable chain-of-thought thinking (supported by QwQ, DeepSeek-R1, etc.).
