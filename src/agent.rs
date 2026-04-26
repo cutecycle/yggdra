@@ -6,6 +6,7 @@ use crate::steering::SteeringDirective;
 use crate::ollama::{OllamaClient, OllamaMessage, StreamEvent};
 use crate::config::AppMode;
 use crate::sysinfo::SystemInfo;
+use crate::tokens;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
@@ -113,6 +114,11 @@ fn main() {
 Commit changes:
 <tool>commit</tool>
 <message>feat: add run function</message>
+
+Search the local knowledge base (only available when .yggdra/knowledge/ exists):
+<tool>knowledge</tool>
+<query>async trait lifetime</query>
+<desc>Search knowledge base for async trait patterns.</desc>
 
 Optional tags on shell (add after <desc>):
   <returnlines>1-50</returnlines>   — slice output to line range
@@ -378,7 +384,7 @@ fn extract_balanced_brackets(s: &str) -> Option<String> {
     None
 }
 fn is_valid_tool(name: &str) -> bool {
-    matches!(name, "shell" | "setfile" | "patchfile" | "commit")
+    matches!(name, "shell" | "setfile" | "patchfile" | "commit" | "knowledge")
 }
 
 /// Validate tool parameters and return warning if problematic.
@@ -619,6 +625,7 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ToolCall> {
                     .unwrap_or("")
                     .to_string()
             }
+            "knowledge" => extract_tag(block, "query").unwrap_or("").to_string(),
             _ if command.is_empty() => String::new(),
             _ => command,
         };
@@ -726,6 +733,13 @@ pub struct AgentConfig {
     pub token_tx: Option<mpsc::UnboundedSender<String>>,
     /// Live project file listing (size + mtime + path). Injected into system prompt.
     pub project_context: String,
+    /// Content of the N most recently modified text files. Injected into system prompt
+    /// so the agent has immediate visibility into what was last touched without needing
+    /// an explicit read tool call first.
+    pub recent_files_content: String,
+    /// Context window size in tokens (used for token warnings and auto-compress triggers)
+    /// Default: 4096 (conservative for Ollama; adjust for specific models)
+    pub max_context_tokens: usize,
 }
 
 impl AgentConfig {
@@ -739,6 +753,8 @@ impl AgentConfig {
             app_mode: AppMode::Plan,
             token_tx: None,
             project_context: String::new(),
+            recent_files_content: String::new(),
+            max_context_tokens: 4096,  // conservative default for Ollama
         }
     }
 
@@ -764,6 +780,16 @@ impl AgentConfig {
 
     pub fn with_project_context(mut self, ctx: impl Into<String>) -> Self {
         self.project_context = ctx.into();
+        self
+    }
+
+    pub fn with_recent_files_content(mut self, content: impl Into<String>) -> Self {
+        self.recent_files_content = content.into();
+        self
+    }
+
+    pub fn with_max_context_tokens(mut self, tokens: usize) -> Self {
+        self.max_context_tokens = tokens;
         self
     }
 }
@@ -913,6 +939,13 @@ impl Agent {
             .map(|s| format!("\n\n### SESSION NOTES (from previous compress)\n{}", s))
             .unwrap_or_default();
 
+        // Recent file contents (pre-loaded by App).
+        let recent_files = if self.config.recent_files_content.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", self.config.recent_files_content)
+        };
+
         let prompt = format!(
             "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
              Use shell for all file operations, builds, and commits.\n\
@@ -929,7 +962,8 @@ impl Agent {
              - Constraints: Keep files under 1000 chars (~200 lines). Use async for long tasks.\n\
              - Completion: Summarize results when finished.\n\
              \n\
-             {project_ctx}\n\
+             {project_ctx}\
+             {recent_files}\
              {personal_instructions}\
              {session_notes}\n\
              The file tree is live.",
@@ -937,10 +971,26 @@ impl Agent {
             root    = root_line,
             tools   = tools,
             project_ctx = self.config.project_context,
+            recent_files = recent_files,
             personal_instructions = personal_instructions,
             session_notes = session_notes,
         );
-        SteeringDirective::custom(&prompt).format_for_system_prompt()
+        let full_prompt = SteeringDirective::custom(&prompt).format_for_system_prompt();
+        
+        // Estimate tokens and warn if approaching context limit
+        let prompt_tokens = tokens::estimate_tokens(&full_prompt);
+        let (fits, threshold) = tokens::check_fits_in_context(prompt_tokens, self.config.max_context_tokens);
+        if !fits {
+            crate::dlog!("⚠️  PROMPT TOKENS EXCEED 80% THRESHOLD: {} / {} ({}%)",
+                prompt_tokens, self.config.max_context_tokens,
+                (prompt_tokens as f64 / self.config.max_context_tokens as f64 * 100.0) as u32);
+        } else if prompt_tokens > threshold * 3 / 4 {
+            crate::dlog!("📊 Prompt size: {} / {} tokens ({:.0}% of context)",
+                prompt_tokens, self.config.max_context_tokens,
+                prompt_tokens as f64 / self.config.max_context_tokens as f64 * 100.0);
+        }
+        
+        full_prompt
     }
 
     /// Check if LLM output indicates completion (explicit marker only)

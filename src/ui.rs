@@ -75,16 +75,10 @@ pub(crate) fn decide_stream_end(
     consecutive_empty_kicks: u32,
 ) -> StreamEndAction {
     // After this turn, kicks-without-tools becomes consecutive_empty_kicks + 1.
-    let kicks_after = consecutive_empty_kicks + 1;
+    let kicks_after = consecutive_empty_kicks.saturating_add(1);
     match mode {
         AppMode::Plan | AppMode::Ask => StreamEndAction::Persist,
-            AppMode::Forever => {
-                if kicks_after >= 5 {
-                    StreamEndAction::Halt("model stuck")
-                } else {
-                    StreamEndAction::Kick
-                }
-            }
+            AppMode::Forever => StreamEndAction::Kick, // Never halt — run forever
         AppMode::One => {
             if !has_text {
                 // Model produced only thinking tokens (or nothing) — kick up to 3 times.
@@ -498,6 +492,10 @@ pub struct App {
     consecutive_tool_errors: u32,
     /// Name of the last tool that produced an error (for grouping consecutive errors)
     last_errored_tool: String,
+    /// Pending user messages waiting to run in Forever/One mode.
+    /// When the agent is busy and the user submits a new message, it's pushed here
+    /// instead of interrupting the current turn. Drained FIFO when the agent goes idle.
+    task_queue: std::collections::VecDeque<String>,
     /// Whether gradient background is enabled in message area
     gradient_enabled: bool,
     /// Inference rate from last completed generation (tokens/second)
@@ -546,6 +544,8 @@ pub struct App {
     stall_notice_sent: bool,
     /// Set by check_context_pressure when usage ≥ 90% — consumed by the async run loop.
     pending_auto_compress: bool,
+    /// Count of successful tool executions since last compress — triggers auto-compress at 8+
+    tools_executed_since_compress: usize,
     /// When true, tool output is never truncated — full raw content injected into context.
     zero_truncation: bool,
     /// Number of messages dropped by the last sliding-window context trim (0 = nothing dropped).
@@ -564,6 +564,8 @@ pub struct App {
     project_context: String,
     /// When project_context was last built (refresh after mutations or after 60s stale)
     project_context_built: std::time::Instant,
+    /// Content of the N most recently modified text files — refreshed alongside project_context.
+    recent_files_content: String,
     /// Which message index (in messages_cache) the expand/collapse cursor is on (None = no cursor)
     msg_cursor: Option<usize>,
     /// Set of message indices (in messages_cache) that have been expanded by the user
@@ -699,6 +701,7 @@ impl App {
         }
 
         let project_context = build_project_context(10000);
+        let recent_files_content = build_recent_files_content(5, 2000);
 
         Self {
             config,
@@ -760,6 +763,7 @@ impl App {
             consecutive_format_errors: 0,
             consecutive_tool_errors: 0,
             last_errored_tool: String::new(),
+            task_queue: std::collections::VecDeque::new(),
             gradient_enabled,
             last_infer_rate: None,
             on_battery: crate::battery::battery_state(),
@@ -782,10 +786,12 @@ impl App {
             last_mutating_action: std::time::Instant::now(),
             stall_notice_sent: false,
             pending_auto_compress: false,
+            tools_executed_since_compress: 0,
             zero_truncation: false,
             context_cutoff_dropped: 0,
             project_context,
             project_context_built: std::time::Instant::now(),
+            recent_files_content,
             msg_cursor: None,
             expanded_msgs: std::collections::HashSet::new(),
             render_cache_dirty: false,
@@ -1177,6 +1183,30 @@ impl App {
                 self.handle_compress().await;
                 self.last_warned_ctx_pct = 0; // reset so pressure warnings fire again after compaction
             }
+
+            // Task queue drain: in Forever/One mode, dequeue the next pending user task
+            // when the agent is fully idle (no stream, no tool, no compress in flight).
+            if self.turn_phase == TurnPhase::Idle
+                && !self.pending_auto_compress
+                && matches!(self.mode, AppMode::Forever | AppMode::One)
+                && self.ollama_client.is_some()
+            {
+                if let Some(next_task) = self.task_queue.pop_front() {
+                    let remaining = self.task_queue.len();
+                    if remaining > 0 {
+                        self.push_agent_notice(format!(
+                            "▶ Starting next queued task ({} still pending after this)",
+                            remaining
+                        ));
+                    }
+                    // Reset stuck-detection counters for the fresh task
+                    self.consecutive_empty_kicks = 0;
+                    self.autokick_paused = false;
+                    self.consecutive_format_errors = 0;
+                    self.stall_notice_sent = false;
+                    self.handle_message(&next_task).await;
+                }
+            }
         }
 
         // Save stats and epoch summary on clean exit
@@ -1199,40 +1229,24 @@ impl App {
             None => return,
         };
 
-        // Stall detection: abort if Ollama goes silent mid-stream.
-        // Prefill can be slow for large contexts; give generous but finite limits.
-        const PREFILL_TIMEOUT_SECS: u64 = 120; // 2 min for model load + first token
-        const STALL_TIMEOUT_SECS: u64 = 30;    // 30s without a new token = hung
+        // Stall detection: only abort mid-generation (after the first token).
+        // Prefill has no timeout — slow machines / large models can take arbitrarily long
+        // to produce the first token and we should never abort them.
+        const STALL_TIMEOUT_SECS: u64 = 30; // 30s without a new token mid-generation = hung
 
         let now = std::time::Instant::now();
-        let stall_timeout = if self.streaming_text.is_empty() {
-            PREFILL_TIMEOUT_SECS
-        } else {
-            STALL_TIMEOUT_SECS
-        };
+        // No stall check while still in prefill (streaming_text is empty).
+        let in_prefill = self.streaming_text.is_empty();
         let last_activity = self.last_stream_token_time
             .or(self.stream_start_time)
             .unwrap_or(now);
-        if last_activity.elapsed().as_secs() > stall_timeout {
-            let phase = if self.streaming_text.is_empty() { "prefill" } else { "generation" };
-            self.notify(format!("⏱ Stream stalled during {} ({}s) — aborting", phase, stall_timeout));
-            if !self.streaming_text.is_empty() {
-                self.complete_streaming_turn();
+        if !in_prefill && last_activity.elapsed().as_secs() > STALL_TIMEOUT_SECS {
+            if self.mode == AppMode::Forever {
+                self.push_agent_notice(format!("⚠️ Stream stalled ({}s) — retrying in Forever mode", STALL_TIMEOUT_SECS));
             } else {
-                self.stream_rx = None;
-                self.turn_phase = TurnPhase::Idle;
-                self.tool_iteration_count = 0;
-                self.last_stream_token_time = None;
-                if matches!(self.mode, AppMode::Forever | AppMode::One) {
-                    self.consecutive_empty_kicks += 1;
-                    if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
-                        self.autokick_paused = true;
-                        self.push_agent_notice("⏸️ Stream keeps stalling — pausing. Send a message to retry.".to_string());
-                    } else {
-                        self.inject_continue_kick();
-                    }
-                }
+                self.notify(format!("⏱ Stream stalled during generation ({}s) — aborting", STALL_TIMEOUT_SECS));
             }
+            self.complete_streaming_turn();
             return;
         }
 
@@ -1290,6 +1304,24 @@ impl App {
                     self.stats.record_llm(prompt_tokens, gen_tokens, self.last_infer_rate);
                     if context_trimmed { self.stats.context_trims += 1; }
                     self.context_cutoff_dropped = msgs_dropped;
+
+                    // Warn when this turn consumed a worrying fraction of the context window.
+                    let ctx_window = self.effective_context_window();
+                    let total_tokens = prompt_tokens + gen_tokens;
+                    let pct = (total_tokens as f64 / ctx_window as f64 * 100.0) as u32;
+                    if total_tokens >= ctx_window {
+                        self.push_agent_notice(format!(
+                            "⚠️  Context full: this turn used {} tokens ({}% of {} limit). \
+                             Older messages are being dropped. Consider /compress or a fresh session.",
+                            total_tokens, pct, ctx_window
+                        ));
+                    } else if pct >= 80 {
+                        self.push_agent_notice(format!(
+                            "⚠️  Context at {}%: {} / {} tokens used this turn.",
+                            pct, total_tokens, ctx_window
+                        ));
+                    }
+
                     self.complete_streaming_turn();
                     return;
                 }
@@ -1315,7 +1347,12 @@ impl App {
                     self.last_infer_rate = None;
                     if matches!(self.mode, AppMode::Forever | AppMode::One) {
                         self.consecutive_empty_kicks += 1;
-                        if is_fatal || self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                        if self.mode == AppMode::Forever {
+                            // Forever mode never pauses — always retry
+                            let msg = format!("⚠️ Stream error (retrying): {}", clean_error);
+                            self.push_agent_notice(msg);
+                            self.inject_continue_kick();
+                        } else if is_fatal || self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                             self.autokick_paused = true;
                             let reason = if is_fatal {
                                 format!("⏸️ Provider error (will not retry): {}. Send a message to continue.", clean_error)
@@ -1340,7 +1377,9 @@ impl App {
                         self.tool_iteration_count = 0;
                         if matches!(self.mode, AppMode::Forever | AppMode::One) {
                             self.consecutive_empty_kicks += 1;
-                            if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
+                            if self.mode == AppMode::Forever {
+                                self.inject_continue_kick();
+                            } else if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                                 self.autokick_paused = true;
                                 self.push_agent_notice("⏸️ Connection lost repeatedly — pausing. Send a message to retry.".to_string());
                             } else {
@@ -1584,8 +1623,14 @@ impl App {
             self.turn_phase = TurnPhase::Idle;
             self.tool_iteration_count = 0;
             // Don't retry generation — message wasn't persisted, context is stale
-            self.autokick_paused = true;
-            self.push_agent_notice("⏸️ Storage error — pausing. Fix the issue and send a message to resume.".to_string());
+            if self.mode == AppMode::Forever {
+                // Can't persist the message — log and keep going
+                self.push_agent_notice("⚠️ Storage error in Forever mode — message not saved, continuing.".to_string());
+                self.inject_continue_kick();
+            } else {
+                self.autokick_paused = true;
+                self.push_agent_notice("⏸️ Storage error — pausing. Fix the issue and send a message to resume.".to_string());
+            }
             return;
         }
         self.cached_message_count = self.message_buffer.count()
@@ -2213,6 +2258,7 @@ impl App {
         let endpoint = self.config.endpoint.clone();
         let model = self.config.model.clone();
         let project_ctx = self.project_context.clone();
+        let recent_files = self.recent_files_content.clone();
 
         let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         self.subagent_token_rx = Some(token_rx);
@@ -2224,6 +2270,7 @@ impl App {
                 .with_max_recursion_depth(10)
                 .with_app_mode(crate::config::AppMode::Forever)
                 .with_project_context(project_ctx)
+                .with_recent_files_content(recent_files)
                 .with_token_tx(token_tx);
             let result = crate::spawner::spawn_subagent(
                 "ui", &task_id, &task_desc, &endpoint, config, 10,
@@ -2299,6 +2346,12 @@ impl App {
 
         self.turn_phase = TurnPhase::Idle;
         self.tool_iteration_count = 0;
+
+        // Auto-compress after successful subagent completion to avoid context bloat
+        if result.success && !self.pending_auto_compress {
+            self.pending_auto_compress = true;
+            crate::dlog!("🔄 Auto-compress triggered: subagent completed successfully");
+        }
 
         // Kick next stream turn with the injected result
         if let Some(client) = self.ollama_client.clone() {
@@ -2455,8 +2508,16 @@ impl App {
 
                 // Record persistent stats for this tool call
                 match &result.output {
-                    Ok(output) => self.stats.record_tool(&result.tool_name, true, output.len()),
-                    Err(_)     => self.stats.record_tool(&result.tool_name, false, 0),
+                    Ok(output) => {
+                        self.stats.record_tool(&result.tool_name, true, output.len());
+                        // Auto-compress after 8 successful tool executions
+                        self.tools_executed_since_compress += 1;
+                        if self.tools_executed_since_compress >= 8 && !self.pending_auto_compress {
+                            self.pending_auto_compress = true;
+                            crate::dlog!("🔄 Auto-compress triggered: {} tools executed", self.tools_executed_since_compress);
+                        }
+                    }
+                    Err(_) => self.stats.record_tool(&result.tool_name, false, 0),
                 }
 
                 // ── Error-loop detection ─────────────────────────────────────
@@ -2626,8 +2687,12 @@ impl App {
                 if matches!(self.mode, AppMode::Forever | AppMode::One) {
                     self.consecutive_empty_kicks += 1;
                     if self.consecutive_empty_kicks >= 5 || self.autokick_paused {
-                        self.autokick_paused = true;
-                        self.push_agent_notice("⏸️ Tool failures — pausing. Send a message to retry.".to_string());
+                        if self.mode == AppMode::Forever {
+                            self.inject_continue_kick();
+                        } else {
+                            self.autokick_paused = true;
+                            self.push_agent_notice("⏸️ Tool failures — pausing. Send a message to retry.".to_string());
+                        }
                     } else {
                         self.inject_continue_kick();
                     }
@@ -2984,16 +3049,26 @@ impl App {
              Verify every edit: cat -n f.rs | sed -n 'N,Mp'\n\
              sed regex on Rust code is fragile — use awk line-numbers or python3.replace instead.\n\
              ---\n\
-             KNOWLEDGE BASE: .yggdra/knowledge/ — 135,000+ offline docs (Rust, Godot, physics, etc)\n\
-             shell \"ls .yggdra/knowledge/\"                          — list categories\n\
-             shell \"rg 'topic' .yggdra/knowledge/rust/ -l\"     — search docs\n\
-             shell \"cat .yggdra/knowledge/rust/some-doc.md\"         — read a doc\n\
-             .yggdra/knowledge/INDEX.md — indexed category list. Check it before searching.\n\
-             ---\n\
              AGENTS.md is already in context — start working immediately.\n\
              PERSIST NOTES: shell \"echo 'note' >> .yggdra/memory.md\" to remember facts across turns.\n\
              PERSIST REASONING: shell \"echo 'thought' >> .yggdra/thoughts.md\" before complex steps."
         );
+        // Show knowledge base instructions only when .yggdra/knowledge/ exists
+        let kb_path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(".yggdra/knowledge");
+        if kb_path.exists() {
+            base.push_str(
+                "\n---\n\
+                 KNOWLEDGE BASE: .yggdra/knowledge/ — 135,000+ offline docs (Rust, Godot, physics, etc)\n\
+                 Use the knowledge tool to search it:\n\
+                 <tool>knowledge</tool>\n\
+                 <query>async trait lifetime</query>\n\
+                 shell \"ls .yggdra/knowledge/\"              — list categories\n\
+                 shell \"cat .yggdra/knowledge/INDEX.md\"     — full index\n\
+                 shell \"cat .yggdra/knowledge/rust/some-doc.md\" — read a doc"
+            );
+        }
         let memory = Self::memory_block();
         if !memory.is_empty() {
             base.push_str("\n---\n");
@@ -3688,6 +3763,14 @@ impl App {
             AppMode::Ask => (" 🔍ASK ", Color::Yellow),
             AppMode::One => (" 🎯ONE ", Color::Green),
         };
+        // Append queue depth to the mode badge when tasks are pending
+        let queue_badge;
+        let mode_badge = if !self.task_queue.is_empty() {
+            queue_badge = format!("{} [{}▶] ", mode_badge.trim_end(), self.task_queue.len());
+            &queue_badge
+        } else {
+            mode_badge
+        };
 
         // Compute a "frosted" bg for the boxes: gradient end color, slightly lightened
         let box_bg = if self.gradient_enabled {
@@ -3883,8 +3966,9 @@ impl App {
         // Calculate task tokens (since last [DONE])
         let task_tokens = self.total_tokens_used.saturating_sub(self.session_tokens_at_last_done);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let bright = Style::default().fg(Color::White);
+        let is_dark_theme = self.theme.kind == crate::theme::ThemeKind::Dark;
+        let dim    = Style::default().fg(if is_dark_theme { Color::DarkGray } else { Color::Rgb(100, 100, 100) });
+        let bright = Style::default().fg(if is_dark_theme { Color::White    } else { Color::Black });
 
         // Context usage with traffic-light color
         let usage_pct = if prompt_tok > 0 {
@@ -3918,8 +4002,8 @@ impl App {
         let (mode_label, mode_color) = match self.mode {
             AppMode::Forever => ("⚡FOREVER", self.theme.violet),
             AppMode::Plan    => ("🧠PLAN",    self.theme.accent),
-            AppMode::Ask     => ("🔍ASK",     Color::Yellow),
-            AppMode::One     => ("🎯ONE",     Color::Green),
+            AppMode::Ask     => ("🔍ASK",     if is_dark_theme { Color::Yellow } else { Color::Rgb(160, 100, 0) }),
+            AppMode::One     => ("🎯ONE",     if is_dark_theme { Color::Green  } else { Color::Rgb(0, 130, 50)  }),
         };
 
         // Connection icon (varies by endpoint type)
@@ -4366,6 +4450,7 @@ impl App {
         // Budget: 5% of context window in chars, but always at least 10k to preserve multi-level tree depth.
         let max_chars = (self.effective_context_window() as usize / 5).clamp(10000, 20000);
         self.project_context = build_project_context(max_chars);
+        self.recent_files_content = build_recent_files_content(5, 2000);
         self.project_context_built = std::time::Instant::now();
     }
 
@@ -4661,10 +4746,12 @@ impl App {
             let was_streaming = self.stream_rx.is_some();
             let was_executing = self.tool_result_rx.is_some();
             let had_async = !self.async_tasks.is_empty();
-            
+            let queued = self.task_queue.len();
+
             self.abort_active_turn();
             self.async_tasks.clear(); // Clear background tasks
-            
+            self.task_queue.clear();  // Discard pending queued tasks
+
             let mut msg = String::from("⏹️ Aborted");
             if was_streaming {
                 msg.push_str(" (stream)");
@@ -4675,7 +4762,10 @@ impl App {
             if had_async {
                 msg.push_str(" (async tasks)");
             }
-            if !was_streaming && !was_executing && !had_async {
+            if queued > 0 {
+                msg.push_str(&format!(" ({} queued tasks discarded)", queued));
+            }
+            if !was_streaming && !was_executing && !had_async && queued == 0 {
                 msg = "❌ Nothing to abort (not currently running)".to_string();
             }
             self.notify(msg);
@@ -4770,6 +4860,21 @@ impl App {
         } else if command.starts_with('/') {
             self.status_message = format!("❓ Unknown command: '{}'. Type /help for available commands.", command);
         } else if !command.is_empty() {
+            // In Forever/One mode: if the agent is busy, queue the task instead of
+            // interrupting the current turn. The queue drains FIFO as each turn completes.
+            if matches!(self.mode, AppMode::Forever | AppMode::One)
+                && self.turn_phase != TurnPhase::Idle
+            {
+                self.task_queue.push_back(command.clone());
+                let pos = self.task_queue.len();
+                self.status_message = format!(
+                    "📋 Task queued (position {} in queue) — will run when agent is free",
+                    pos
+                );
+                self.input_buffer.clear();
+                return;
+            }
+
             // Message validation: no excessive length, check for reasonable content
             self.inline_tool_results.clear(); // Clear inline results when user sends new message
             self.consecutive_empty_kicks = 0; // Reset stuck detection on new user input
@@ -4994,6 +5099,9 @@ impl App {
                 self.notify(format!("✅ Compressed: {} messages → summary injected (notes write failed: {})", archived, e));
             }
         }
+        
+        // Reset auto-compress counters after successful compress
+        self.tools_executed_since_compress = 0;
     }
 
     /// Handle /gradient command — toggle pastel gradient background
@@ -6116,6 +6224,20 @@ impl App {
             return;
         }
 
+        // Auto-seed AGENTS.md from first prompt when missing or empty
+        let agents_empty = self.agents_context.as_deref().map(str::trim).unwrap_or("").is_empty();
+        let is_first_message = self.message_buffer.count().unwrap_or(1) == 0;
+        if agents_empty && is_first_message {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let agents_path = cwd.join("AGENTS.md");
+            if let Err(e) = std::fs::write(&agents_path, message) {
+                crate::dlog!("Failed to write AGENTS.md: {}", e);
+            } else {
+                self.agents_context = std::fs::read_to_string(&agents_path).ok();
+                self.push_agent_notice("📝 First prompt saved to AGENTS.md — edit it to provide persistent project context.");
+            }
+        }
+
         // Save user message
         let user_msg = Message::new("user", message.to_string());
         if let Err(e) = self.message_buffer.add_and_persist(user_msg) {
@@ -6386,20 +6508,21 @@ impl App {
                     } else {
                         "code".to_string()
                     };
-                    let header = format!("┌─ {}", code_language);
-                    if first_line {
-                        lines.push(RLine::from(format!("{} {}", content_emoji, header)));
-                        first_line = false;
-                    } else {
-                        lines.push(RLine::from(header));
-                    }
                     in_code_block = true;
                     code_buffer.clear();
+                    // first_line is consumed when the wrapped block is emitted (close brace).
                 } else {
-                    // End of code block — highlight accumulated code
+                    // End of code block — highlight + wrap with rounded borders + dim gutter
                     let highlighted = self.highlighter.highlight_code(&code_buffer, &code_language, is_dark);
-                    lines.extend(highlighted);
-                    lines.push(RLine::from("└─".to_string()));
+                    let mut wrapped = wrap_code_block(&code_language, highlighted, is_dark);
+                    if first_line && !wrapped.is_empty() {
+                        let header = wrapped.remove(0);
+                        let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+                        spans.extend(header.spans);
+                        lines.push(RLine::from(spans));
+                        first_line = false;
+                    }
+                    lines.extend(wrapped);
                     in_code_block = false;
                     code_language.clear();
                     code_buffer.clear();
@@ -6420,7 +6543,7 @@ impl App {
                     // Prepend emoji to first table line if needed
                     if first_line && !table_lines.is_empty() {
                         let mut first_table_line = table_lines[0].clone();
-                        if let Some(first_span) = first_table_line.spans.first() {
+                        if let Some(_first_span) = first_table_line.spans.first() {
                             let mut new_spans = vec![Span::raw(format!("{} ", content_emoji))];
                             new_spans.extend(first_table_line.spans.iter().cloned());
                             first_table_line = RLine::from(new_spans);
@@ -6452,10 +6575,17 @@ impl App {
             }
         }
 
-        // Handle unclosed code block
+        // Handle unclosed code block — wrap accumulated buffer for visual consistency
         if in_code_block && !code_buffer.is_empty() {
             let highlighted = self.highlighter.highlight_code(&code_buffer, &code_language, is_dark);
-            lines.extend(highlighted);
+            let mut wrapped = wrap_code_block(&code_language, highlighted, is_dark);
+            if first_line && !wrapped.is_empty() {
+                let header = wrapped.remove(0);
+                let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+                spans.extend(header.spans);
+                lines.push(RLine::from(spans));
+            }
+            lines.extend(wrapped);
         }
 
         // Ensure at least one line with the emoji
@@ -7050,6 +7180,108 @@ pub fn build_project_context_for_bench(cwd: &std::path::Path) -> String {
     }
 }
 
+/// Build a block of content from the N most recently modified text files.
+///
+/// Skips binary files, files larger than 200 KB, lock files, and the same
+/// directories as `build_project_context` (target, .git, node_modules, …).
+/// Each file is capped at `max_chars_per_file` characters; a `…(truncated)`
+/// marker is appended when the file is cut.
+///
+/// Returns an empty string when the project directory is not a git repo or
+/// no eligible files are found.
+pub(crate) fn build_recent_files_content(n: usize, max_chars_per_file: usize) -> String {
+    build_recent_files_content_in(n, max_chars_per_file, std::path::Path::new("."))
+}
+
+/// Inner implementation accepting an explicit root, so tests can call it without
+/// mutating process-global CWD.
+pub(crate) fn build_recent_files_content_in(n: usize, max_chars_per_file: usize, root: &std::path::Path) -> String {
+    const SKIP_DIRS: &[&str] = &[
+        "target", ".git", "node_modules", ".yggdra/log", ".yggdra/knowledge",
+        "vendor", "dist", "build", ".next", "__pycache__",
+    ];
+    // Extensions we never want to embed (binary / generated / lock files).
+    const SKIP_EXTS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "ico", "svg", "woff", "woff2", "ttf", "eot",
+        "pdf", "zip", "tar", "gz", "bz2", "xz", "7z", "bin", "exe", "dll", "so",
+        "dylib", "a", "o", "class", "jar", "pyc", "pyo", "lock",
+    ];
+
+    struct FileEntry { path: std::path::PathBuf, modified: u64 }
+
+    fn collect(dir: &std::path::Path, skip: &[&str], out: &mut Vec<FileEntry>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') && name != ".yggdra" { continue; }
+            let rel = path.to_string_lossy();
+            if skip.iter().any(|s| rel.contains(s)) { continue; }
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if meta.is_dir() {
+                collect(&path, skip, out);
+            } else {
+                let modified = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(FileEntry { path, modified });
+            }
+        }
+    }
+
+    let mut files: Vec<FileEntry> = Vec::new();
+    collect(root, SKIP_DIRS, &mut files);
+
+    // Most recently modified first.
+    files.sort_by(|a, b| b.modified.cmp(&a.modified));
+
+    let mut sections = String::new();
+    let mut count = 0usize;
+
+    for entry in &files {
+        if count >= n { break; }
+
+        // Skip unwanted extensions.
+        let ext = entry.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if SKIP_EXTS.contains(&ext.as_str()) { continue; }
+
+        // Skip files that are likely too large to be useful.
+        let size = std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
+        if size > 200_000 { continue; }
+
+        // Read and validate as UTF-8; skip binary files (null bytes).
+        let bytes = match std::fs::read(&entry.path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bytes.contains(&0u8) { continue; }
+        let content = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let rel = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+
+        let body = if content.chars().count() > max_chars_per_file {
+            let boundary = floor_char_boundary(&content, max_chars_per_file);
+            format!("{}…(truncated)", &content[..boundary])
+        } else {
+            content.clone()
+        };
+
+        sections.push_str(&format!("// {}\n```\n{}\n```\n\n", rel.display(), body));
+        count += 1;
+    }
+
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("### RECENTLY EDITED FILES ({})\n\n{}", count, sections)
+    }
+}
+
+
 fn floor_char_boundary(s: &str, max: usize) -> usize {
     if max >= s.len() { return s.len(); }
     let mut i = max;
@@ -7079,6 +7311,55 @@ pub(crate) fn looks_like_diff(body: &str) -> bool {
 }
 
 /// Render a diff body as colored ratatui Lines. `max_lines` caps the preview; 0 = show all.
+/// Wrap highlighted code lines in a soft, opencode-style box:
+///   ╭─ rust ────
+///   │  fn main() ...
+///   ╰─
+/// Borders are dim and the language is rendered as a small accent badge so that
+/// the code itself remains the visual focus.
+pub(crate) fn wrap_code_block(
+    language: &str,
+    highlighted: Vec<ratatui::text::Line<'static>>,
+    is_dark: bool,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line as RLine, Span as RSpan};
+
+    let border_color = if is_dark {
+        Color::Rgb(80, 90, 110)
+    } else {
+        Color::Rgb(170, 175, 185)
+    };
+    let lang_color = if is_dark {
+        Color::Rgb(120, 180, 235)
+    } else {
+        Color::Rgb(60, 110, 175)
+    };
+    let dim = Style::default().fg(border_color);
+    let lang_style = Style::default().fg(lang_color).add_modifier(Modifier::BOLD);
+
+    let mut out: Vec<RLine<'static>> = Vec::with_capacity(highlighted.len() + 2);
+
+    // Header: ╭─ <lang> ──── (a few trailing dashes for visual weight)
+    out.push(RLine::from(vec![
+        RSpan::styled("╭─ ".to_string(), dim),
+        RSpan::styled(language.to_string(), lang_style),
+        RSpan::styled(" ────".to_string(), dim),
+    ]));
+
+    // Body: prefix every highlighted line with a dim left gutter
+    for line in highlighted {
+        let mut spans: Vec<RSpan<'static>> = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(RSpan::styled("│  ".to_string(), dim));
+        spans.extend(line.spans);
+        out.push(RLine::from(spans));
+    }
+
+    // Footer
+    out.push(RLine::from(RSpan::styled("╰─".to_string(), dim)));
+
+    out
+}
+
 pub(crate) fn render_diff_styled(
     emoji: &str,
     name: &str,
@@ -7094,49 +7375,59 @@ pub(crate) fn render_diff_styled(
 
     let mut lines: Vec<RLine<'static>> = Vec::with_capacity(cap + 3);
 
-    // Header row
-    let trimmed = if cap < total {
-        format!("{} {}  ({} lines — showing {})", emoji, name, total, cap)
+    // Header row — bold name plus a dim line-count badge
+    let count = if cap < total {
+        format!("  ({} lines — showing {})", total, cap)
     } else {
-        format!("{} {}  ({} lines)", emoji, name, total)
+        format!("  ({} lines)", total)
     };
-    lines.push(RLine::from(RSpan::styled(
-        trimmed,
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    lines.push(RLine::from(vec![
+        RSpan::raw(format!("{} ", emoji)),
+        RSpan::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+        RSpan::styled(count, Style::default().fg(Color::DarkGray)),
+    ]));
 
+    // Each diff line gets a colored signal gutter (▎) in the relevant color so
+    // additions/deletions are scannable without painting the whole line.
     for line in all_lines[..cap].iter() {
-        let style = if line.starts_with('+') && !line.starts_with("+++") {
-            Style::default().fg(Color::Green)
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            Style::default().fg(Color::Red)
-        } else if line.starts_with("@@") {
-            Style::default().fg(Color::Cyan)
-        } else if line.starts_with("diff ")
-            || line.starts_with("index ")
-            || line.starts_with("---")
-            || line.starts_with("+++")
-        {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        lines.push(RLine::from(RSpan::styled(
-            format!("│  {}", line),
-            style,
-        )));
+        let (gutter_style, text_style) =
+            if line.starts_with('+') && !line.starts_with("+++") {
+                (Style::default().fg(Color::Rgb(80, 200, 120)),
+                 Style::default().fg(Color::Rgb(80, 200, 120)))
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                (Style::default().fg(Color::Rgb(230, 100, 110)),
+                 Style::default().fg(Color::Rgb(230, 100, 110)))
+            } else if line.starts_with("@@") {
+                (Style::default().fg(Color::Cyan),
+                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else if line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("---")
+                || line.starts_with("+++")
+            {
+                (Style::default().fg(Color::Yellow),
+                 Style::default().fg(Color::Yellow))
+            } else {
+                (Style::default().fg(Color::DarkGray),
+                 Style::default().fg(Color::Gray))
+            };
+        lines.push(RLine::from(vec![
+            RSpan::styled("▎ ".to_string(), gutter_style),
+            RSpan::styled(line.to_string(), text_style),
+        ]));
     }
 
+    let dim = Style::default().fg(Color::DarkGray);
     if cap < total {
         lines.push(RLine::from(RSpan::styled(
-            format!("│  … {} more lines{}", total - cap,
+            format!("▎ … {} more lines{}", total - cap,
                 if !hint.is_empty() { "  [Space=expand]" } else { "" }),
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
     } else if !hint.is_empty() {
         lines.push(RLine::from(RSpan::styled(
-            "│  [Space=collapse]".to_string(),
-            Style::default().fg(Color::DarkGray),
+            "▎ [Space=collapse]".to_string(),
+            dim,
         )));
     }
 
@@ -7248,8 +7539,8 @@ pub(crate) fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<
         };
 
     let dim   = Style::default().fg(Color::DarkGray);
-    let cyan  = Style::default().fg(Color::Cyan);
-    let yel   = Style::default().fg(Color::Yellow);
+    let cyan  = Style::default().fg(Color::Rgb(120, 180, 235)).add_modifier(Modifier::BOLD);
+    let yel   = Style::default().fg(Color::Rgb(214, 182, 110));
     let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -7266,11 +7557,12 @@ pub(crate) fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<
         };
 
         if i > 0 {
-            lines.push(Line::from(vec![Span::styled("├───".to_string(), dim)]));
+            lines.push(Line::from(vec![Span::styled("├─".to_string(), dim)]));
         }
 
+        // Header: ╭─ <emoji> name
         lines.push(Line::from(vec![
-            Span::styled("┌─ ".to_string(), dim),
+            Span::styled("╭─ ".to_string(), dim),
             Span::raw(format!("{} ", tool_emoji)),
             Span::styled(name.clone(), cyan),
         ]));
@@ -7299,6 +7591,8 @@ pub(crate) fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<
                 Span::styled(tid.to_string(), Style::default().fg(Color::Magenta)),
             ]));
         }
+        // Footer to close the card
+        lines.push(Line::from(vec![Span::styled("╰─".to_string(), dim)]));
     }
     if lines.is_empty() { return None; }
     Some(lines)
@@ -7319,9 +7613,9 @@ pub(crate) fn render_markdown_line(line: &str, is_dark: bool) -> Vec<ratatui::te
         return vec![crate::markdown::format_header(level, &content, text_color)];
     }
 
-    // Check for list items
+    // Check for list items — use a unified bullet glyph so prose reads consistently.
     if let Some((indent, content)) = crate::markdown::detect_list_item(line) {
-        let bullet = if line.contains('*') { '•' } else if line.contains('+') { '◦' } else { '·' };
+        let bullet = if line.trim_start().starts_with(|c: char| c.is_ascii_digit()) { '·' } else { '•' };
         return vec![crate::markdown::format_list_item(indent, &content, text_color, bullet)];
     }
 
@@ -7496,20 +7790,19 @@ pub(crate) fn format_message_styled(
                 } else {
                     "code".to_string()
                 };
-                let header = format!("┌─ {}", code_language);
-                if first_line {
-                    lines.push(RLine::from(format!("{} {}", content_emoji, header)));
-                    first_line = false;
-                } else {
-                    lines.push(RLine::from(header));
-                }
                 in_code_block = true;
                 code_buffer.clear();
             } else {
-                // End of code block — highlight accumulated code
                 let highlighted = highlighter.highlight_code(&code_buffer, &code_language, is_dark);
-                lines.extend(highlighted);
-                lines.push(RLine::from("└─".to_string()));
+                let mut wrapped = wrap_code_block(&code_language, highlighted, is_dark);
+                if first_line && !wrapped.is_empty() {
+                    let header = wrapped.remove(0);
+                    let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+                    spans.extend(header.spans);
+                    lines.push(RLine::from(spans));
+                    first_line = false;
+                }
+                lines.extend(wrapped);
                 in_code_block = false;
                 code_language.clear();
                 code_buffer.clear();
@@ -7565,7 +7858,14 @@ pub(crate) fn format_message_styled(
     // Handle unclosed code block
     if in_code_block && !code_buffer.is_empty() {
         let highlighted = highlighter.highlight_code(&code_buffer, &code_language, is_dark);
-        lines.extend(highlighted);
+        let mut wrapped = wrap_code_block(&code_language, highlighted, is_dark);
+        if first_line && !wrapped.is_empty() {
+            let header = wrapped.remove(0);
+            let mut spans = vec![Span::raw(format!("{} ", content_emoji))];
+            spans.extend(header.spans);
+            lines.push(RLine::from(spans));
+        }
+        lines.extend(wrapped);
     }
 
     // Ensure at least one line with the emoji
@@ -8298,7 +8598,7 @@ mod stream_tests {
     }
 
     // ============================================================================
-    // decide_stream_end — Build mode (halts after 5 kicks)
+    // decide_stream_end — Forever mode (NEVER halts — always kicks)
     // ============================================================================
 
     #[test]
@@ -8310,15 +8610,299 @@ mod stream_tests {
     }
 
     #[test]
-    fn build_halts_at_threshold() {
-        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 4), StreamEndAction::Halt("model stuck"));
-        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 4), StreamEndAction::Halt("model stuck"));
+    fn build_never_halts_at_threshold() {
+        // Previously halted at kicks=4 (kicks_after=5); now always Kick
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 4), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 4), StreamEndAction::Kick);
     }
 
     #[test]
-    fn build_halts_above_threshold() {
-        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 10), StreamEndAction::Halt("model stuck"));
-        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 99), StreamEndAction::Halt("model stuck"));
+    fn build_never_halts_above_threshold() {
+        // Previously halted; now always Kick
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 10), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 99), StreamEndAction::Kick);
+    }
+
+    // ============================================================================
+    // Forever mode — exhaustive resilience proof (50+ tests)
+    // Every single permutation of inputs must return Kick, never Halt.
+    // ============================================================================
+
+    // --- Group 1: no text, no tools, varying kicks ---
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_0() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 0), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_1() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 1), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_2() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 2), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_3() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 3), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_4() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 4), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_5() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_6() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 6), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_10() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 10), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_50() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 50), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_100() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 100), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_no_tools_kicks_1000() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, 1000), StreamEndAction::Kick);
+    }
+
+    // --- Group 2: has text, no tools, varying kicks ---
+
+    #[test]
+    fn forever_has_text_no_tools_kicks_0() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 0), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_no_tools_kicks_1() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 1), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_no_tools_kicks_4() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 4), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_no_tools_kicks_5() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_no_tools_kicks_100() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, 100), StreamEndAction::Kick);
+    }
+
+    // --- Group 3: has text, with tools used, varying kicks ---
+
+    #[test]
+    fn forever_has_text_1_tool_kicks_0() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 1, 0), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_1_tool_kicks_5() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 1, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_5_tools_kicks_0() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 0), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_5_tools_kicks_4() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 4), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_5_tools_kicks_5() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_5_tools_kicks_99() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, 99), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_10_tools_kicks_100() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 10, 100), StreamEndAction::Kick);
+    }
+
+    // --- Group 4: no text, with tools, varying kicks ---
+
+    #[test]
+    fn forever_no_text_1_tool_kicks_5() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 1, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_10_tools_kicks_5() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 10, 5), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_no_text_10_tools_kicks_1000() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 10, 1000), StreamEndAction::Kick);
+    }
+
+    // --- Group 5: boundary — u32::MAX kicks ---
+
+    #[test]
+    fn forever_no_text_kicks_u32_max() {
+        assert_eq!(decide_stream_end(false, AppMode::Forever, 0, u32::MAX), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_has_text_kicks_u32_max() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 0, u32::MAX), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn forever_with_tools_kicks_u32_max() {
+        assert_eq!(decide_stream_end(true, AppMode::Forever, 5, u32::MAX), StreamEndAction::Kick);
+    }
+
+    // --- Group 6: property — Forever always returns Kick, never other variants ---
+
+    #[test]
+    fn forever_never_returns_halt() {
+        for kicks in [0u32, 1, 4, 5, 6, 10, 100, 1000] {
+            for tools in [0usize, 1, 10] {
+                for has_text in [true, false] {
+                    let action = decide_stream_end(has_text, AppMode::Forever, tools, kicks);
+                    assert!(
+                        matches!(action, StreamEndAction::Kick),
+                        "Expected Kick but got non-Kick for has_text={has_text} tools={tools} kicks={kicks}"
+                    );
+                    assert!(
+                        !matches!(action, StreamEndAction::Halt(_)),
+                        "Got Halt for has_text={has_text} tools={tools} kicks={kicks}"
+                    );
+                    assert!(
+                        !matches!(action, StreamEndAction::CompleteOne(_)),
+                        "Got CompleteOne for has_text={has_text} tools={tools} kicks={kicks}"
+                    );
+                    assert!(
+                        !matches!(action, StreamEndAction::Persist),
+                        "Got Persist for has_text={has_text} tools={tools} kicks={kicks}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Group 7: StreamEndAction variant identity checks ---
+
+    #[test]
+    fn stream_end_kick_is_not_halt() {
+        let kick = StreamEndAction::Kick;
+        assert!(!matches!(kick, StreamEndAction::Halt(_)));
+    }
+
+    #[test]
+    fn stream_end_kick_is_not_persist() {
+        let kick = StreamEndAction::Kick;
+        assert!(!matches!(kick, StreamEndAction::Persist));
+    }
+
+    #[test]
+    fn stream_end_kick_is_not_complete_one() {
+        let kick = StreamEndAction::Kick;
+        assert!(!matches!(kick, StreamEndAction::CompleteOne(_)));
+    }
+
+    #[test]
+    fn stream_end_halt_is_not_kick() {
+        let halt = StreamEndAction::Halt("test");
+        assert!(!matches!(halt, StreamEndAction::Kick));
+    }
+
+    #[test]
+    fn stream_end_complete_one_is_not_kick() {
+        let done = StreamEndAction::CompleteOne("done");
+        assert!(!matches!(done, StreamEndAction::Kick));
+    }
+
+    // --- Group 8: other modes still correct at high kick counts ---
+
+    #[test]
+    fn plan_never_halts_at_high_kicks() {
+        for kicks in [0u32, 5, 100, 1000] {
+            assert_eq!(
+                decide_stream_end(false, AppMode::Plan, 0, kicks),
+                StreamEndAction::Persist,
+                "Plan should always Persist, kicks={kicks}"
+            );
+            assert_eq!(
+                decide_stream_end(true, AppMode::Plan, 5, kicks),
+                StreamEndAction::Persist,
+                "Plan should always Persist, kicks={kicks}"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_never_halts_at_high_kicks() {
+        for kicks in [0u32, 5, 100, 1000] {
+            assert_eq!(
+                decide_stream_end(false, AppMode::Ask, 0, kicks),
+                StreamEndAction::Persist,
+                "Ask should always Persist, kicks={kicks}"
+            );
+            assert_eq!(
+                decide_stream_end(true, AppMode::Ask, 5, kicks),
+                StreamEndAction::Persist,
+                "Ask should always Persist, kicks={kicks}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_kicks_below_threshold_no_text() {
+        assert_eq!(decide_stream_end(false, AppMode::One, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(false, AppMode::One, 0, 1), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn one_completes_at_threshold_no_text() {
+        assert_eq!(decide_stream_end(false, AppMode::One, 0, 2), StreamEndAction::CompleteOne("empty responses"));
+    }
+
+    #[test]
+    fn one_completes_with_text_and_tools() {
+        assert_eq!(decide_stream_end(true, AppMode::One, 3, 0), StreamEndAction::CompleteOne("no tool calls"));
+    }
+
+    #[test]
+    fn one_kicks_with_text_no_tools_below_threshold() {
+        assert_eq!(decide_stream_end(true, AppMode::One, 0, 0), StreamEndAction::Kick);
+        assert_eq!(decide_stream_end(true, AppMode::One, 0, 1), StreamEndAction::Kick);
+    }
+
+    #[test]
+    fn one_completes_with_text_no_tools_at_threshold() {
+        assert_eq!(decide_stream_end(true, AppMode::One, 0, 2), StreamEndAction::CompleteOne("model unresponsive"));
     }
 
     // ============================================================================
@@ -9053,8 +9637,8 @@ mod rendering_pipeline_tests {
         let text = format_message_styled("🤖", content, true, &h());
         let full: String = text.lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
-            .collect::<Vec<_>>().join(" ");
-        assert!(full.contains("┌─ rust") || full.contains("┌─ code") || full.contains("fn main"), "Code block not rendered");
+            .collect::<Vec<_>>().join("");
+        assert!(full.contains("╭─ rust") || full.contains("╭─ code") || full.contains("┌─ rust") || full.contains("┌─ code") || full.contains("fn main"), "Code block not rendered");
     }
 
     #[test]
@@ -9477,5 +10061,84 @@ mod provider_error_tests {
         let (msg, fatal) = extract_provider_error(raw);
         assert!(!fatal, "429 should not be fatal (retriable)");
         assert_eq!(msg, raw);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_recent_files_content tests
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod recent_files_tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn returns_empty_for_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = build_recent_files_content_in(5, 1000, tmp.path());
+        assert!(result.is_empty(), "empty dir should yield empty string");
+    }
+
+    #[test]
+    fn includes_written_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(tmp.path(), "hello.rs", "fn main() {}");
+        let result = build_recent_files_content_in(5, 1000, tmp.path());
+        assert!(result.contains("hello.rs"), "should include the file");
+        assert!(result.contains("fn main()"), "should include file content");
+    }
+
+    #[test]
+    fn respects_n_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10usize {
+            // sleep 5ms between writes so mtimes differ
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            write_file(tmp.path(), &format!("file{}.txt", i), &format!("content {}", i));
+        }
+        let result = build_recent_files_content_in(3, 1000, tmp.path());
+        // Should only show 3 files (header says "3")
+        assert!(result.contains("RECENTLY EDITED FILES (3)"), "header should say 3 files: {}", result);
+    }
+
+    #[test]
+    fn truncates_large_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(5000);
+        write_file(tmp.path(), "big.txt", &big);
+        let result = build_recent_files_content_in(5, 100, tmp.path());
+        assert!(result.contains("truncated"), "large file should be truncated");
+    }
+
+    #[test]
+    fn skips_binary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a "binary" file with null bytes
+        let path = tmp.path().join("binary.bin");
+        fs::write(&path, b"data\x00more").unwrap();
+        let result = build_recent_files_content_in(5, 1000, tmp.path());
+        assert!(!result.contains("binary.bin"), "binary files should be skipped");
+    }
+
+    #[test]
+    fn skips_lock_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(tmp.path(), "Cargo.lock", "[metadata]");
+        let result = build_recent_files_content_in(5, 1000, tmp.path());
+        assert!(!result.contains("Cargo.lock"), "lock files should be skipped");
+    }
+
+    #[test]
+    fn with_recent_files_content_builder() {
+        let config = crate::agent::AgentConfig::new("model", "http://localhost:11434")
+            .with_recent_files_content("some content");
+        assert_eq!(config.recent_files_content, "some content");
     }
 }

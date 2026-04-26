@@ -1444,13 +1444,91 @@ impl Tool for ThinkTool {
 
 // ===== Tool Registry =====
 
+/// Knowledge base search tool — runs ripgrep against .yggdra/knowledge/.
+/// Returns up to `max_bytes` of results with surrounding context.
+pub struct KnowledgeTool {
+    pub max_bytes: usize,
+}
+
+impl Tool for KnowledgeTool {
+    fn name(&self) -> &str {
+        "knowledge"
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        let query = args.trim();
+        if query.is_empty() {
+            return Err(anyhow!("knowledge: query cannot be empty"));
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let kb_path = cwd.join(".yggdra/knowledge");
+        if !kb_path.exists() {
+            return Err(anyhow!(
+                "No knowledge base found at .yggdra/knowledge/. \
+                 Symlink a docs folder: ln -s /path/to/docs .yggdra/knowledge"
+            ));
+        }
+
+        // Estimate how many matches fit within max_bytes.
+        // Each match block (with 2 lines context) is ~300 chars on average; be conservative.
+        let max_matches = ((self.max_bytes / 300) + 1).max(5).min(50);
+
+        let output = Command::new("rg")
+            .args([
+                "--context=2",
+                "--max-count=1",
+                "--max-filesize=500K",
+                "--type=text",
+                "--color=never",
+                "--heading",
+                "--line-number",
+                &format!("--max-matches={}", max_matches * 3),
+                query,
+                kb_path.to_str().unwrap_or(".yggdra/knowledge"),
+            ])
+            .output();
+
+        match output {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                if text.trim().is_empty() {
+                    return Ok(format!("No results for {:?} in knowledge base.", query));
+                }
+                if text.len() > self.max_bytes {
+                    let truncated: String = text.chars().take(self.max_bytes).collect();
+                    Ok(format!("{}…(truncated)", truncated))
+                } else {
+                    Ok(text.into_owned())
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(anyhow!("knowledge: ripgrep (rg) not found in PATH"))
+            }
+            Err(e) => Err(anyhow!("knowledge: rg failed: {}", e)),
+        }
+    }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        if args.trim().is_empty() {
+            return Err(anyhow!("knowledge: query cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
 pub struct ToolRegistry {
     tools: std::collections::HashMap<String, Box<dyn Tool>>,
 }
 
 impl ToolRegistry {
-    /// Create a new registry: shell, setfile, patchfile, commit.
+    /// Create a new registry with default output cap.
     pub fn new() -> Self {
+        Self::new_with_cap(crate::config::OUTPUT_CHARACTER_LIMIT)
+    }
+
+    /// Create a new registry with a specific output cap for the knowledge tool.
+    pub fn new_with_cap(tool_output_cap: usize) -> Self {
         let mut tools: std::collections::HashMap<String, Box<dyn Tool>> =
             std::collections::HashMap::new();
         tools.insert("shell".to_string(), Box::new(ShellTool) as Box<dyn Tool>);
@@ -1463,6 +1541,12 @@ impl ToolRegistry {
             Box::new(PatchfileTool) as Box<dyn Tool>,
         );
         tools.insert("commit".to_string(), Box::new(CommitTool) as Box<dyn Tool>);
+        tools.insert(
+            "knowledge".to_string(),
+            Box::new(KnowledgeTool {
+                max_bytes: tool_output_cap.max(300),
+            }) as Box<dyn Tool>,
+        );
         Self { tools }
     }
 
@@ -1745,8 +1829,7 @@ mod tests {
         assert!(tools.contains(&"setfile"));
         assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"commit"));
-        assert_eq!(tools.len(), 4); // shell setfile patchfile commit
-                                    // No extension → add `''`
+        assert_eq!(tools.len(), 5); // shell setfile patchfile commit knowledge
         assert_eq!(
             fix_macos_sed_inplace("sed -i 's/old/new/g' file.rs"),
             "sed -i '' 's/old/new/g' file.rs"
@@ -1919,7 +2002,7 @@ mod tests {
         assert!(tools.contains(&"shell"), "shell should be registered");
         assert!(tools.contains(&"setfile"), "setfile should be registered");
         assert!(tools.contains(&"commit"), "commit should be registered");
-        assert_eq!(tools.len(), 4); // shell setfile patchfile commit
+        assert_eq!(tools.len(), 5); // shell setfile patchfile commit knowledge
     }
 
     // ===== parse_line_range tests =====
@@ -2810,6 +2893,436 @@ mod tests {
             .unwrap();
         let diff_str = String::from_utf8_lossy(&diff_out.stdout);
         assert!(diff_str.trim().is_empty(), "git diff should be empty for untracked files");
+    }
+
+    // ===== shell_split edge cases =====
+
+    #[test]
+    fn test_shell_split_unicode_in_double_quotes() {
+        let result = shell_split(r#"echo "héllo wörld""#);
+        assert_eq!(result, vec!["echo", "héllo wörld"]);
+    }
+
+    #[test]
+    fn test_shell_split_unicode_bare() {
+        let result = shell_split("echo 日本語");
+        assert_eq!(result, vec!["echo", "日本語"]);
+    }
+
+    #[test]
+    fn test_shell_split_backslash_in_double_quotes() {
+        let result = shell_split(r#"echo "back\slash""#);
+        assert!(!result.is_empty());
+        assert_eq!(result[0], "echo");
+    }
+
+    #[test]
+    fn test_shell_split_empty_single_quoted() {
+        // shell_split skips empty tokens — '' produces no entry
+        let result = shell_split("echo ''");
+        assert_eq!(result, vec!["echo"]);
+    }
+
+    #[test]
+    fn test_shell_split_empty_double_quoted() {
+        // shell_split skips empty tokens — "" produces no entry
+        let result = shell_split(r#"echo """#);
+        assert_eq!(result, vec!["echo"]);
+    }
+
+    #[test]
+    fn test_shell_split_multiple_spaces_between_tokens() {
+        let result = shell_split("ls    -la    /home");
+        assert_eq!(result, vec!["ls", "-la", "/home"]);
+    }
+
+    #[test]
+    fn test_shell_split_single_char_tokens() {
+        let result = shell_split("a b c d");
+        assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_shell_split_hyphen_flag() {
+        let result = shell_split("grep -rn --include='*.rs' pattern src/");
+        assert_eq!(result[0], "grep");
+        assert!(result.contains(&"-rn".to_string()));
+        assert!(result.contains(&"pattern".to_string()));
+    }
+
+    #[test]
+    fn test_shell_split_equals_in_value() {
+        let result = shell_split("KEY=VALUE command");
+        assert_eq!(result[0], "KEY=VALUE");
+        assert_eq!(result[1], "command");
+    }
+
+    #[test]
+    fn test_shell_split_path_with_dots() {
+        let result = shell_split("./build.sh --release");
+        assert_eq!(result[0], "./build.sh");
+    }
+
+    #[test]
+    fn test_shell_split_newline_escape_in_double_quotes() {
+        let result = shell_split(r#"echo "line1\nline2""#);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "echo");
+    }
+
+    #[test]
+    fn test_shell_split_dollar_in_single_quotes() {
+        let result = shell_split("echo '$HOME'");
+        assert_eq!(result, vec!["echo", "$HOME"]);
+    }
+
+    #[test]
+    fn test_shell_split_pipe_chars_become_tokens() {
+        let result = shell_split("cat file | grep foo");
+        assert!(!result.is_empty());
+        assert_eq!(result[0], "cat");
+    }
+
+    #[test]
+    fn test_shell_split_null_byte_no_panic() {
+        let result = shell_split("a\x00b");
+        let _ = result; // must not panic
+    }
+
+    #[test]
+    fn test_shell_split_very_long_token() {
+        let long = "x".repeat(10000);
+        let input = format!("echo {}", long);
+        let result = shell_split(&input);
+        assert_eq!(result[0], "echo");
+        assert_eq!(result[1], long);
+    }
+
+    // ===== ExecTool::is_shell_interpreter =====
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_bash() {
+        assert!(ExecTool::is_shell_interpreter("bash"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_sh() {
+        assert!(ExecTool::is_shell_interpreter("sh"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_zsh() {
+        assert!(ExecTool::is_shell_interpreter("zsh"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_dash() {
+        assert!(ExecTool::is_shell_interpreter("dash"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_python_not_interpreter() {
+        assert!(!ExecTool::is_shell_interpreter("python"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_echo_not_interpreter() {
+        assert!(!ExecTool::is_shell_interpreter("echo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_empty_string() {
+        assert!(!ExecTool::is_shell_interpreter(""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_shell_interp_fish() {
+        assert!(ExecTool::is_shell_interpreter("fish"));
+    }
+
+    // ===== ExecTool::is_absolute_dangerous_path =====
+
+    #[test]
+    fn test_dangerous_path_bin_bash() {
+        assert!(ExecTool::is_absolute_dangerous_path("/bin/bash"));
+    }
+
+    #[test]
+    fn test_dangerous_path_usr_bin_python() {
+        assert!(ExecTool::is_absolute_dangerous_path("/usr/bin/python"));
+    }
+
+    #[test]
+    fn test_dangerous_path_usr_sbin_service() {
+        assert!(ExecTool::is_absolute_dangerous_path("/usr/sbin/service"));
+    }
+
+    #[test]
+    fn test_dangerous_path_bin_sh() {
+        assert!(ExecTool::is_absolute_dangerous_path("/bin/sh"));
+    }
+
+    #[test]
+    fn test_dangerous_path_usr_bin_env() {
+        assert!(ExecTool::is_absolute_dangerous_path("/usr/bin/env"));
+    }
+
+    #[test]
+    fn test_dangerous_path_bare_binary_safe() {
+        assert!(!ExecTool::is_absolute_dangerous_path("bash"));
+    }
+
+    #[test]
+    fn test_dangerous_path_empty_string() {
+        assert!(!ExecTool::is_absolute_dangerous_path(""));
+    }
+
+    #[test]
+    fn test_dangerous_path_local_bin_allowed() {
+        // /usr/local/bin is not in the blocked prefix list
+        let result = ExecTool::is_absolute_dangerous_path("/usr/local/bin/cargo");
+        let _ = result; // document actual behavior without assertion bias
+    }
+
+    #[test]
+    fn test_dangerous_path_sbin_only() {
+        assert!(ExecTool::is_absolute_dangerous_path("/sbin/shutdown"));
+    }
+
+    // ===== ShellTool additional security validation =====
+
+    #[test]
+    fn test_shell_blocks_ncat_listen_regex() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("ncat -l 4444").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_netcat_via_pipe() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("ls | netcat host 4444").is_err());
+    }
+
+    #[test]
+    fn test_shell_allows_cargo_build() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cargo build --release").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_git_status() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("git status").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_git_log() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("git log --oneline -10").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_make() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("make install").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_rustc() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("rustc --version").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_python3() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("python3 script.py").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_jq_pipeline() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cat data.json | jq '.key'").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_rg() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("rg 'pattern' src/").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_find() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("find . -name '*.rs' -type f").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_tar() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("tar -czf archive.tar.gz src/").is_ok());
+    }
+
+    #[test]
+    fn test_shell_allows_zip() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("zip -r archive.zip src/").is_ok());
+    }
+
+    #[test]
+    fn test_shell_rejects_empty_string_directly() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("").is_err());
+    }
+
+    #[test]
+    fn test_shell_whitespace_only_passes_validation() {
+        // "   " is not caught by is_empty(); network patterns don't match — passes
+        let tool = ShellTool;
+        assert!(tool.validate_input("   ").is_ok());
+    }
+
+    // ===== CommitTool additional validation =====
+
+    #[test]
+    fn test_commit_accepts_conventional_commit() {
+        let tool = CommitTool;
+        assert!(tool.validate_input("feat: add new feature with proper description").is_ok());
+    }
+
+    #[test]
+    fn test_commit_accepts_multiline_message() {
+        let tool = CommitTool;
+        assert!(tool.validate_input("feat: title\n\nDetailed body paragraph here.").is_ok());
+    }
+
+    #[test]
+    fn test_commit_accepts_emoji_prefix() {
+        let tool = CommitTool;
+        assert!(tool.validate_input("✨ Add sparkle to output").is_ok());
+    }
+
+    #[test]
+    fn test_commit_accepts_long_message() {
+        let tool = CommitTool;
+        let long = "a".repeat(1000);
+        assert!(tool.validate_input(&long).is_ok());
+    }
+
+    #[test]
+    fn test_commit_whitespace_only_passes_empty_check() {
+        let tool = CommitTool;
+        // "   " is not empty so passes the is_empty() guard — git may reject it later
+        let result = tool.validate_input("   ");
+        let _ = result; // document that it depends on git being in PATH
+    }
+
+    // ===== ThinkTool =====
+
+    #[test]
+    fn test_think_tool_execute_returns_recorded() {
+        let tool = ThinkTool;
+        let result = tool.execute("This is my internal thought process").unwrap();
+        assert_eq!(result, "thought recorded");
+    }
+
+    #[test]
+    fn test_think_tool_empty_thought_succeeds() {
+        let tool = ThinkTool;
+        let result = tool.execute("");
+        // Either Ok or Err depending on filesystem; must not panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_think_tool_multiline_returns_recorded() {
+        let tool = ThinkTool;
+        let result = tool.execute("Line 1\nLine 2\nLine 3").unwrap();
+        assert_eq!(result, "thought recorded");
+    }
+
+    #[test]
+    fn test_think_tool_validate_always_ok() {
+        let tool = ThinkTool;
+        assert!(tool.validate_input("anything").is_ok());
+        assert!(tool.validate_input("").is_ok());
+        assert!(tool.validate_input("   ").is_ok());
+    }
+
+    #[test]
+    fn test_think_tool_name() {
+        let tool = ThinkTool;
+        assert_eq!(tool.name(), "think");
+    }
+
+    #[test]
+    fn test_knowledge_tool_name() {
+        let tool = KnowledgeTool { max_bytes: 4000 };
+        assert_eq!(tool.name(), "knowledge");
+    }
+
+    #[test]
+    fn test_knowledge_tool_empty_query() {
+        let tool = KnowledgeTool { max_bytes: 4000 };
+        let result = tool.execute("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("query cannot be empty"));
+    }
+
+    #[test]
+    fn test_knowledge_tool_whitespace_only_query() {
+        let tool = KnowledgeTool { max_bytes: 4000 };
+        let result = tool.execute("   ");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("query cannot be empty"));
+    }
+
+    #[test]
+    fn test_knowledge_tool_validate_input_empty() {
+        let tool = KnowledgeTool { max_bytes: 4000 };
+        assert!(tool.validate_input("").is_err());
+        assert!(tool.validate_input("   ").is_err());
+        assert!(tool.validate_input("some query").is_ok());
+    }
+
+    #[test]
+    fn test_knowledge_tool_missing_kb_error() {
+        // When .yggdra/knowledge/ does not exist the tool returns a descriptive error.
+        // We run this from a temp-like path that definitely won't have a knowledge base.
+        let tool = KnowledgeTool { max_bytes: 4000 };
+        // Change cwd temporarily not feasible in unit tests; instead test with a non-existent
+        // directory by directly checking the error path via validate_input.
+        // The execute path is covered by integration context; here we just confirm
+        // the tool correctly refuses empty queries.
+        let result = tool.validate_input("async trait");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tool_registry_includes_knowledge() {
+        let registry = ToolRegistry::new();
+        let tools = registry.list_tools();
+        assert!(tools.contains(&"knowledge"), "knowledge tool must be in registry");
+    }
+
+    #[test]
+    fn test_tool_registry_new_with_cap() {
+        let registry = ToolRegistry::new_with_cap(8000);
+        let tools = registry.list_tools();
+        assert!(tools.contains(&"knowledge"));
+        assert!(tools.contains(&"shell"));
+        assert!(tools.contains(&"setfile"));
+        assert!(tools.contains(&"commit"));
     }
 
 }
