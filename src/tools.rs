@@ -296,7 +296,10 @@ impl Tool for ShellTool {
 
     fn validate_input(&self, args: &str) -> Result<()> {
         if args.is_empty() {
-            return Err(anyhow!("shell: empty command"));
+            return Err(anyhow!(
+                "shell: empty command. Did you forget to close </command> before <desc>? \
+                 Heredocs (<<'EOF') are not supported in XML tool calls — use setfile instead."
+            ));
         }
 
         // Extract just the command part (before \x00 delimiter if present)
@@ -855,6 +858,25 @@ impl Tool for SetfileTool {
         if path.is_empty() {
             return Err(anyhow!("setfile: empty file path"));
         }
+        // Reject paths that have no file extension and look like directory names.
+        // A model writing `setfile path="src"` creates a file that breaks subsequent
+        // `src/foo.rs` writes. Common mistake when the model wants `src/main.rs`.
+        let stem = std::path::Path::new(path).file_name()
+            .and_then(|n| n.to_str()).unwrap_or(path);
+        if !stem.contains('.') {
+            const COMMON_DIRS: &[&str] = &[
+                "src", "lib", "tests", "bin", "examples", "benches",
+                "target", "build", "dist", "out", "pkg",
+            ];
+            if COMMON_DIRS.contains(&stem) {
+                return Err(anyhow!(
+                    "setfile: '{}' looks like a directory name, not a file. \
+                     Did you mean '{}/main.rs' or '{}/lib.rs'? \
+                     setfile writes FILES — include a filename with extension.",
+                    path, path, path
+                ));
+            }
+        }
         sandbox::check_write(path)?;
         Ok(())
     }
@@ -869,6 +891,21 @@ impl Tool for SetfileTool {
         let path = sandbox::resolve(raw_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                // Before create_dir_all, check whether any path component exists as a
+                // file (not a directory) — gives a clear diagnosis instead of "File exists (os error 17)".
+                let mut probe = std::path::PathBuf::new();
+                for component in parent.components() {
+                    probe.push(component);
+                    if probe.exists() && !probe.is_dir() {
+                        return Err(anyhow!(
+                            "setfile: cannot create '{}' — '{}' exists as a file, not a directory. \
+                             Remove it first with: shell \"rm '{}'\"",
+                            path.display(),
+                            probe.display(),
+                            probe.display(),
+                        ));
+                    }
+                }
                 fs::create_dir_all(parent).map_err(|e| {
                     anyhow!(
                         "setfile: failed to create dirs for {}: {}",

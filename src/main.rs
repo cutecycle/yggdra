@@ -23,6 +23,7 @@ mod task;
 mod ui;
 mod metrics;
 mod watcher;
+mod tokens;
 
 use anyhow::Result;
 use session::Session;

@@ -101,6 +101,69 @@ fn no_system_leakage(r: &str) -> bool {
     has_call && no_leak
 }
 
+// ── extended check functions ──────────────────────────────────────────────────
+
+fn xml_patchfile_correct(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    calls.iter().any(|c| c.name == "patchfile" && !c.args.is_empty())
+}
+fn xml_commit_conventional(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    calls.iter().any(|c| c.name == "commit" && (
+        c.args.starts_with("feat:") || c.args.starts_with("fix:") ||
+        c.args.starts_with("chore:") || c.args.starts_with("docs:") ||
+        c.args.starts_with("refactor:")
+    ))
+}
+fn xml_setfile_correct_path(r: &str) -> bool {
+    let calls = agent::parse_xml_tool_calls(r);
+    calls.iter().any(|c| c.name == "setfile" && c.args.contains('\x00') && {
+        let path = c.args.split('\x00').next().unwrap_or("");
+        !path.is_empty() && (
+            path.ends_with(".txt") || path.ends_with(".rs") ||
+            path.ends_with(".py") || path.contains('/')
+        )
+    })
+}
+fn xml_three_calls(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).len() >= 3
+}
+fn xml_shell_pipe(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell" && c.args.contains('|'))
+}
+fn xml_returnlines(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell" && c.args.contains('\x00'))
+}
+fn xml_async_mode(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.async_mode)
+}
+fn xml_has_desc(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| {
+        c.description.as_deref().map(|d| !d.is_empty()).unwrap_or(false)
+    })
+}
+fn no_tool_output_hallucination_strict(r: &str) -> bool {
+    !r.contains("[TOOL_OUTPUT:") && !r.contains("[TOOL_RESULT:")
+        && !r.contains("tool_output") && !r.contains("RESULT:")
+}
+fn xml_unix_remap(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "shell")
+}
+fn response_concise(r: &str) -> bool {
+    let without_think = if let (Some(s), Some(e)) = (r.find("<think>"), r.find("</think>")) {
+        format!("{}{}", &r[..s], &r[e + "</think>".len()..])
+    } else {
+        r.to_string()
+    };
+    without_think.len() < 500
+}
+fn commit_with_emoji(r: &str) -> bool {
+    agent::parse_xml_tool_calls(r).iter().any(|c| c.name == "commit" && (
+        c.args.contains('✨') || c.args.contains('🐛') || c.args.contains('🔧') ||
+        c.args.contains('📝') || c.args.contains('🚀') || c.args.contains('🎉')
+    ))
+}
+
 const TESTS: &[TestCase] = &[
     TestCase {
         name: "XML: basic shell call",
@@ -271,6 +334,196 @@ const TESTS: &[TestCase] = &[
         think: Some(false),
     },
     
+    // ── Extended gauntlet: parsing correctness + discipline ───────────────────
+
+    TestCase {
+        name: "XML: patchfile call",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>patchfile</tool>\n<path>src/main.rs</path>\n\
+                 <start_line>1</start_line>\n<end_line>3</end_line>\n\
+                 <new_text>fn main() {\n    println!(\"patched\");\n}</new_text>",
+        check: xml_patchfile_correct,
+        expect: "patchfile call with non-empty args (path\\x00start\\x00end\\x00text)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: conventional commit message",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>commit</tool>\n<message>feat: add user authentication module</message>",
+        check: xml_commit_conventional,
+        expect: "commit call with conventional commit prefix (feat:/fix:/chore:)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: setfile with correct path extraction",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>setfile</tool>\n<path>/tmp/hello.txt</path>\n<content>Hello, world!</content>",
+        check: xml_setfile_correct_path,
+        expect: "setfile call with path ending in .txt and non-empty content",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: three consecutive tool calls",
+        prompt: "Respond with EXACTLY THREE XML tool calls and no other text:\n\
+                 First: <tool>shell</tool><command>echo one</command><desc>step 1</desc>\n\
+                 Second: <tool>shell</tool><command>echo two</command><desc>step 2</desc>\n\
+                 Third: <tool>shell</tool><command>echo three</command><desc>step 3</desc>",
+        check: xml_three_calls,
+        expect: "at least 3 parsed XML tool calls",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: shell command with pipe",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo hello | grep hello</command>\n<desc>pipe test</desc>",
+        check: xml_shell_pipe,
+        expect: "shell call with | in command args",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: returnlines parameter",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>cat /etc/hosts</command>\n\
+                 <desc>read hosts</desc>\n<returnlines>1-10</returnlines>",
+        check: xml_returnlines,
+        expect: "shell call with \\x00 in args (returnlines encoded)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: async mode flag",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>sleep 1 && echo done</command>\n\
+                 <desc>background task</desc>\n<mode>async</mode>\n<task_id>bg-task-1</task_id>",
+        check: xml_async_mode,
+        expect: "tool call with async_mode=true",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: desc tag is non-empty",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>ls .</command>\n<desc>List current directory contents.</desc>",
+        check: xml_has_desc,
+        expect: "tool call with non-empty description",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: strict no tool output hallucination",
+        prompt: "Respond with ONLY the word \"ok\" — no tool calls, no [TOOL_OUTPUT:], no explanations.",
+        check: no_tool_output_hallucination_strict,
+        expect: "no [TOOL_OUTPUT:], [TOOL_RESULT:], or RESULT: in response",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: unix command remapping (cat → shell)",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>cat</tool>\n<command>/etc/hostname</command>",
+        check: xml_unix_remap,
+        expect: "cat remapped to shell call successfully parsed",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: concise response (no bloat)",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo brief</command>\n<desc>brief</desc>",
+        check: response_concise,
+        expect: "total response length < 500 chars (no prose preamble/postamble)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: commit with emoji",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>commit</tool>\n<message>✨ feat: add sparkle feature</message>",
+        check: commit_with_emoji,
+        expect: "commit call with emoji in message",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: setfile with Python code",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>setfile</tool>\n<path>script.py</path>\n\
+                 <content>\ndef hello():\n    print('hello')\n\nhello()\n</content>",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            calls.iter().any(|c| c.name == "setfile" && c.args.contains("def hello"))
+        },
+        expect: "setfile call preserving Python function definition",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: shell + setfile sequence",
+        prompt: "Respond with EXACTLY TWO XML tool calls — no prose before, between, or after.\n\
+                 First: <tool>shell</tool><command>mkdir -p /tmp/demo</command><desc>make dir</desc>\n\
+                 Then: <tool>setfile</tool><path>/tmp/demo/readme.txt</path><content>hello</content><desc>write file</desc>",
+        check: xml_two_different_tools,
+        expect: ">= 2 XML tool calls with different names (shell + setfile)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: patchfile with multi-line new_text",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>patchfile</tool>\n<path>main.rs</path>\n<start_line>1</start_line>\n\
+                 <end_line>2</end_line>\n<new_text>fn main() {\n    println!(\"updated\");\n}</new_text>",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            calls.iter().any(|c| c.name == "patchfile" && c.args.contains('\n'))
+        },
+        expect: "patchfile call with newline in new_text (multi-line replacement)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: commit_message alternate tag",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>commit</tool>\n<commit_message>fix: resolve null pointer exception</commit_message>",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            calls.iter().any(|c| c.name == "commit" && c.args.contains("fix:"))
+        },
+        expect: "commit parsed from <commit_message> tag with fix: prefix",
+        think: Some(false),
+    },
+    TestCase {
+        name: "XML: shell with environment variable expansion",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>shell</tool>\n<command>echo $HOME</command>\n<desc>Print home directory.</desc>",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            calls.iter().any(|c| c.name == "shell" && c.args.contains("$HOME"))
+        },
+        expect: "shell call preserving $HOME env var reference",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Think+act: think about which tool to use",
+        prompt: "Think about whether to use shell or setfile, then use shell to print 'chosen'.",
+        check: xml_think_act,
+        expect: "think block present AND at least one tool call",
+        think: Some(true),
+    },
+    TestCase {
+        name: "XML: setfile preserves leading whitespace in content",
+        prompt: "Respond with ONLY this XML tool call and no other text:\n\
+                 <tool>setfile</tool>\n<path>/tmp/indent.py</path>\n\
+                 <content>\n    def f():\n        return 42\n</content>",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            calls.iter().any(|c| c.name == "setfile" && c.args.contains("    def f"))
+        },
+        expect: "setfile preserves Python indentation (4-space indent in content)",
+        think: Some(false),
+    },
+    TestCase {
+        name: "Discipline: no backtick wrapping of tool calls",
+        prompt: "Use a tool call (not backtick-wrapped) to run: echo 'no-fence'",
+        check: |r| {
+            let calls = agent::parse_xml_tool_calls(r);
+            let has_shell = calls.iter().any(|c| c.name == "shell");
+            let has_fence = r.contains("```");
+            has_shell && !has_fence
+        },
+        expect: "XML shell call present and no ``` fences in response",
+        think: Some(false),
+    },
+
     // ── HUMOR BENCHMARKS ───────────────────────────────────────────────────────
     // Tests whether models can be charming, funny, and delightful
     // These are critical for the "adorable TUI agent" personality

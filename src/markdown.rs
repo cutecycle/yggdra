@@ -243,61 +243,102 @@ pub fn parse_table(lines: &[&str]) -> Option<Vec<Vec<String>>> {
     }
 }
 
-/// Format inline markdown to ratatui Spans
+/// A muted/dim variant of a text color, for secondary content like borders.
+fn dim_of(color: Color) -> Color {
+    match color {
+        // Dark theme text -> mid grey-blue border
+        Color::Rgb(r, g, b) if (r as u16 + g as u16 + b as u16) > 384 => {
+            Color::Rgb(r.saturating_sub(110), g.saturating_sub(110), b.saturating_sub(110))
+        }
+        // Light theme text -> a softer grey
+        Color::Rgb(r, g, b) => {
+            Color::Rgb(r.saturating_add(110).min(180), g.saturating_add(110).min(185), b.saturating_add(110).min(195))
+        }
+        _ => Color::DarkGray,
+    }
+}
+
+/// Format inline markdown to ratatui Spans.
+/// Inline code is rendered in a warm yellow accent so it stands out from prose,
+/// matching opencode-style emphasis.
 pub fn format_inline_to_spans(text: &str, text_color: Color) -> Vec<Span<'static>> {
     let parts = parse_inline(text);
+    let code_color = Color::Rgb(214, 182, 110); // warm amber, readable on both themes
     parts
         .into_iter()
         .map(|(text, modifier)| {
-            let style = if let Some(m) = modifier {
-                Style::default().fg(text_color).add_modifier(m)
-            } else {
-                Style::default().fg(text_color)
+            let style = match modifier {
+                Some(Modifier::DIM) => Style::default().fg(code_color),
+                Some(m) => Style::default().fg(text_color).add_modifier(m),
+                None => Style::default().fg(text_color),
             };
             Span::styled(text, style)
         })
         .collect()
 }
 
-/// Format a header line with appropriate styling
+/// Format a header line with tier-based styling.
+/// h1 = bold + accent color, h2 = bold, h3+ = bold + dim.
+/// The leading `#` marker is rendered dim so it doesn't fight the text.
 pub fn format_header(level: usize, content: &str, text_color: Color) -> Line<'static> {
-    let modifier = match level {
-        1 => Modifier::BOLD,
-        2 => Modifier::BOLD,
-        _ => Modifier::BOLD,
+    let dim = dim_of(text_color);
+    // h1 gets a warm accent; h2 stays at full text color; h3+ goes dim.
+    let (header_color, modifier) = match level {
+        1 => (Color::Rgb(120, 180, 235), Modifier::BOLD),
+        2 => (text_color, Modifier::BOLD),
+        _ => (dim, Modifier::BOLD),
     };
-    
+
     let marker = "#".repeat(level);
     let prefix = format!("{} ", marker);
-    let style = Style::default().fg(text_color).add_modifier(modifier);
+    let marker_style = Style::default().fg(dim);
+    let header_style = Style::default().fg(header_color).add_modifier(modifier);
 
-    let mut spans = vec![Span::styled(prefix, style)];
-    spans.extend(format_inline_to_spans(content, text_color));
+    let mut spans = vec![Span::styled(prefix, marker_style)];
+
+    // Re-style the inline-formatted content with the header color while
+    // preserving inline modifiers (bold/italic/code).
+    let parts = parse_inline(content);
+    let code_color = Color::Rgb(214, 182, 110);
+    for (txt, m) in parts {
+        let style = match m {
+            Some(Modifier::DIM) => Style::default().fg(code_color).add_modifier(modifier),
+            Some(extra) => header_style.add_modifier(extra),
+            None => header_style,
+        };
+        spans.push(Span::styled(txt, style));
+    }
 
     Line::from(spans)
 }
 
-/// Format a list item with proper indentation and bullet
+/// Format a list item with hanging indent and a unified bullet glyph.
+/// Bullet is rendered dim so the item content reads first.
 pub fn format_list_item(indent: usize, content: &str, text_color: Color, bullet: char) -> Line<'static> {
+    let dim = dim_of(text_color);
     let spaces = " ".repeat(indent);
     let bullet_str = format!("{} ", bullet);
-    
+
     let mut spans = vec![
         Span::raw(spaces),
-        Span::styled(bullet_str, Style::default().fg(text_color)),
+        Span::styled(bullet_str, Style::default().fg(dim)),
     ];
     spans.extend(format_inline_to_spans(content, text_color));
 
     Line::from(spans)
 }
 
-/// Format a simple table with aligned columns
+/// Format a simple table with aligned columns.
+/// Borders are rendered dim and rounded so the cell content is visually primary.
 pub fn format_table(rows: &[Vec<String>], text_color: Color) -> Vec<Line<'static>> {
     let mut result = Vec::new();
 
     if rows.is_empty() {
         return result;
     }
+
+    let border_color = dim_of(text_color);
+    let border_style = Style::default().fg(border_color);
 
     // Calculate column widths
     let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
@@ -311,21 +352,18 @@ pub fn format_table(rows: &[Vec<String>], text_color: Color) -> Vec<Line<'static
         }
     }
 
-    // Add separator above header
+    // Top border (rounded corners)
     let separator = format!(
-        "┌{}┐",
+        "╭{}╮",
         col_widths
             .iter()
             .map(|w| "─".repeat(w + 2))
             .collect::<Vec<_>>()
             .join("┬")
     );
-    result.push(Line::from(Span::styled(
-        separator,
-        Style::default().fg(text_color),
-    )));
+    result.push(Line::from(Span::styled(separator, border_style)));
 
-    // Format header row
+    // Header row
     if let Some(header) = rows.first() {
         let cells: Vec<String> = header
             .iter()
@@ -336,10 +374,19 @@ pub fn format_table(rows: &[Vec<String>], text_color: Color) -> Vec<Line<'static
             })
             .collect();
 
-        result.push(Line::from(Span::styled(
-            format!("│{}│", cells.join("│")),
-            Style::default().fg(text_color).add_modifier(Modifier::BOLD),
-        )));
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 2 + 1);
+        spans.push(Span::styled("│".to_string(), border_style));
+        for (i, cell) in cells.iter().enumerate() {
+            spans.push(Span::styled(
+                cell.clone(),
+                Style::default().fg(text_color).add_modifier(Modifier::BOLD),
+            ));
+            if i + 1 < cells.len() {
+                spans.push(Span::styled("│".to_string(), border_style));
+            }
+        }
+        spans.push(Span::styled("│".to_string(), border_style));
+        result.push(Line::from(spans));
 
         // Separator after header
         let header_sep = format!(
@@ -350,13 +397,10 @@ pub fn format_table(rows: &[Vec<String>], text_color: Color) -> Vec<Line<'static
                 .collect::<Vec<_>>()
                 .join("┼")
         );
-        result.push(Line::from(Span::styled(
-            header_sep,
-            Style::default().fg(text_color),
-        )));
+        result.push(Line::from(Span::styled(header_sep, border_style)));
     }
 
-    // Format data rows
+    // Data rows: cells in text color, borders dim
     for row in rows.iter().skip(1) {
         let cells: Vec<String> = row
             .iter()
@@ -367,25 +411,28 @@ pub fn format_table(rows: &[Vec<String>], text_color: Color) -> Vec<Line<'static
             })
             .collect();
 
-        result.push(Line::from(Span::styled(
-            format!("│{}│", cells.join("│")),
-            Style::default().fg(text_color),
-        )));
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 2 + 1);
+        spans.push(Span::styled("│".to_string(), border_style));
+        for (i, cell) in cells.iter().enumerate() {
+            spans.push(Span::styled(cell.clone(), Style::default().fg(text_color)));
+            if i + 1 < cells.len() {
+                spans.push(Span::styled("│".to_string(), border_style));
+            }
+        }
+        spans.push(Span::styled("│".to_string(), border_style));
+        result.push(Line::from(spans));
     }
 
-    // Separator below table
+    // Bottom border (rounded corners)
     let footer_sep = format!(
-        "└{}┘",
+        "╰{}╯",
         col_widths
             .iter()
             .map(|w| "─".repeat(w + 2))
             .collect::<Vec<_>>()
             .join("┴")
     );
-    result.push(Line::from(Span::styled(
-        footer_sep,
-        Style::default().fg(text_color),
-    )));
+    result.push(Line::from(Span::styled(footer_sep, border_style)));
 
     result
 }
