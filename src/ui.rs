@@ -6982,7 +6982,7 @@ fn build_project_context(max_chars: usize) -> String {
     use std::collections::BTreeMap;
 
     const SKIP_DIRS: &[&str] = &[
-        "target", ".git", "node_modules", ".yggdra/log", ".yggdra/knowledge",
+        "target", ".git", "node_modules", ".yggdra",
         "vendor", "dist", "build", ".next", "__pycache__",
     ];
     const MAX_FILES: usize = 5000; // bail out if directory is huge (e.g. home dir)
@@ -7211,7 +7211,7 @@ pub(crate) fn build_recent_files_content(n: usize, max_chars_per_file: usize) ->
 /// mutating process-global CWD.
 pub(crate) fn build_recent_files_content_in(n: usize, max_chars_per_file: usize, root: &std::path::Path) -> String {
     const SKIP_DIRS: &[&str] = &[
-        "target", ".git", "node_modules", ".yggdra/log", ".yggdra/knowledge",
+        "target", ".git", "node_modules", ".yggdra",
         "vendor", "dist", "build", ".next", "__pycache__",
     ];
     // Extensions we never want to embed (binary / generated / lock files).
