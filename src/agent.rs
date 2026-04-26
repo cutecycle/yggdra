@@ -613,8 +613,11 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ToolCall> {
                 format!("{}\x00{}\x00{}\x00{}", fpath, start, end_l, new_text)
             }
             "commit" => {
-                // <message>commit message</message>
-                extract_tag(block, "message").unwrap_or("").to_string()
+                // Accept both <message> and <commit_message> — models vary.
+                extract_tag(block, "message")
+                    .or_else(|| extract_tag(block, "commit_message"))
+                    .unwrap_or("")
+                    .to_string()
             }
             _ if command.is_empty() => String::new(),
             _ => command,
@@ -904,6 +907,12 @@ impl Agent {
             .map(|s| format!("\n\n### PERSONAL INSTRUCTIONS\n{}", s))
             .unwrap_or_default();
 
+        // Session notes: persisted summary from /compress — survives restarts.
+        // Loaded from .yggdra/session_notes.md if present.
+        let session_notes = std::fs::read_to_string(".yggdra/session_notes.md")
+            .map(|s| format!("\n\n### SESSION NOTES (from previous compress)\n{}", s))
+            .unwrap_or_default();
+
         let prompt = format!(
             "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
              Use shell for all file operations, builds, and commits.\n\
@@ -921,13 +930,15 @@ impl Agent {
              - Completion: Summarize results when finished.\n\
              \n\
              {project_ctx}\n\
-             {personal_instructions}\n\
+             {personal_instructions}\
+             {session_notes}\n\
              The file tree is live.",
             sysinfo = sysinfo,
             root    = root_line,
             tools   = tools,
             project_ctx = self.config.project_context,
             personal_instructions = personal_instructions,
+            session_notes = session_notes,
         );
         SteeringDirective::custom(&prompt).format_for_system_prompt()
     }
@@ -2116,6 +2127,33 @@ The answer is 42.";
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "commit");
         assert_eq!(calls[0].args, "feat: add tests");
+    }
+
+    /// Models often emit <commit_message> instead of <message>.
+    /// Both must be accepted so the commit tool receives a non-empty arg.
+    #[test]
+    fn test_parse_xml_commit_message_alias_accepted() {
+        let xml = "<tool>commit</tool>\n<commit_message>feat: set package name</commit_message>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "commit");
+        assert_eq!(calls[0].args, "feat: set package name");
+    }
+
+    /// Malformed closing tag (<commit_message>…</commit>) — the content is still
+    /// extracted via <commit_message> open tag before the mismatched close.
+    #[test]
+    fn test_parse_xml_commit_message_alias_malformed_close() {
+        // </commit> is wrong but the parser should still find <commit_message>
+        let xml = "<tool>commit</tool>\n<commit_message>fix: typo</commit>";
+        let calls = parse_xml_tool_calls(xml);
+        // The parser finds <commit_message>fix: typo</commit_message>? No —
+        // the closing tag </commit_message> is absent; this won't parse.
+        // What we care about: it does NOT crash and does NOT produce a non-empty
+        // arg that equals "fix: typo" via a wrong path.
+        // The session bug was a totally missing <message> tag, not a partial
+        // close tag, so this just documents the current behaviour.
+        assert!(calls.is_empty() || calls[0].args.is_empty());
     }
 
     #[test]

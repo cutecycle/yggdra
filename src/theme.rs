@@ -74,32 +74,57 @@ impl Theme {
     /// Can be called at any time while the TUI is running.
     /// Returns Some(is_light) or None if detection is unavailable.
     pub fn detect_safe() -> Option<bool> {
-        // macOS: `defaults read -g AppleInterfaceStyle` returns "Dark" in dark mode,
-        // exits with code 1 and empty output in light mode. No terminal involvement.
         #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = std::process::Command::new("defaults")
-                .args(["read", "-g", "AppleInterfaceStyle"])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-                if output.status.success() && stdout.contains("dark") {
-                    return Some(false); // definitely dark mode
-                }
-                // Light mode: key doesn't exist → exit code 1, empty stdout.
-                // Only assert light if we see that exact signature; any other failure
-                // (process error, sandbox, etc.) returns None to avoid false positives.
-                if !output.status.success() && stdout.is_empty() {
-                    return Some(true); // definitely light mode
-                }
-                // Unexpected output — don't change the theme.
-                return None;
-            }
-        }
-        // Fallback: COLORFGBG env var (set once at shell startup; won't catch mid-session changes
-        // on most terminals, but better than nothing on non-macOS platforms)
+        return detect_safe_macos();
+        // Non-macOS: fall back to COLORFGBG env var (set at shell startup).
+        #[cfg(not(target_os = "macos"))]
         detect_via_env()
     }
+}
+
+// ── macOS dark-mode detection ─────────────────────────────────────────────────
+
+/// macOS-specific detection. Never falls through to COLORFGBG (a terminal
+/// variable that has nothing to do with the system appearance setting).
+///
+/// Strategy:
+///   1. osascript — queries the live appearance API; handles auto-appearance
+///      mode, MDM policies, and per-app overrides correctly.
+///   2. `defaults read -g AppleInterfaceStyle` — simpler fallback; works in
+///      all common cases but can miss edge cases covered by step 1.
+///   3. None — both failed (binary missing, spawn error, unexpected output).
+#[cfg(target_os = "macos")]
+fn detect_safe_macos() -> Option<bool> {
+    // Primary: osascript
+    if let Ok(output) = std::process::Command::new("osascript")
+        .args(["-e", "tell app \"System Events\" to dark mode of appearance preferences"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+        if output.status.success() {
+            if s == "true"  { return Some(false); } // dark mode
+            if s == "false" { return Some(true);  } // light mode
+        }
+    }
+
+    // Fallback: defaults read -g AppleInterfaceStyle
+    // Dark  → exit 0, stdout = "Dark\n"
+    // Light → exit 1, empty stdout (key does not exist)
+    if let Ok(output) = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+        if output.status.success() && s.contains("dark") {
+            return Some(false); // dark mode
+        }
+        if !output.status.success() && s.is_empty() {
+            return Some(true); // light mode (key absent)
+        }
+        // Unexpected output — don't guess.
+    }
+
+    None
 }
 
 // ── OSC 11 detection ─────────────────────────────────────────────────────────

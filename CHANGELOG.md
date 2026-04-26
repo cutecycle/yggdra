@@ -5,6 +5,53 @@ All notable changes to Yggdra will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-04-26
+
+### Added
+
+- **Session notes persistence**: `/compress` now writes the summary to
+  `.yggdra/session_notes.md`. On startup, if that file exists, its contents
+  are injected into the system prompt under `### SESSION NOTES` so the agent
+  retains context across session restarts without re-reading the full history.
+- **Untracked file detection in shell tool**: `git diff` is silent for new
+  untracked files, causing the previous stale-diff fallback to show the last
+  commit instead — confusing the agent into infinite retry loops (e.g. writing
+  the same file 10+ times). The shell tool now runs
+  `git ls-files --others --exclude-standard` and surfaces new files as
+  `new files: src/foo.rs` in the tool output. The `git show HEAD` fallback is
+  now scoped to commands that contain `git commit/push/merge/rebase`.
+
+### Fixed
+
+- **`<commit_message>` tag accepted**: The XML parser for the `commit` tool
+  only accepted `<message>` but models frequently emit `<commit_message>`.
+  Both tags are now accepted, preventing every agent commit attempt from
+  failing with "empty commit message".
+- **OpenRouter 400 errors no longer trigger retry loops**: When OpenRouter
+  returns a 400 (e.g. context too long), `async_openai` fails to deserialize
+  the response because the `code` field is an integer rather than a string.
+  This previously produced a cryptic error that was treated as transient and
+  retried up to 4 times before the circuit breaker fired. The new
+  `extract_provider_error()` helper detects this pattern, extracts the
+  human-readable message from the embedded JSON, and pauses immediately with
+  `"⏸️ Provider error (will not retry): …"`.
+- **macOS `/theme auto` now correctly detects dark mode**: Detection fell
+  through to the `COLORFGBG` environment variable when `defaults read -g
+  AppleInterfaceStyle` failed (e.g. sandbox, spawn error), returning the wrong
+  theme. The macOS path now uses `osascript` (queries the live appearance API,
+  handles auto-appearance and MDM) as the primary method, with `defaults` as a
+  fallback, and never falls through to `COLORFGBG` on macOS.
+- **`setfile` commit messages now use relative paths**: Previously committed as
+  `setfile: /Users/name/source/repos/project/src/main.rs`; now
+  `setfile: src/main.rs`.
+
+### Tests
+
+- 712 tests total (up from 706); 6 new tests covering untracked file
+  detection, commit tag alias, and provider error extraction.
+
+---
+
 ## [0.2.4] - 2026-04-25
 
 ### Added

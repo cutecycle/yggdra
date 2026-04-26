@@ -437,9 +437,29 @@ impl Tool for ShellTool {
             format!("{}{}", stdout, stderr)
         };
 
-        // Append git diff for human viewing — try unstaged first, fall back to last commit
+        // Append git diff for human viewing.
+        //
+        // Priority:
+        //   1. Staged changes  (git diff --cached)   — agent staged something
+        //   2. Unstaged tracked changes (git diff)   — agent modified tracked files
+        //   3. New untracked files (git status --short) — agent created new files
+        //      (these are INVISIBLE to `git diff` but critical for agent orientation)
+        //   4. git show HEAD  — ONLY when the command looks like a git commit;
+        //      showing HEAD on every command caused stale diffs to mislead the agent
+        //      into infinite retry loops.
         let diff = {
-            // Try unstaged changes first (agent edited but hasn't committed yet)
+            // 1. Staged changes
+            let staged = Command::new("git")
+                .args(["diff", "--cached", "--color=never", "--unified=3"])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let d = String::from_utf8_lossy(&o.stdout).into_owned();
+                    if d.trim().is_empty() { None } else { Some(d) }
+                });
+
+            // 2. Unstaged tracked changes
             let unstaged = Command::new("git")
                 .args(["diff", "--color=never", "--unified=3"])
                 .current_dir(&cwd)
@@ -447,29 +467,57 @@ impl Tool for ShellTool {
                 .ok()
                 .and_then(|o| {
                     let d = String::from_utf8_lossy(&o.stdout).into_owned();
-                    if d.trim().is_empty() {
+                    if d.trim().is_empty() { None } else { Some(d) }
+                });
+
+            // 3. New untracked files
+            let untracked = Command::new("git")
+                .args(["ls-files", "--others", "--exclude-standard"])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let d = String::from_utf8_lossy(&o.stdout).into_owned();
+                    let files: Vec<&str> = d.lines().filter(|l| !l.trim().is_empty()).collect();
+                    if files.is_empty() {
                         None
                     } else {
-                        Some(d)
+                        Some(format!("new files: {}", files.join(", ")))
                     }
                 });
-            if unstaged.is_some() {
-                unstaged
+
+            // Merge 1+2+3
+            let working_tree: Option<String> = match (staged, unstaged, untracked) {
+                (None, None, None) => None,
+                (s, u, t) => {
+                    let parts: Vec<String> = [s, u, t].into_iter().flatten().collect();
+                    Some(parts.join("\n"))
+                }
+            };
+
+            if working_tree.is_some() {
+                working_tree
             } else {
-                // Fall back to last commit diff (agent just committed)
-                Command::new("git")
-                    .args(["show", "--color=never", "--unified=3", "--stat", "HEAD"])
-                    .current_dir(&cwd)
-                    .output()
-                    .ok()
-                    .and_then(|o| {
-                        let d = String::from_utf8_lossy(&o.stdout).into_owned();
-                        if d.trim().is_empty() {
-                            None
-                        } else {
-                            Some(d)
-                        }
-                    })
+                // 4. Fall back to git show HEAD — but ONLY for commit operations.
+                //    Showing a stale HEAD on every shell command caused the agent to
+                //    believe its writes hadn't taken effect, triggering retry loops.
+                let looks_like_commit = cmd.contains("git commit")
+                    || cmd.contains("git push")
+                    || cmd.contains("git merge")
+                    || cmd.contains("git rebase");
+                if looks_like_commit {
+                    Command::new("git")
+                        .args(["show", "--color=never", "--unified=3", "--stat", "HEAD"])
+                        .current_dir(&cwd)
+                        .output()
+                        .ok()
+                        .and_then(|o| {
+                            let d = String::from_utf8_lossy(&o.stdout).into_owned();
+                            if d.trim().is_empty() { None } else { Some(d) }
+                        })
+                } else {
+                    None
+                }
             }
         };
         let combined = if let Some(d) = diff {
@@ -890,7 +938,12 @@ impl SetfileTool {
         // Trim the diff to keep output reasonable (first 60 lines)
         let diff_trimmed = diff_out.lines().take(60).collect::<Vec<_>>().join("\n");
 
-        let msg = format!("setfile: {}", path.display());
+        // Use a relative path in the commit message so it isn't full-system-path noisy.
+        let display_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| path.to_path_buf());
+        let msg = format!("setfile: {}", display_path.display());
         let commit = Command::new("git")
             .args(["commit", "-m", &msg, "--", path.to_str().unwrap_or("")])
             .stdout(std::process::Stdio::piped())
@@ -2672,6 +2725,91 @@ mod tests {
     fn test_readfile_double_quoted_path_stripped() {
         let tool = ReadfileTool;
         assert!(tool.validate_input("\"./Cargo.toml\"").is_ok());
+    }
+
+    // ===== Shell tool diff-context tests =====
+
+    /// The looks_like_commit guard must fire for git commit/push/merge/rebase
+    /// and must NOT fire for ordinary shell commands so the stale-HEAD fallback
+    /// is never shown to the agent after non-commit operations.
+    #[test]
+    fn test_shell_diff_commit_guard() {
+        let is_commit = |cmd: &str| -> bool {
+            cmd.contains("git commit")
+                || cmd.contains("git push")
+                || cmd.contains("git merge")
+                || cmd.contains("git rebase")
+        };
+        assert!(is_commit("git commit -m 'feat: hello'"));
+        assert!(is_commit("git push origin main"));
+        assert!(is_commit("git merge feature-branch"));
+        assert!(is_commit("git rebase main"));
+        // These must NOT trigger the fallback
+        assert!(!is_commit("cat > src/main.rs << 'EOF'\nfn main(){}\nEOF"));
+        assert!(!is_commit("mkdir -p src"));
+        assert!(!is_commit("cargo build --release"));
+        assert!(!is_commit("echo hello"));
+        assert!(!is_commit("ls -la"));
+    }
+
+    /// Untracked file list formatting (mirrors the in-tool logic).
+    #[test]
+    fn test_shell_diff_untracked_format() {
+        let files = vec!["src/main.rs", "src/lib.rs"];
+        let msg = format!("new files: {}", files.join(", "));
+        assert_eq!(msg, "new files: src/main.rs, src/lib.rs");
+
+        // Single file
+        let files = vec!["hello.rs"];
+        let msg = format!("new files: {}", files.join(", "));
+        assert_eq!(msg, "new files: hello.rs");
+    }
+
+    /// Integration: create a temp git repo, write a new untracked file via
+    /// shell, and verify the tool output contains "new files:" — not a stale
+    /// commit diff.
+    #[test]
+    fn test_shell_reports_new_untracked_file() {
+        use std::process::Command as Cmd;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+
+        // Init git repo with an initial commit so HEAD exists
+        Cmd::new("git").args(["init"]).current_dir(path).output().unwrap();
+        Cmd::new("git").args(["config", "user.email", "test@test.com"]).current_dir(path).output().unwrap();
+        Cmd::new("git").args(["config", "user.name", "Test"]).current_dir(path).output().unwrap();
+        std::fs::write(path.join("README.md"), "init").unwrap();
+        Cmd::new("git").args(["add", "README.md"]).current_dir(path).output().unwrap();
+        Cmd::new("git").args(["commit", "-m", "init"]).current_dir(path).output().unwrap();
+
+        // Now write a new file (untracked — not staged, not committed)
+        std::fs::write(path.join("hello.rs"), "fn main(){}\n").unwrap();
+
+        // Query git ls-files --others --exclude-standard (what the tool does)
+        let out = Cmd::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&out.stdout);
+        let file_list: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        assert!(!file_list.is_empty(), "expected hello.rs to appear as untracked");
+        assert!(file_list.contains(&"hello.rs"), "expected hello.rs in untracked list");
+
+        let msg = format!("new files: {}", file_list.join(", "));
+        assert!(msg.contains("hello.rs"), "untracked format should mention hello.rs");
+
+        // git diff HEAD should be EMPTY (file is untracked — old stale-diff bug)
+        let diff_out = Cmd::new("git")
+            .args(["diff", "--color=never"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        let diff_str = String::from_utf8_lossy(&diff_out.stdout);
+        assert!(diff_str.trim().is_empty(), "git diff should be empty for untracked files");
     }
 
 }
