@@ -2558,8 +2558,16 @@ impl App {
                             let hint = match result.tool_name.as_str() {
                                 "shell" | "exec" => {
                                     "⚠️ shell is failing repeatedly.\n\
-                                     For file writes use setfile instead (no shell escaping needed):\n\
-                                     {\"name\": \"setfile\", \"parameters\": {\"path\": \"file\", \"content\": \"content here\"}}"
+                                     For file writes use setfile (no shell escaping, no heredocs):\n\
+                                     <tool>setfile</tool>\n\
+                                     <path>src/main.rs</path>\n\
+                                     <content>file content here</content>"
+                                }
+                                "setfile" => {
+                                    "⚠️ setfile is failing repeatedly. Common mistakes:\n\
+                                     (1) Path like 'src' is a directory name — use 'src/main.rs' instead.\n\
+                                     (2) A parent path exists as a file — remove it with shell first.\n\
+                                     (3) Must close </command> tag before <desc> in XML tool calls."
                                 }
                                 _ => "⚠️ Tool failing repeatedly — try a different approach.",
                             };
