@@ -3099,6 +3099,12 @@ impl App {
         base.push_str(&self.project_context);
         base.push_str("\n⚠️ The file tree is live — go directly to relevant files.");
 
+        // Inject recently modified file contents so the model has real code to start from
+        if !self.recent_files_content.is_empty() {
+            base.push_str("\n---\n");
+            base.push_str(&self.recent_files_content);
+        }
+
         // --- Small-model-optimized state block (near generation = max recency weight) ---
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
