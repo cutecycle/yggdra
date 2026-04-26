@@ -209,7 +209,7 @@ pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
         
         // Validate tool name against the active capability profile
         if !is_valid_tool(&name) {
-            eprintln!("⚠️  Tool '{}' is not available in shell-only profile — skipping", name);
+            crate::dlog!("⚠️  Tool '{}' is not available in shell-only profile — skipping", name);
             continue;
         }
         
@@ -217,7 +217,7 @@ pub fn parse_json_tool_calls(output: &str) -> Vec<ToolCall> {
         
         // Validate parameters for known issues
         if let Some(warning) = validate_tool_params(&name, &params) {
-            eprintln!("{}", warning);
+            crate::dlog!("{}", warning);
         }
         
         let args = json_params_to_args(&name, &params);

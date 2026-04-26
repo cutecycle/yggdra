@@ -30,7 +30,7 @@ impl Session {
         } else {
             let id = Uuid::new_v4().to_string();
             fs::write(&id_path, &id)?;
-            eprintln!("🎫 Created new session: {}", id);
+            eprintln!("🎫 Created new session: {}", &id[..id.len().min(8)]);
             id
         };
 

@@ -105,7 +105,7 @@ pub fn spawn_watcher(
             ) {
                 Ok(w) => Box::new(w),
                 Err(e) => {
-                    eprintln!("Failed to create watcher: {}", e);
+                    crate::dlog!("Failed to create watcher: {}", e);
                     return;
                 }
             };
@@ -115,19 +115,19 @@ pub fn spawn_watcher(
                 cwd.join(".yggdra").as_path(),
                 RecursiveMode::NonRecursive,
             ) {
-                eprintln!("Failed to watch .yggdra directory: {}", e);
+                crate::dlog!("Failed to watch .yggdra directory: {}", e);
             }
 
             // Watch the current directory for AGENTS.md changes
             if let Err(e) = watcher.watch(cwd.as_path(), RecursiveMode::NonRecursive) {
-                eprintln!("Failed to watch cwd: {}", e);
+                crate::dlog!("Failed to watch cwd: {}", e);
             }
 
             // Watch ~/AGENTS.md for global instructions changes
             if let Some(ref global_path) = global_agents_path {
                 if let Some(home_dir) = global_path.parent() {
                     if let Err(e) = watcher.watch(home_dir, RecursiveMode::NonRecursive) {
-                        eprintln!("Failed to watch home dir for AGENTS.md: {}", e);
+                        crate::dlog!("Failed to watch home dir for AGENTS.md: {}", e);
                     }
                 }
             }
@@ -166,7 +166,7 @@ pub fn spawn_watcher(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Watch error: {}", e);
+                        crate::dlog!("Watch error: {}", e);
                     }
                 }
             }

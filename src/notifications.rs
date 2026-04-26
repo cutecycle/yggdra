@@ -69,10 +69,10 @@ fn send_notification_persistent(summary: &str, body: &str) {
 fn dispatch(summary: &str, body: &str, _timeout_ms: Option<i32>) {
     match send_via_osascript(summary, body) {
         Ok(()) => {
-            eprintln!("[NOTIFY] {}", summary);
+            crate::dlog!("[notify] {}", summary);
         }
         Err(e) => {
-            eprintln!("[NOTIFY_WARN] osascript failed ({}); falling back to notify-rust", e);
+            crate::dlog!("[notify] osascript failed ({}); falling back to notify-rust", e);
             send_via_notify_rust(summary, body, _timeout_ms);
         }
     }
@@ -139,8 +139,8 @@ fn send_via_notify_rust(summary: &str, body: &str, timeout_ms: Option<i32>) {
         }
     }
     match n.show() {
-        Ok(_) => eprintln!("[NOTIFY] {} (notify-rust)", summary),
-        Err(e) => eprintln!("[NOTIFY_ERROR] Failed to send '{}': {}", summary, e),
+        Ok(_) => crate::dlog!("[notify] {} (notify-rust)", summary),
+        Err(e) => crate::dlog!("[notify] failed to send '{}': {}", summary, e),
     }
 }
 

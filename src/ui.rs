@@ -615,10 +615,10 @@ impl App {
     ) -> Self {
         let mut message_buffer = MessageBuffer::from_db(&session.messages_db)
             .unwrap_or_else(|e| {
-                eprintln!("🌹 Failed to open messages DB: {}", e);
+                crate::dlog!("🌹 Failed to open messages DB: {}", e);
                 MessageBuffer::new(&session.messages_db)
                     .unwrap_or_else(|e2| {
-                        eprintln!("🌹 FATAL: Cannot create message database at {:?}: {}", session.messages_db, e2);
+                        crate::dlog!("🌹 FATAL: Cannot create message database at {:?}: {}", session.messages_db, e2);
                         std::process::exit(1);
                     })
             });
@@ -626,10 +626,10 @@ impl App {
         let _ = message_buffer.purge_kicks();
         let task_manager = TaskManager::from_db(&session.tasks_db)
             .unwrap_or_else(|e| {
-                eprintln!("🌹 Failed to open tasks DB: {}", e);
+                crate::dlog!("🌹 Failed to open tasks DB: {}", e);
                 TaskManager::new(&session.tasks_db)
                     .unwrap_or_else(|e2| {
-                        eprintln!("🌹 FATAL: Cannot create task database at {:?}: {}", session.tasks_db, e2);
+                        crate::dlog!("🌹 FATAL: Cannot create task database at {:?}: {}", session.tasks_db, e2);
                         std::process::exit(1);
                     })
             });
@@ -1200,9 +1200,9 @@ impl App {
         };
 
         // Stall detection: abort if Ollama goes silent mid-stream.
-        // Prefill can be slow for large contexts; generation stalls are less expected.
-        const PREFILL_TIMEOUT_SECS: u64 = u64::MAX; // no prefill timeout — model loading can take arbitrarily long
-        const STALL_TIMEOUT_SECS: u64 = u64::MAX;  // no generation stall timeout — slow hardware
+        // Prefill can be slow for large contexts; give generous but finite limits.
+        const PREFILL_TIMEOUT_SECS: u64 = 120; // 2 min for model load + first token
+        const STALL_TIMEOUT_SECS: u64 = 30;    // 30s without a new token = hung
 
         let now = std::time::Instant::now();
         let stall_timeout = if self.streaming_text.is_empty() {
@@ -2679,7 +2679,7 @@ impl App {
             Ok(Some(gap)) => {
                 self.gap_rx = None;
                 if let Err(e) = crate::gaps::record_gap(&gap) {
-                    eprintln!("Failed to record gap: {}", e);
+                    crate::dlog!("Failed to record gap: {}", e);
                 } else {
                     self.push_agent_notice(format!("ℹ️  I wish I knew: {}", gap.content));
                 }
@@ -3091,11 +3091,11 @@ impl App {
 
         // Archive everything, then re-insert the kept messages
         if let Err(e) = self.message_buffer.archive_to_scrollback() {
-            eprintln!("Autocompact archive failed: {}", e);
+            crate::dlog!("Autocompact archive failed: {}", e);
             return;
         }
         if let Err(e) = self.message_buffer.add_multiple(&kept) {
-            eprintln!("Autocompact re-insert failed: {}", e);
+            crate::dlog!("Autocompact re-insert failed: {}", e);
             return;
         }
 
@@ -4157,7 +4157,7 @@ impl App {
                         let model_name = raw.split_whitespace().next().unwrap_or(&raw).to_string();
                         self.config.model = model_name.clone();
                         if let Err(e) = self.config.save() {
-                            eprintln!("⚠️ Failed to save config: {}", e);
+                            crate::dlog!("Failed to save config: {}", e);
                         }
                         let endpoint = self.config.endpoint.clone();
                         match OllamaClient::new_with_key(&endpoint, &model_name, self.config.api_key.as_deref()).await {
@@ -5243,7 +5243,7 @@ impl App {
         let context_msg = Message::new("user",
             format!("I just ran this shell command:\n```\n$ {cmd}\n```\nOutput (exit {code}):\n```\n{combined}\n```"));
         if let Err(e) = self.message_buffer.add_and_persist(context_msg) {
-            eprintln!("Failed to save shell context: {}", e);
+            crate::dlog!("Failed to save shell context: {}", e);
             return;
         }
         self.cached_message_count = self.message_buffer.count().unwrap_or(0);
@@ -6084,7 +6084,7 @@ impl App {
         // Save user message
         let user_msg = Message::new("user", message.to_string());
         if let Err(e) = self.message_buffer.add_and_persist(user_msg) {
-            eprintln!("Failed to save user message: {}", e);
+            crate::dlog!("Failed to save user message: {}", e);
             self.notify(format!("❌ Storage error: {}", self.friendly_error(&e.to_string())));
             return;
         }

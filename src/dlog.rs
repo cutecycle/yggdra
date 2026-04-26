@@ -19,7 +19,7 @@ pub fn init() {
             let _ = LOG.set(Mutex::new(BufWriter::new(f)));
             log("=== yggdra debug log started ===");
         }
-        Err(e) => eprintln!("[dlog] failed to open debug.log: {e}"),
+        Err(e) => { let _ = e; } // silently skip — can't eprintln during TUI
     }
 }
 

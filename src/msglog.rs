@@ -70,12 +70,12 @@ pub fn start(log_dir: PathBuf) -> LogSender {
             // Create parent directory tree, then write atomically.
             if let Some(parent) = path.parent() {
                 if let Err(e) = fs::create_dir_all(parent).await {
-                    eprintln!("log: failed to create dir {:?}: {}", parent, e);
+                    crate::dlog!("log: failed to create dir {:?}: {}", parent, e);
                     continue;
                 }
             }
             if let Err(e) = fs::write(&path, markdown.as_bytes()).await {
-                eprintln!("log: failed to write {:?}: {}", path, e);
+                crate::dlog!("log: failed to write {:?}: {}", path, e);
             }
         }
     });

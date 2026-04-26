@@ -819,12 +819,20 @@ impl OllamaClient {
         match &self.backend {
             Backend::Ollama { endpoint } => {
                 let url = format!("{}/api/tags", endpoint);
-                let response = self.http_client.get(&url).send().await
+                let response = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.http_client.get(&url).send()
+                ).await
+                    .map_err(|_| anyhow!("Timed out connecting to Ollama at {}", endpoint))?
                     .map_err(|e| anyhow!("Failed to connect to Ollama at {}: {}", endpoint, e))?;
                 if !response.status().is_success() {
                     return Err(anyhow!("Ollama returned error: {}", response.status()));
                 }
-                let data: ModelsResponse = response.json().await
+                let data: ModelsResponse = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    response.json()
+                ).await
+                    .map_err(|_| anyhow!("Timed out reading models response"))?
                     .map_err(|e| anyhow!("Failed to parse models response: {}", e))?;
                 Ok(data.models)
             }
@@ -835,19 +843,28 @@ impl OllamaClient {
                 } else {
                     format!("{}/v1/models", base)
                 };
-                let response = self.http_client.get(&url)
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .header("Content-Type", "application/json")
-                    .send().await
+                let response = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.http_client.get(&url)
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("Content-Type", "application/json")
+                        .send()
+                ).await
+                    .map_err(|_| anyhow!("Timed out connecting to {}", endpoint))?
                     .map_err(|e| anyhow!("Failed to connect to {} : {}", endpoint, e))?;
                 if !response.status().is_success() {
                     let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
+                    let body = tokio::time::timeout(Duration::from_secs(5), response.text())
+                        .await.ok().and_then(|r| r.ok()).unwrap_or_default();
                     return Err(anyhow!("OpenAI endpoint returned {}: {}", status, body));
                 }
                 #[derive(Deserialize)] struct OAIModelsResp { data: Vec<OAIModelEntry> }
                 #[derive(Deserialize)] struct OAIModelEntry { id: String }
-                let data: OAIModelsResp = response.json().await
+                let data: OAIModelsResp = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    response.json()
+                ).await
+                    .map_err(|_| anyhow!("Timed out reading models response"))?
                     .map_err(|e| anyhow!("Failed to parse models response: {}", e))?;
                 Ok(data.data.into_iter().map(|m| ModelInfo { name: m.id, modified_at: None, size: None }).collect())
             }
@@ -855,15 +872,15 @@ impl OllamaClient {
                 // Try the OpenAI-compatible /v1/models endpoint; fall back to placeholder
                 let base = endpoint.trim_end_matches('/');
                 let url = format!("{}/v1/models", base);
-                match self.http_client.get(&url).send().await {
-                    Ok(response) if response.status().is_success() => {
+                match tokio::time::timeout(Duration::from_secs(15), self.http_client.get(&url).send()).await {
+                    Ok(Ok(response)) if response.status().is_success() => {
                         #[derive(Deserialize)] struct LCModelsResp { data: Vec<LCModelEntry> }
                         #[derive(Deserialize)] struct LCModelEntry { id: String }
-                        match response.json::<LCModelsResp>().await {
-                            Ok(data) => Ok(data.data.into_iter()
+                        match tokio::time::timeout(Duration::from_secs(10), response.json::<LCModelsResp>()).await {
+                            Ok(Ok(data)) => Ok(data.data.into_iter()
                                 .map(|m| ModelInfo { name: m.id, modified_at: None, size: None })
                                 .collect()),
-                            Err(_) => Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }]),
+                            _ => Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }]),
                         }
                     }
                     _ => Ok(vec![ModelInfo { name: self.model.clone(), modified_at: None, size: None }]),
@@ -891,8 +908,14 @@ impl OllamaClient {
         }
         let url = format!("{}/api/show", endpoint);
         let body = serde_json::json!({"model": self.model});
-        let resp = client.post(&url).json(&body).send().await.ok()?;
-        let show: ShowResponse = resp.json().await.ok()?;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.post(&url).json(&body).send()
+        ).await.ok()?.ok()?;
+        let show: ShowResponse = tokio::time::timeout(
+            Duration::from_secs(10),
+            resp.json()
+        ).await.ok()?.ok()?;
 
         let thinks = show.capabilities.iter().any(|c| c == "thinking");
         if let Ok(mut guard) = self.supports_thinking.lock() {
