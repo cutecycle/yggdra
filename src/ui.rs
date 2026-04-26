@@ -1242,7 +1242,10 @@ impl App {
             .unwrap_or(now);
         if !in_prefill && last_activity.elapsed().as_secs() > STALL_TIMEOUT_SECS {
             if self.mode == AppMode::Forever {
-                self.push_agent_notice(format!("⚠️ Stream stalled ({}s) — retrying in Forever mode", STALL_TIMEOUT_SECS));
+                self.forever_retry_notice(
+                    format!("⚠️ Stream stalled ({}s) — retrying", STALL_TIMEOUT_SECS),
+                    false,
+                );
             } else {
                 self.notify(format!("⏱ Stream stalled during generation ({}s) — aborting", STALL_TIMEOUT_SECS));
             }
@@ -1348,9 +1351,9 @@ impl App {
                     if matches!(self.mode, AppMode::Forever | AppMode::One) {
                         self.consecutive_empty_kicks += 1;
                         if self.mode == AppMode::Forever {
-                            // Forever mode never pauses — always retry
+                            // Forever mode never pauses — always retry, throttle notices
                             let msg = format!("⚠️ Stream error (retrying): {}", clean_error);
-                            self.push_agent_notice(msg);
+                            self.forever_retry_notice(msg, false);
                             self.inject_continue_kick();
                         } else if is_fatal || self.consecutive_empty_kicks >= 5 || self.autokick_paused {
                             self.autokick_paused = true;
@@ -1474,7 +1477,10 @@ impl App {
                 }
                 StreamEndAction::Halt(reason) => {
                     if self.mode == AppMode::Forever {
-                        self.push_agent_notice(format!("⚠️ Model stuck ({reason}) — kicking (Forever mode never stops)."));
+                        self.forever_retry_notice(
+                            format!("⚠️ Model stuck ({reason}) — kicking"),
+                            false,
+                        );
                         self.inject_continue_kick();
                     } else {
                         self.autokick_paused = true;
@@ -1630,7 +1636,7 @@ impl App {
             // Don't retry generation — message wasn't persisted, context is stale
             if self.mode == AppMode::Forever {
                 // Can't persist the message — log and keep going
-                self.push_agent_notice("⚠️ Storage error in Forever mode — message not saved, continuing.".to_string());
+                self.forever_retry_notice("⚠️ Storage error — message not saved, continuing", false);
                 self.inject_continue_kick();
             } else {
                 self.autokick_paused = true;
@@ -1640,6 +1646,8 @@ impl App {
         }
         self.cached_message_count = self.message_buffer.count()
             .unwrap_or(self.cached_message_count + 1);
+        // Successful turn — reset retry-notice throttle
+        self.spin_notice_count = 0;
 
         // Warn if context window is filling up
         self.check_context_pressure();
@@ -1990,8 +1998,9 @@ impl App {
                 if self.consecutive_format_errors >= 2 {
                     self.consecutive_format_errors = 0;
                     if self.mode == AppMode::Forever {
-                        self.push_agent_notice(
-                            "⚠️ Repeated format errors — injecting correction and continuing (Forever mode never stops).".to_string()
+                        self.forever_retry_notice(
+                            "⚠️ Repeated format errors — injecting correction",
+                            false,
                         );
                         self.inject_continue_kick();
                         self.turn_phase = TurnPhase::Idle;
@@ -2082,7 +2091,10 @@ impl App {
                     }
                     StreamEndAction::Halt(reason) => {
                         if self.mode == AppMode::Forever {
-                            self.push_agent_notice(format!("⚠️ Model stuck ({reason}) — kicking (Forever mode never stops)."));
+                            self.forever_retry_notice(
+                                format!("⚠️ Model stuck ({reason}) — kicking"),
+                                false,
+                            );
                             self.inject_continue_kick();
                         } else {
                             self.autokick_paused = true;
@@ -2127,6 +2139,23 @@ impl App {
         self.consecutive_empty_kicks = 0;
         self.autokick_paused = false;
         self.needs_full_redraw = true;
+    }
+
+    /// Push a notice for a Forever-mode retry, throttled to avoid chat spam.
+    /// Shows on the 1st retry, then every 5th. Pass `reset=true` on success to clear the counter.
+    fn forever_retry_notice(&mut self, msg: impl Into<String>, reset: bool) {
+        if reset {
+            self.spin_notice_count = 0;
+            return;
+        }
+        self.spin_notice_count = self.spin_notice_count.saturating_add(1);
+        let n = self.spin_notice_count;
+        if n == 1 {
+            self.push_agent_notice(msg.into());
+        } else if n % 5 == 0 {
+            self.push_agent_notice(format!("{} (retry #{})", msg.into(), n));
+        }
+        // else: silent retry
     }
 
     fn inject_continue_kick(&mut self) {
