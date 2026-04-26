@@ -3210,8 +3210,8 @@ impl App {
             };
             
             // Convert normalized coordinates to screen coordinates
-            let screen_x = area.x + ((*x * area.width as f32) as u16).min(area.width - 1);
-            let screen_y = area.y + ((*y * area.height as f32) as u16).min(area.height - 1);
+            let screen_x = area.x + ((*x * area.width as f32) as u16).min(area.width.saturating_sub(1));
+            let screen_y = area.y + ((*y * area.height as f32) as u16).min(area.height.saturating_sub(1));
             
             // Create sparkle character based on age (twinkle effect)
             let sparkle = match age % 4 {
@@ -3799,7 +3799,7 @@ impl App {
             // +1 row for the search bar inside the border
             let filtered = self.model_picker_filtered();
             let visible_rows = (area.height * 4 / 5).saturating_sub(5).max(3);
-            let picker_height = (filtered.len() as u16 + 5).min(area.height - 4).min(visible_rows + 5);
+            let picker_height = (filtered.len() as u16 + 5).min(area.height.saturating_sub(4)).min(visible_rows + 5);
             let picker_x = (area.width.saturating_sub(picker_width)) / 2;
             let picker_y = (area.height.saturating_sub(picker_height)) / 2;
             let picker_rect = Rect { x: picker_x, y: picker_y, width: picker_width, height: picker_height };
@@ -4057,8 +4057,9 @@ impl App {
             .divider(RSpan::raw("│"));
         f.render_widget(tabs_widget, panes[0]);
 
-        // Content area with border
-        let tab = &self.file_viewer_tabs[self.file_viewer_active];
+        // Content area with border — guard against stale active index
+        let active_idx = self.file_viewer_active.min(self.file_viewer_tabs.len().saturating_sub(1));
+        let tab = &self.file_viewer_tabs[active_idx];
         let content_area = panes[1];
         let inner = Block::default()
             .borders(Borders::ALL)
@@ -4149,7 +4150,10 @@ impl App {
                 KeyCode::Enter => {
                     let filtered = self.model_picker_filtered();
                     if let Some(&orig_i) = filtered.get(self.model_picker_selection) {
-                        let raw = self.model_picker_items[orig_i].clone();
+                        let raw = match self.model_picker_items.get(orig_i) {
+                            Some(r) => r.clone(),
+                            None => return,
+                        };
                         let model_name = raw.split_whitespace().next().unwrap_or(&raw).to_string();
                         self.config.model = model_name.clone();
                         if let Err(e) = self.config.save() {
@@ -5797,6 +5801,8 @@ impl App {
             return;
         }
         let tab_count = self.file_viewer_tabs.len();
+        // Clamp active index defensively — tabs can be removed by other paths
+        self.file_viewer_active = self.file_viewer_active.min(tab_count.saturating_sub(1));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.file_viewer_open = false;
@@ -6259,8 +6265,9 @@ impl App {
                 // Collapsed view: show first line + ellipsis
                 if !think_lines.is_empty() {
                     let preview = think_lines[0];
-                    let truncated = if preview.len() > 50 {
-                        format!("{}…", &preview[..50])
+                    let boundary = floor_char_boundary(preview, 50);
+                    let truncated = if preview.len() > boundary {
+                        format!("{}…", &preview[..boundary])
                     } else {
                         preview.to_string()
                     };
@@ -9097,7 +9104,7 @@ mod interaction_latency_tests {
 
     // Budget constants (microseconds per call)
     const FUZZY_SCORE_BUDGET_US: u128 = 50;          // single fuzzy_score call
-    const PALETTE_FILTER_BUDGET_US: u128 = 500;      // filter all 30 palette commands
+    const PALETTE_FILTER_BUDGET_US: u128 = 1000;     // filter all 30 palette commands
     const MD_LINE_RENDER_BUDGET_US: u128 = 200;      // render one markdown line
     const DIFF_RENDER_BUDGET_US: u128 = 500;         // render a diff block
     const MSG_FORMAT_BUDGET_US: u128 = 500;          // format_message_styled

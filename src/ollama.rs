@@ -895,7 +895,9 @@ impl OllamaClient {
         let show: ShowResponse = resp.json().await.ok()?;
 
         let thinks = show.capabilities.iter().any(|c| c == "thinking");
-        *self.supports_thinking.lock().unwrap() = Some(thinks);
+        if let Ok(mut guard) = self.supports_thinking.lock() {
+            *guard = Some(thinks);
+        }
         dlog!("🧠 {} supports_thinking={}", self.model, thinks);
 
         let info = show.model_info?;
@@ -903,19 +905,21 @@ impl OllamaClient {
             .find(|(k, _)| k.ends_with(".context_length"))
             .and_then(|(_, v)| v.as_u64())
             .map(|v| v as u32)?;
-        *self.native_ctx.lock().unwrap() = Some(ctx);
+        if let Ok(mut guard) = self.native_ctx.lock() {
+            *guard = Some(ctx);
+        }
         dlog!("🔍 native context for {}: {}", self.model, ctx);
         Some(ctx)
     }
 
     /// Return the previously fetched native context length (None if fetch_native_ctx not yet called).
     pub fn get_native_ctx(&self) -> Option<u32> {
-        *self.native_ctx.lock().unwrap()
+        self.native_ctx.lock().ok().and_then(|g| *g)
     }
 
     /// Whether the model supports native thinking (detected via /api/show capabilities).
     pub fn supports_thinking(&self) -> bool {
-        self.supports_thinking.lock().unwrap().unwrap_or(false)
+        self.supports_thinking.lock().ok().and_then(|g| *g).unwrap_or(false)
     }
 
     /// Resolve the `think` parameter: if user explicitly set it, use that;
