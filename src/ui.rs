@@ -1473,10 +1473,15 @@ impl App {
                     self.complete_one_mode(reason);
                 }
                 StreamEndAction::Halt(reason) => {
-                    self.autokick_paused = true;
-                    self.push_agent_notice(
-                        format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
-                    );
+                    if self.mode == AppMode::Forever {
+                        self.push_agent_notice(format!("⚠️ Model stuck ({reason}) — kicking (Forever mode never stops)."));
+                        self.inject_continue_kick();
+                    } else {
+                        self.autokick_paused = true;
+                        self.push_agent_notice(
+                            format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
+                        );
+                    }
                 }
                 StreamEndAction::Kick => {
                     if self.consecutive_empty_kicks == 3 {
@@ -1981,9 +1986,18 @@ impl App {
                  // show the model exactly what the correct XML would have looked like.
                  self.consecutive_format_errors += 1;
 
-                // After 2 consecutive format errors: give up injecting and switch to Ask mode
+                // After 2 consecutive format errors: give up and pause (or kick in Forever)
                 if self.consecutive_format_errors >= 2 {
                     self.consecutive_format_errors = 0;
+                    if self.mode == AppMode::Forever {
+                        self.push_agent_notice(
+                            "⚠️ Repeated format errors — injecting correction and continuing (Forever mode never stops).".to_string()
+                        );
+                        self.inject_continue_kick();
+                        self.turn_phase = TurnPhase::Idle;
+                        self.stream_rx = None;
+                        return;
+                    }
                     let msg = format!(
                         "🤖 Agent gave up after {} format correction attempts — switching to Ask mode.\n\
                          The agent sent prose instead of a tool call. You can give new instructions or \
@@ -2067,10 +2081,15 @@ impl App {
                         return;
                     }
                     StreamEndAction::Halt(reason) => {
-                        self.autokick_paused = true;
-                        self.push_agent_notice(
-                            format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
-                        );
+                        if self.mode == AppMode::Forever {
+                            self.push_agent_notice(format!("⚠️ Model stuck ({reason}) — kicking (Forever mode never stops)."));
+                            self.inject_continue_kick();
+                        } else {
+                            self.autokick_paused = true;
+                            self.push_agent_notice(
+                                format!("⏸️ Model not producing output ({reason}) — pausing. Send a message to resume.")
+                            );
+                        }
                     }
                     StreamEndAction::Kick => {
                         if self.consecutive_empty_kicks == 3 {
@@ -3694,9 +3713,9 @@ impl App {
                 .scroll((partial_skip, 0));
 
             let msg_area = Rect {
-                x: messages_area.x + 1,
+                x: messages_area.x + 3,
                 y: current_y,
-                width: messages_area.width.saturating_sub(2),
+                width: messages_area.width.saturating_sub(6),
                 height: draw_height,
             };
 
@@ -6427,11 +6446,11 @@ impl App {
             if !is_collapsed {
                 for tl in &think_lines {
                     lines.push(RLine::from(vec![
-                        Span::styled(format!("  {}", tl), dim),
+                        Span::styled(format!("   {}", tl), dim),
                     ]));
                 }
                 // Separator after thinking block
-                lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
+                lines.push(RLine::from(vec![Span::styled("   ·".to_string(), dim)]));
             } else {
                 // Collapsed view: show first line + ellipsis
                 if !think_lines.is_empty() {
@@ -6443,11 +6462,11 @@ impl App {
                         preview.to_string()
                     };
                     lines.push(RLine::from(vec![
-                        Span::styled(format!("  {}", truncated), dim),
+                        Span::styled(format!("   {}", truncated), dim),
                     ]));
                 }
                 // Separator for collapsed block
-                lines.push(RLine::from(vec![Span::styled("  ·".to_string(), dim)]));
+                lines.push(RLine::from(vec![Span::styled("   ·".to_string(), dim)]));
             }
         }
 
@@ -6467,23 +6486,8 @@ impl App {
                             lines.push(RLine::from(format!("{} {}", content_emoji, raw_line)));
                             first_prose = false;
                         } else {
-                            lines.push(RLine::from(raw_line.to_string()));
+                            lines.push(RLine::from(format!("   {}", raw_line)));
                         }
-                    }
-                }
-                // Render prettified tool call box
-                let mut first_box = prose.is_empty();
-                for pl in pretty_lines {
-                    if first_box {
-                        // Prepend emoji to the first box line
-                        let mut spans = vec![ratatui::text::Span::raw(format!("{} ", content_emoji))];
-                        spans.extend(pl.spans.into_iter().map(|s| {
-                            ratatui::text::Span::styled(s.content.into_owned(), s.style)
-                        }));
-                        lines.push(RLine::from(spans));
-                        first_box = false;
-                    } else {
-                        lines.push(pl);
                     }
                 }
                 return RText::from(lines);
@@ -6581,7 +6585,10 @@ impl App {
                             lines.push(RLine::from(spans));
                             first_line = false;
                         } else {
-                            lines.push(md_line);
+                            // Indent continuation lines to align with content after emoji (~3 cols)
+                            let mut spans = vec![Span::raw("   ")];
+                            spans.extend(md_line.spans.into_iter());
+                            lines.push(RLine::from(spans));
                         }
                     }
                     line_idx += 1;
@@ -7749,7 +7756,7 @@ pub(crate) fn format_message_styled(
                         lines.push(RLine::from(format!("{} {}", content_emoji, raw_line)));
                         first_prose = false;
                     } else {
-                        lines.push(RLine::from(raw_line.to_string()));
+                        lines.push(RLine::from(format!("   {}", raw_line)));
                     }
                 }
             }
@@ -7861,7 +7868,10 @@ pub(crate) fn format_message_styled(
                         lines.push(RLine::from(spans));
                         first_line = false;
                     } else {
-                        lines.push(md_line);
+                        // Indent continuation lines to align with content after emoji (~3 cols)
+                        let mut spans = vec![Span::raw("   ")];
+                        spans.extend(md_line.spans.into_iter());
+                        lines.push(RLine::from(spans));
                     }
                 }
                 line_idx += 1;
