@@ -77,4 +77,74 @@ mod tests {
         assert!(formatted.contains("[TOOL_OUTPUT:"));
         assert!(formatted.contains("success"));
     }
+
+    // ===== Additional tests =====
+
+    #[test]
+    fn test_no_execution_directive_content() {
+        let dir = SteeringDirective::no_execution();
+        let formatted = dir.format_for_system_prompt();
+        assert!(formatted.contains("cannot execute"), "no_execution must mention restriction");
+    }
+
+    #[test]
+    fn test_tool_response_directive_content() {
+        let dir = SteeringDirective::tool_response();
+        let formatted = dir.format_for_system_prompt();
+        assert!(!formatted.is_empty());
+        assert!(formatted.contains("tool"), "tool_response directive must mention 'tool'");
+    }
+
+    #[test]
+    fn test_custom_directive_exact_content() {
+        let dir = SteeringDirective::custom("Do not repeat yourself");
+        assert_eq!(dir.format_for_system_prompt(), "Do not repeat yourself");
+    }
+
+    #[test]
+    fn test_custom_directive_empty_string() {
+        let dir = SteeringDirective::custom("");
+        assert_eq!(dir.format_for_system_prompt(), "");
+    }
+
+    #[test]
+    fn test_format_with_tool_output_structure() {
+        let dir = SteeringDirective::custom("my constraint");
+        let formatted = dir.format_with_tool_output("output data");
+        assert!(formatted.contains("[STEERING:"), "must have STEERING tag");
+        assert!(formatted.contains("[TOOL_OUTPUT:"), "must have TOOL_OUTPUT tag");
+        assert!(formatted.contains("[END_STEERING]"), "must have END_STEERING tag");
+        assert!(formatted.contains("my constraint"));
+        assert!(formatted.contains("output data"));
+    }
+
+    #[test]
+    fn test_format_with_tool_output_empty_output() {
+        let dir = SteeringDirective::json_output();
+        let formatted = dir.format_with_tool_output("");
+        // Should not panic with empty tool output
+        assert!(formatted.contains("[TOOL_OUTPUT:"));
+    }
+
+    #[test]
+    fn test_format_with_tool_output_special_chars() {
+        let dir = SteeringDirective::custom("c");
+        let output = "line1\nline2\ttabbed\n\"quoted\"";
+        let formatted = dir.format_with_tool_output(output);
+        assert!(formatted.contains("line1\nline2\ttabbed"));
+    }
+
+    #[test]
+    fn test_json_output_directive_exact_content() {
+        let dir = SteeringDirective::json_output();
+        let s = dir.format_for_system_prompt();
+        assert!(s.contains("JSON"), "json_output must mention JSON");
+    }
+
+    #[test]
+    fn test_all_constructors_produce_non_empty_constraints() {
+        assert!(!SteeringDirective::json_output().constraint.is_empty());
+        assert!(!SteeringDirective::tool_response().constraint.is_empty());
+        assert!(!SteeringDirective::no_execution().constraint.is_empty());
+    }
 }

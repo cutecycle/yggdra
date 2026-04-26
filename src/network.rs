@@ -183,4 +183,137 @@ mod tests {
         let ep2 = ep1.clone();
         assert_eq!(ep1.as_string(), ep2.as_string());
     }
+
+    // ===== URL with path component =====
+
+    #[test]
+    fn test_valid_localhost_with_path() {
+        assert!(validate_endpoint("http://localhost:11434/api/generate").is_ok());
+        assert!(validate_endpoint("http://127.0.0.1:11434/v1/chat/completions").is_ok());
+    }
+
+    #[test]
+    fn test_valid_localhost_no_port() {
+        // No port is fine — default 80/443
+        assert!(validate_endpoint("http://localhost/api").is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv4_port_zero() {
+        // Port 0 is unusual but syntactically valid
+        assert!(validate_endpoint("http://127.0.0.1:0").is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv4_max_port() {
+        assert!(validate_endpoint("http://127.0.0.1:65535").is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv4_full_loopback_range() {
+        // 127.0.0.1 through 127.255.255.255 should all be valid
+        assert!(validate_endpoint("http://127.0.0.2:8080").is_ok());
+        assert!(validate_endpoint("http://127.128.0.1:9000").is_ok());
+        assert!(validate_endpoint("http://127.255.255.254:1234").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_ipv4_zero_address() {
+        assert!(validate_endpoint("http://0.0.0.0:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_ipv4_broadcast() {
+        assert!(validate_endpoint("http://255.255.255.255:80").is_err());
+    }
+
+    #[test]
+    fn test_invalid_ipv4_private_class_a() {
+        assert!(validate_endpoint("http://10.0.0.1:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_ipv4_private_class_b() {
+        assert!(validate_endpoint("http://172.16.0.1:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_ipv4_private_class_c() {
+        assert!(validate_endpoint("http://192.168.0.1:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_ipv6_non_loopback() {
+        assert!(validate_endpoint("http://[::2]:8080").is_err());
+        assert!(validate_endpoint("http://[fe80::1]:8080").is_err());
+        assert!(validate_endpoint("http://[2001:db8::1]:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_domain_subdomain_of_localhost() {
+        // "api.localhost" is NOT the same as "localhost"
+        assert!(validate_endpoint("http://api.localhost:8080").is_err());
+    }
+
+    #[test]
+    fn test_invalid_domain_with_localhost_substring() {
+        // "notlocalhost.com" must not be accepted
+        assert!(validate_endpoint("http://notlocalhost.com:80").is_err());
+        assert!(validate_endpoint("http://localhost.example.com:80").is_err());
+    }
+
+    #[test]
+    fn test_invalid_empty_string() {
+        assert!(validate_endpoint("").is_err());
+    }
+
+    #[test]
+    fn test_invalid_just_scheme() {
+        assert!(validate_endpoint("http://").is_err());
+    }
+
+    #[test]
+    fn test_invalid_no_scheme() {
+        assert!(validate_endpoint("localhost:11434").is_err());
+    }
+
+    #[test]
+    fn test_invalid_file_scheme() {
+        assert!(validate_endpoint("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_invalid_data_uri() {
+        assert!(validate_endpoint("data:text/plain,hello").is_err());
+    }
+
+    #[test]
+    fn test_valid_https_localhost() {
+        assert!(validate_endpoint("https://localhost:8443").is_ok());
+        assert!(validate_endpoint("https://127.0.0.1:8443").is_ok());
+    }
+
+    #[test]
+    fn test_valid_https_ipv6_loopback() {
+        assert!(validate_endpoint("https://[::1]:8443").is_ok());
+    }
+
+    #[test]
+    fn test_localhost_localdomain_valid() {
+        assert!(validate_endpoint("http://localhost.localdomain:8080").is_ok());
+    }
+
+    #[test]
+    fn test_inference_endpoint_exposes_client() {
+        let ep = InferenceEndpoint::new("http://127.0.0.1:11434").unwrap();
+        // client() must return a valid client reference without panicking
+        let _client = ep.client();
+    }
+
+    #[test]
+    fn test_inference_endpoint_as_string_roundtrip() {
+        let url = "http://localhost:11434";
+        let ep = InferenceEndpoint::new(url).unwrap();
+        assert_eq!(ep.as_string(), url);
+    }
 }

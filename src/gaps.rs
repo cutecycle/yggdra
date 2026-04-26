@@ -135,4 +135,74 @@ mod tests {
 
         let _ = fs::remove_file(&file_path);
     }
+
+    // ===== Additional tests =====
+
+    #[test]
+    fn test_gap_format_bracket_timestamp() {
+        let tmp = std::env::temp_dir().join(format!("yggdra_gap_fmt_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("gaps");
+        let gap = Gap {
+            timestamp: "2026-04-01 12:00:00".to_string(),
+            content: "specific dependency version".to_string(),
+        };
+        let mut f = OpenOptions::new().create(true).append(true).open(&file_path).unwrap();
+        writeln!(f, "[{}] {}", gap.timestamp, gap.content).unwrap();
+        let line = fs::read_to_string(&file_path).unwrap();
+        assert!(line.starts_with('['), "gap line must start with '['");
+        assert!(line.contains("] "), "gap line must have '] ' separator");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_gap_content_preserved_exactly() {
+        let tmp = std::env::temp_dir().join(format!("yggdra_gap_exact_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("gaps");
+        let content = "the exact API version of serde_json being used";
+        let gap = Gap { timestamp: "t".to_string(), content: content.to_string() };
+        let mut f = OpenOptions::new().create(true).append(true).open(&file_path).unwrap();
+        writeln!(f, "[{}] {}", gap.timestamp, gap.content).unwrap();
+        let read = fs::read_to_string(&file_path).unwrap();
+        assert!(read.contains(content), "content must be preserved: {:?}", read);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_multiple_gaps_one_per_line() {
+        let tmp = std::env::temp_dir().join(format!("yggdra_gap_multi_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("gaps");
+        let gaps = vec![
+            Gap { timestamp: "2026-01-01 00:00:00".into(), content: "gap one".into() },
+            Gap { timestamp: "2026-01-01 00:01:00".into(), content: "gap two".into() },
+            Gap { timestamp: "2026-01-01 00:02:00".into(), content: "gap three".into() },
+        ];
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&file_path).unwrap();
+            for g in &gaps {
+                writeln!(f, "[{}] {}", g.timestamp, g.content).unwrap();
+            }
+        }
+        let content = fs::read_to_string(&file_path).unwrap();
+        let non_empty_lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(non_empty_lines.len(), 3, "must have 3 lines, got: {}", content);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_gap_clone() {
+        let g = Gap { timestamp: "ts".into(), content: "c".into() };
+        let g2 = g.clone();
+        assert_eq!(g.timestamp, g2.timestamp);
+        assert_eq!(g.content, g2.content);
+    }
+
+    #[test]
+    fn test_gap_debug_format() {
+        let g = Gap { timestamp: "2026-01-01".into(), content: "test gap".into() };
+        let debug = format!("{:?}", g);
+        assert!(debug.contains("test gap"));
+    }
 }

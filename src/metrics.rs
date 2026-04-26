@@ -229,4 +229,89 @@ mod tests {
         assert!(status.contains("tok/s"));
         assert!(status.contains("tools"));
     }
+
+    // ===== Additional tests =====
+
+    #[test]
+    fn test_tokens_per_second_zero_duration() {
+        let tracker = MetricsTracker::new(); // no inference recorded
+        assert_eq!(tracker.tokens_per_second(), 0.0, "zero duration must yield 0 tps");
+    }
+
+    #[test]
+    fn test_tokens_per_second_precise() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_inference(500, 1000); // 500 tokens in 1 second
+        let tps = tracker.tokens_per_second();
+        assert!((tps - 500.0).abs() < 0.001, "expected 500.0 tps, got {}", tps);
+    }
+
+    #[test]
+    fn test_inference_cumulative() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_inference(100, 200);
+        tracker.record_inference(300, 800);
+        // Total: 400 tokens in 1000ms → 400 tps
+        let tps = tracker.tokens_per_second();
+        assert!((tps - 400.0).abs() < 0.001, "expected 400.0 tps, got {}", tps);
+    }
+
+    #[test]
+    fn test_tool_use_deduplication() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_tool_use("shell");
+        tracker.record_tool_use("shell");
+        tracker.record_tool_use("shell");
+        assert_eq!(tracker.tools_used().len(), 1, "duplicates should be deduplicated");
+    }
+
+    #[test]
+    fn test_tools_used_sorted_alphabetically() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_tool_use("shell");
+        tracker.record_tool_use("commit");
+        tracker.record_tool_use("rg");
+        let tools = tracker.tools_used();
+        assert_eq!(tools, vec!["commit", "rg", "shell"]);
+    }
+
+    #[test]
+    fn test_tools_used_empty() {
+        let tracker = MetricsTracker::new();
+        assert!(tracker.tools_used().is_empty());
+    }
+
+    #[test]
+    fn test_tokens_per_second_large_values() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_inference(1_000_000, 1_000); // 1M tokens in 1s = 1000 tps
+        let tps = tracker.tokens_per_second();
+        assert!((tps - 1_000_000.0).abs() < 1.0, "got {}", tps);
+    }
+
+    #[test]
+    fn test_format_detailed_contains_tools_section() {
+        let mut tracker = MetricsTracker::new();
+        tracker.record_tool_use("rg");
+        tracker.record_inference(100, 200);
+        let detailed = tracker.format_detailed();
+        assert!(detailed.contains("rg"), "detailed output must list tool names");
+        assert!(detailed.contains("tok/s"), "detailed must show inference speed");
+    }
+
+    #[test]
+    fn test_format_detailed_contains_metrics_header() {
+        let tracker = MetricsTracker::new();
+        let detailed = tracker.format_detailed();
+        assert!(detailed.contains("METRICS"), "must have metrics header");
+    }
+
+    #[test]
+    fn test_default_same_as_new() {
+        let a = MetricsTracker::new();
+        let b = MetricsTracker::default();
+        // Both should start with same state (0 tokens, empty tools)
+        assert_eq!(a.tokens_per_second(), b.tokens_per_second());
+        assert_eq!(a.tools_used(), b.tools_used());
+    }
 }

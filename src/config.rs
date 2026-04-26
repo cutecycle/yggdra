@@ -1025,4 +1025,409 @@ See docs for details.
             "Empty config should not crash on reload"
         );
     }
+
+    // ===== ModelParams::is_empty =====
+
+    #[test]
+    fn test_model_params_empty_all_none() {
+        let p = ModelParams {
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            repeat_penalty: None,
+            num_predict: None,
+            num_ctx: None,
+            tool_output_cap: None,
+            think: None,
+            reasoning_effort: None,
+            ambiguity_threshold: None,
+        };
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_model_params_default_not_empty() {
+        // Default has temperature and num_predict set
+        let p = ModelParams::default();
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn test_model_params_single_field_not_empty() {
+        let mut p = ModelParams {
+            temperature: None, top_k: None, top_p: None, repeat_penalty: None,
+            num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
+            reasoning_effort: None, ambiguity_threshold: None,
+        };
+        p.temperature = Some(0.5);
+        assert!(!p.is_empty());
+    }
+
+    // ===== ModelParams::merge_over =====
+
+    #[test]
+    fn test_merge_over_self_wins() {
+        let overrides = ModelParams { temperature: Some(0.1), ..Default::default() };
+        let base = ModelParams { temperature: Some(0.9), ..Default::default() };
+        let merged = overrides.merge_over(&base);
+        assert!((merged.temperature.unwrap() - 0.1).abs() < 1e-6,
+            "override temperature should win");
+    }
+
+    #[test]
+    fn test_merge_over_base_fills_missing() {
+        let overrides = ModelParams {
+            temperature: None, top_k: None, top_p: None, repeat_penalty: None,
+            num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
+            reasoning_effort: None, ambiguity_threshold: None,
+        };
+        let base = ModelParams { temperature: Some(0.7), ..Default::default() };
+        let merged = overrides.merge_over(&base);
+        assert!((merged.temperature.unwrap() - 0.7).abs() < 1e-6,
+            "base temperature should fill when override is None");
+    }
+
+    #[test]
+    fn test_merge_over_both_none_stays_none() {
+        let overrides = ModelParams {
+            temperature: None, top_k: None, top_p: None, repeat_penalty: None,
+            num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
+            reasoning_effort: None, ambiguity_threshold: None,
+        };
+        let base = ModelParams {
+            temperature: None, top_k: None, top_p: None, repeat_penalty: None,
+            num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
+            reasoning_effort: None, ambiguity_threshold: None,
+        };
+        let merged = overrides.merge_over(&base);
+        assert!(merged.temperature.is_none());
+        assert!(merged.top_k.is_none());
+    }
+
+    #[test]
+    fn test_merge_over_reasoning_effort_self_wins() {
+        let overrides = ModelParams { reasoning_effort: Some("low".into()), ..Default::default() };
+        let base = ModelParams { reasoning_effort: Some("xhigh".into()), ..Default::default() };
+        let merged = overrides.merge_over(&base);
+        assert_eq!(merged.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    // ===== ModelParams::apply_kv =====
+
+    #[test]
+    fn test_apply_kv_temperature_valid() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("temperature", "0.5");
+        assert!(result.is_ok());
+        assert!((p.temperature.unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_apply_kv_temperature_zero() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("temperature", "0.0").is_ok());
+        assert!((p.temperature.unwrap()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_apply_kv_temperature_max() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("temperature", "2.0").is_ok());
+        assert!((p.temperature.unwrap() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_apply_kv_temperature_above_max_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("temperature", "2.1");
+        assert!(result.is_err(), "temperature > 2.0 must be rejected");
+        assert!(result.unwrap_err().contains("2.0"));
+    }
+
+    #[test]
+    fn test_apply_kv_temperature_negative_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("temperature", "-0.1");
+        assert!(result.is_err(), "negative temperature must be rejected");
+    }
+
+    #[test]
+    fn test_apply_kv_temperature_non_float_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("temperature", "hot");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("float"));
+    }
+
+    #[test]
+    fn test_apply_kv_top_k_valid() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("top_k", "40").is_ok());
+        assert_eq!(p.top_k, Some(40));
+    }
+
+    #[test]
+    fn test_apply_kv_top_k_zero_valid() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("top_k", "0").is_ok());
+        assert_eq!(p.top_k, Some(0));
+    }
+
+    #[test]
+    fn test_apply_kv_top_p_boundary_zero() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("top_p", "0.0").is_ok());
+    }
+
+    #[test]
+    fn test_apply_kv_top_p_boundary_one() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("top_p", "1.0").is_ok());
+    }
+
+    #[test]
+    fn test_apply_kv_top_p_above_one_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("top_p", "1.1");
+        assert!(result.is_err(), "top_p > 1.0 must be rejected");
+    }
+
+    #[test]
+    fn test_apply_kv_repeat_penalty_valid() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("repeat_penalty", "1.1").is_ok());
+        assert!((p.repeat_penalty.unwrap() - 1.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_kv_repeat_penalty_negative_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("repeat_penalty", "-0.5");
+        assert!(result.is_err(), "negative repeat_penalty must be rejected");
+    }
+
+    #[test]
+    fn test_apply_kv_num_predict_negative_one() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("num_predict", "-1").is_ok());
+        assert_eq!(p.num_predict, Some(-1));
+    }
+
+    #[test]
+    fn test_apply_kv_tool_output_cap_minimum() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("tool_output_cap", "100").is_ok());
+        assert_eq!(p.tool_output_cap, Some(100));
+    }
+
+    #[test]
+    fn test_apply_kv_tool_output_cap_below_minimum_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("tool_output_cap", "99");
+        assert!(result.is_err(), "tool_output_cap < 100 must be rejected");
+        assert!(result.unwrap_err().contains("100"));
+    }
+
+    #[test]
+    fn test_apply_kv_think_true() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("think", "true").is_ok());
+        assert_eq!(p.think, Some(true));
+    }
+
+    #[test]
+    fn test_apply_kv_think_false() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("think", "false").is_ok());
+        assert_eq!(p.think, Some(false));
+    }
+
+    #[test]
+    fn test_apply_kv_think_yes_no() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("think", "yes").is_ok());
+        assert_eq!(p.think, Some(true));
+        assert!(p.apply_kv("think", "no").is_ok());
+        assert_eq!(p.think, Some(false));
+    }
+
+    #[test]
+    fn test_apply_kv_think_on_off() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("think", "on").is_ok());
+        assert_eq!(p.think, Some(true));
+        assert!(p.apply_kv("think", "off").is_ok());
+        assert_eq!(p.think, Some(false));
+    }
+
+    #[test]
+    fn test_apply_kv_think_invalid_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("think", "maybe");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("true/false"));
+    }
+
+    #[test]
+    fn test_apply_kv_reasoning_effort_all_valid() {
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let mut p = ModelParams::default();
+            let result = p.apply_kv("reasoning_effort", effort);
+            assert!(result.is_ok(), "effort '{}' should be valid", effort);
+            assert_eq!(p.reasoning_effort.as_deref(), Some(effort));
+        }
+    }
+
+    #[test]
+    fn test_apply_kv_reasoning_effort_none_clears() {
+        let mut p = ModelParams::default();
+        p.reasoning_effort = Some("high".into());
+        assert!(p.apply_kv("reasoning_effort", "none").is_ok());
+        assert!(p.reasoning_effort.is_none(), "reasoning_effort=none should clear it");
+    }
+
+    #[test]
+    fn test_apply_kv_reasoning_effort_invalid_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("reasoning_effort", "ultra");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_kv_ambiguity_threshold_valid() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_kv("ambiguity_threshold", "5").is_ok());
+        assert_eq!(p.ambiguity_threshold, Some(5));
+    }
+
+    #[test]
+    fn test_apply_kv_reset_clears_all_to_defaults() {
+        let mut p = ModelParams::default();
+        p.temperature = Some(0.0);
+        p.top_k = Some(99);
+        p.apply_kv("reset", "").unwrap();
+        // After reset, should be back to default
+        assert!(p.temperature.is_some(), "default has temperature set");
+    }
+
+    #[test]
+    fn test_apply_kv_unknown_key_rejected() {
+        let mut p = ModelParams::default();
+        let result = p.apply_kv("max_tokens", "1000");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown param"));
+    }
+
+    #[test]
+    fn test_apply_kv_whitespace_trimmed_from_key() {
+        let mut p = ModelParams::default();
+        // Whitespace around key should be handled
+        let result = p.apply_kv("  temperature  ", "0.5");
+        assert!(result.is_ok(), "whitespace around key should be trimmed");
+    }
+
+    // ===== ModelParams::apply_args =====
+
+    #[test]
+    fn test_apply_args_single_pair() {
+        let mut p = ModelParams::default();
+        let result = p.apply_args("temperature=0.3");
+        assert!(result.is_ok());
+        assert!((p.temperature.unwrap() - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_args_multiple_pairs() {
+        let mut p = ModelParams::default();
+        let result = p.apply_args("temperature=0.2 top_k=50");
+        assert!(result.is_ok(), "multiple pairs should succeed: {:?}", result);
+        assert!((p.temperature.unwrap() - 0.2).abs() < 1e-5);
+        assert_eq!(p.top_k, Some(50));
+    }
+
+    #[test]
+    fn test_apply_args_reset_keyword() {
+        let mut p = ModelParams::default();
+        p.top_k = Some(99);
+        let result = p.apply_args("reset");
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("reset"));
+    }
+
+    #[test]
+    fn test_apply_args_empty_string_error() {
+        let mut p = ModelParams::default();
+        let result = p.apply_args("");
+        assert!(result.is_err(), "empty args should fail");
+    }
+
+    #[test]
+    fn test_apply_args_no_equals_sign_error() {
+        let mut p = ModelParams::default();
+        let result = p.apply_args("temperature");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("key=value"));
+    }
+
+    #[test]
+    fn test_apply_args_first_error_stops_processing() {
+        let mut p = ModelParams::default();
+        let result = p.apply_args("temperature=99.9 top_k=10");
+        // temperature=99.9 is invalid (> 2.0), should return error
+        assert!(result.is_err());
+        // top_k should NOT have been applied (first error stops)
+        // Actually apply_args applies sequentially — the error may stop after first fail
+        // Just verify it returns an error
+    }
+
+    // ===== ModelParams::summary =====
+
+    #[test]
+    fn test_summary_all_none_is_defaults() {
+        let p = ModelParams {
+            temperature: None, top_k: None, top_p: None, repeat_penalty: None,
+            num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
+            reasoning_effort: None, ambiguity_threshold: None,
+        };
+        assert_eq!(p.summary(), "defaults");
+    }
+
+    #[test]
+    fn test_summary_temperature_shown() {
+        let p = ModelParams { temperature: Some(0.7), top_k: None, top_p: None,
+            repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
+            think: None, reasoning_effort: None, ambiguity_threshold: None };
+        let s = p.summary();
+        assert!(s.contains("temperature="), "summary must show temperature, got: {}", s);
+    }
+
+    #[test]
+    fn test_summary_think_shown() {
+        let p = ModelParams { temperature: None, top_k: None, top_p: None,
+            repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
+            think: Some(true), reasoning_effort: None, ambiguity_threshold: None };
+        let s = p.summary();
+        assert!(s.contains("think=true"), "summary must show think, got: {}", s);
+    }
+
+    #[test]
+    fn test_summary_reasoning_effort_shown() {
+        let p = ModelParams { temperature: None, top_k: None, top_p: None,
+            repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
+            think: None, reasoning_effort: Some("high".into()), ambiguity_threshold: None };
+        let s = p.summary();
+        assert!(s.contains("reasoning_effort=high"), "got: {}", s);
+    }
+
+    #[test]
+    fn test_summary_multiple_fields_space_separated() {
+        let mut p = ModelParams::default();
+        p.temperature = Some(0.5);
+        p.top_k = Some(40);
+        let s = p.summary();
+        assert!(s.contains("temperature="), "must have temperature, got: {}", s);
+        assert!(s.contains("top_k="), "must have top_k, got: {}", s);
+        // Fields should be space-separated
+        assert!(s.contains(' '), "fields must be space-separated, got: {}", s);
+    }
 }

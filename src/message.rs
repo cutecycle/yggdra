@@ -490,4 +490,288 @@ mod tests {
         assert_eq!(msgs[0].content.len(), 100_000);
         assert_eq!(msgs[0].content, large_content);
     }
+
+    // ===== Unicode and special content =====
+
+    #[test]
+    fn test_unicode_content_roundtrip() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let content = "日本語テスト\n🦀 Rust 🦀\n∑∆∫∮";
+        buf.add_and_persist(Message::new("user", content)).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs[0].content, content);
+    }
+
+    #[test]
+    fn test_content_with_json_special_chars() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        // JSON-sensitive characters must survive the JSONL roundtrip
+        let content = r#"{"key": "value", "escaped": "line1\nline2\t\"quoted\""}"#;
+        buf.add_and_persist(Message::new("assistant", content)).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs[0].content, content);
+    }
+
+    #[test]
+    fn test_content_with_newlines_preserved() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let content = "line one\nline two\nline three\n";
+        buf.add_and_persist(Message::new("user", content)).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs[0].content, content);
+    }
+
+    #[test]
+    fn test_empty_content_roundtrip() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("system", "")).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "");
+        assert_eq!(msgs[0].role, "system");
+    }
+
+    // ===== Token count persistence =====
+
+    #[test]
+    fn test_token_counts_stored_and_retrieved() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let mut msg = Message::new("assistant", "hello");
+        msg.prompt_tokens = Some(42);
+        msg.completion_tokens = Some(7);
+        buf.add_and_persist(msg).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs[0].prompt_tokens, Some(42));
+        assert_eq!(msgs[0].completion_tokens, Some(7));
+    }
+
+    #[test]
+    fn test_token_counts_none_when_not_set() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "no tokens")).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert!(msgs[0].prompt_tokens.is_none());
+        assert!(msgs[0].completion_tokens.is_none());
+    }
+
+    // ===== get_last_n edge cases =====
+
+    #[test]
+    fn test_get_last_n_larger_than_count_returns_all() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        for i in 0..3 {
+            buf.add_and_persist(Message::new("user", format!("m{}", i))).unwrap();
+        }
+        let result = buf.get_last_n(100).unwrap();
+        assert_eq!(result.len(), 3, "requesting more than count should return all");
+    }
+
+    #[test]
+    fn test_get_last_n_zero_returns_empty() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "msg")).unwrap();
+        let result = buf.get_last_n(0).unwrap();
+        assert!(result.is_empty(), "get_last_n(0) must return empty");
+    }
+
+    #[test]
+    fn test_get_last_n_on_empty_buffer() {
+        let path = temp_path();
+        let buf = MessageBuffer::new(&path).unwrap();
+        let result = buf.get_last_n(5).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_last_n_exact_count() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        for i in 0..5 {
+            buf.add_and_persist(Message::new("user", format!("msg{}", i))).unwrap();
+        }
+        let result = buf.get_last_n(5).unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].content, "msg0");
+        assert_eq!(result[4].content, "msg4");
+    }
+
+    // ===== delete_last edge cases =====
+
+    #[test]
+    fn test_delete_last_on_empty_buffer_no_error() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        // Should not panic or error on empty buffer
+        let result = buf.delete_last();
+        assert!(result.is_ok(), "delete_last on empty buffer must not error");
+        assert_eq!(buf.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_last_leaves_rest_intact() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "alpha")).unwrap();
+        buf.add_and_persist(Message::new("user", "beta")).unwrap();
+        buf.add_and_persist(Message::new("user", "gamma")).unwrap();
+        buf.delete_last().unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "alpha");
+        assert_eq!(msgs[1].content, "beta");
+    }
+
+    // ===== search_scrollback case-insensitive =====
+
+    #[test]
+    fn test_search_scrollback_case_insensitive() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "Hello WORLD")).unwrap();
+        buf.archive_to_scrollback().unwrap();
+        // Search lowercase
+        let results = buf.search_scrollback("hello world").unwrap();
+        assert_eq!(results.len(), 1, "case-insensitive search must match");
+    }
+
+    #[test]
+    fn test_search_scrollback_by_role() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("system", "init")).unwrap();
+        buf.add_and_persist(Message::new("user", "question")).unwrap();
+        buf.archive_to_scrollback().unwrap();
+        let results = buf.search_scrollback("system").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.role, "system");
+    }
+
+    #[test]
+    fn test_search_scrollback_no_match() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "nothing here")).unwrap();
+        buf.archive_to_scrollback().unwrap();
+        let results = buf.search_scrollback("xyzzy_impossible").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_scrollback_empty_query_matches_all() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "anything")).unwrap();
+        buf.add_and_persist(Message::new("assistant", "response")).unwrap();
+        buf.archive_to_scrollback().unwrap();
+        let results = buf.search_scrollback("").unwrap();
+        // Empty query — "" is contained in every string
+        assert_eq!(results.len(), 2);
+    }
+
+    // ===== all_messages merge =====
+
+    #[test]
+    fn test_all_messages_includes_scrollback_and_current() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "archived")).unwrap();
+        buf.archive_to_scrollback().unwrap();
+        buf.add_and_persist(Message::new("user", "current")).unwrap();
+        let all = buf.all_messages().unwrap();
+        assert_eq!(all.len(), 2, "all_messages must include both archived and current");
+        assert!(all.iter().any(|m| m.content == "archived"));
+        assert!(all.iter().any(|m| m.content == "current"));
+    }
+
+    #[test]
+    fn test_all_messages_empty_both() {
+        let path = temp_path();
+        let buf = MessageBuffer::new(&path).unwrap();
+        let all = buf.all_messages().unwrap();
+        assert!(all.is_empty());
+    }
+
+    // ===== purge_kicks edge cases =====
+
+    #[test]
+    fn test_purge_kicks_on_empty_buffer() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let removed = buf.purge_kicks().unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_purge_kicks_no_kicks_returns_zero() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        buf.add_and_persist(Message::new("user", "msg")).unwrap();
+        let removed = buf.purge_kicks().unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(buf.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_purge_kicks_all_kicks_clears_buffer() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        for _ in 0..5 {
+            buf.add_and_persist(Message::new("kick", "auto")).unwrap();
+        }
+        let removed = buf.purge_kicks().unwrap();
+        assert_eq!(removed, 5);
+        assert_eq!(buf.count().unwrap(), 0);
+    }
+
+    // ===== scrollback_count =====
+
+    #[test]
+    fn test_scrollback_count_without_archive_is_zero() {
+        let path = temp_path();
+        let buf = MessageBuffer::new(&path).unwrap();
+        assert_eq!(buf.scrollback_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_scrollback_count_matches_archived() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        for i in 0..4 {
+            buf.add_and_persist(Message::new("user", format!("m{}", i))).unwrap();
+        }
+        buf.archive_to_scrollback().unwrap();
+        assert_eq!(buf.scrollback_count().unwrap(), 4);
+    }
+
+    // ===== add_multiple edge cases =====
+
+    #[test]
+    fn test_add_multiple_empty_slice_no_error() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let result = buf.add_multiple(&[]);
+        assert!(result.is_ok());
+        assert_eq!(buf.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_add_multiple_preserves_token_counts() {
+        let path = temp_path();
+        let mut buf = MessageBuffer::new(&path).unwrap();
+        let mut msg = Message::new("assistant", "reply");
+        msg.prompt_tokens = Some(100);
+        msg.completion_tokens = Some(20);
+        buf.add_multiple(&[msg]).unwrap();
+        let msgs = buf.messages().unwrap();
+        assert_eq!(msgs[0].prompt_tokens, Some(100));
+        assert_eq!(msgs[0].completion_tokens, Some(20));
+    }
 }

