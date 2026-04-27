@@ -950,29 +950,31 @@ impl Agent {
             "You are an agentic assistant. You have exactly one tool: shell (sh -c).\n\
              Use shell for all file operations, builds, and commits.\n\
              \n\
+             {tools}\n\
+             \n\
+             {personal_instructions}\
+             \n\
              {sysinfo}\n\
              \n\
              {root}\n\
              Stay within this directory. Use relative paths.\n\
              \n\
-             {tools}\n\
-             \n\
-              DIRECTIVES:\n\
-              - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
-              - Constraints: Keep output files to a maximum of 200 lines. If content exceeds 200 lines, split into multiple files or use async mode. Never exceed 200 lines in a single file.\n\
-              - Completion: Summarize results when finished.\n\
-             \n\
              {project_ctx}\
              {recent_files}\
-             {personal_instructions}\
-             {session_notes}\n\
+             {session_notes}\
+             \n\
+             DIRECTIVES:\n\
+             - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
+             - Constraints: Keep output files to a maximum of 200 lines. If content exceeds 200 lines, split into multiple files or use async mode. Never exceed 200 lines in a single file.\n\
+             - Completion: Summarize results when finished.\n\
+             \n\
              The file tree is live.",
+            tools   = tools,
+            personal_instructions = personal_instructions,
             sysinfo = sysinfo,
             root    = root_line,
-            tools   = tools,
             project_ctx = self.config.project_context,
             recent_files = recent_files,
-            personal_instructions = personal_instructions,
             session_notes = session_notes,
         );
         let full_prompt = SteeringDirective::custom(&prompt).format_for_system_prompt();
