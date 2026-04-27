@@ -2172,6 +2172,15 @@ impl App {
         let steering = self.steering_text();
         let mut messages = self.message_buffer.messages().unwrap_or_default();
         messages.push(kick);
+        
+        // Check if we're about to exceed context before streaming
+        let (fits, usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+        if !fits && self.mode == crate::config::AppMode::Forever {
+            // In Forever mode, pause and let user know
+            self.autokick_paused = true;
+            return;
+        }
+        
         if let Some(client) = &self.ollama_client {
             let (tool_cap, ctx_win) = self.compression_params();
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
@@ -3279,6 +3288,42 @@ impl App {
     fn effective_context_window(&self) -> u32 {
         let native_ctx = self.ollama_client.as_ref().and_then(|c| c.get_native_ctx());
         self.config.context_window.or(self.config.params.num_ctx).or(native_ctx).unwrap_or(32768)
+    }
+
+    /// Check if messages + steering will exceed available context.
+    /// Returns (fits, usage_pct). If not fits, emit warning to user.
+    fn check_context_before_stream(&mut self, messages: &[crate::message::Message], steering: Option<&str>) -> (bool, u32) {
+        let ctx_window = self.effective_context_window() as usize;
+        
+        // Rough estimate: concatenate all messages and steering
+        let mut total_text = String::new();
+        for msg in messages {
+            total_text.push_str(&msg.content);
+            total_text.push('\n');
+        }
+        if let Some(s) = steering {
+            total_text.push_str(s);
+        }
+        
+        let est_tokens = crate::tokens::estimate_tokens(&total_text);
+        let (fits, threshold) = crate::tokens::check_fits_in_context(est_tokens, ctx_window);
+        let usage_pct = (est_tokens as f64 / ctx_window as f64 * 100.0) as u32;
+        
+        if !fits {
+            self.push_agent_notice(format!(
+                "⚠️ CONTEXT OVERFLOW: query + context = {} tokens ({}% of {} available). \
+                 Run /compress to summarize history, or increase context with /ctx {}",
+                est_tokens, usage_pct, ctx_window,
+                (ctx_window as f64 * 1.5) as u32
+            ));
+        } else if usage_pct >= 80 {
+            self.push_agent_notice(format!(
+                "⚠️ Context at {}% ({} / {} tokens). If task fails, run /compress",
+                usage_pct, est_tokens, ctx_window
+            ));
+        }
+        
+        (fits, usage_pct)
     }
 
     fn push_system_event(&mut self, text: impl Into<String>) {
