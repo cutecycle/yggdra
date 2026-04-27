@@ -1032,10 +1032,7 @@ impl App {
                 messages.push(kick_msg);
                 let steering = self.steering_text();
                 let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
-                if !fits && self.mode == crate::config::AppMode::Forever {
-                    self.autokick_paused = true;
-                    return Ok(());
-                }
+                // In Forever mode, keep going anyway (just warned above)
                 
                 if let Some(client) = &self.ollama_client {
                     let (tool_cap, ctx_win) = self.compression_params();
@@ -5508,13 +5505,10 @@ impl App {
         // Trigger assistant response
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
-        
-        // Check context before streaming
+         
+        // Check context before streaming (warns if near/over limit)
         let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
-        if !fits && self.mode == crate::config::AppMode::Forever {
-            self.autokick_paused = true;
-            return;
-        }
+        // In Forever mode, keep going anyway (just warned above)
         
         if let Some(client) = &self.ollama_client {
             let (tool_cap, ctx_win) = self.compression_params();
