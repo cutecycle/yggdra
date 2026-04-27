@@ -2155,11 +2155,10 @@ impl App {
         self.spin_notice_count = self.spin_notice_count.saturating_add(1);
         let n = self.spin_notice_count;
         if n == 1 {
+            // Only add the first error message; subsequent retries are silent
             self.push_agent_notice(msg.into());
-        } else if n % 5 == 0 {
-            self.push_agent_notice(format!("{} (retry #{})", msg.into(), n));
         }
-        // else: silent retry
+        // All other retries: silent (no new messages, just internal counter)
     }
 
     fn inject_continue_kick(&mut self) {
@@ -9467,7 +9466,7 @@ mod terminal_integrity_tests {
         }).unwrap();
 
         let buf = terminal.backend().buffer();
-        let cell_4 = buf.get(4, 0).symbol();
+        let cell_4 = buf[(4, 0)].symbol();
         assert!(
             cell_4 == " " || cell_4 == "",
             "Ghost char at x=4 after backspace: {:?}", cell_4
@@ -9489,7 +9488,7 @@ mod terminal_integrity_tests {
 
         let buf = terminal.backend().buffer();
         for x in 2..=10u16 {
-            let sym = buf.get(x, 0).symbol();
+            let sym = buf[(x, 0)].symbol();
             assert!(
                 sym == " " || sym == "",
                 "Ghost char at x={} after large shrink: {:?}", x, sym
@@ -9515,7 +9514,7 @@ mod terminal_integrity_tests {
 
         let buf = terminal.backend().buffer();
         for x in 0..5u16 {
-            let sym = buf.get(x, 0).symbol();
+            let sym = buf[(x, 0)].symbol();
             assert!(sym == " " || sym == "",
                 "Ghost char at x={} after clear: {:?}", x, sym);
         }
