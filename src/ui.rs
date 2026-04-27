@@ -530,6 +530,16 @@ pub struct App {
     /// Time this App was created — used to compute uptime on exit.
     session_start: std::time::Instant,
 
+    // ── File content caches (to avoid blocking steering_text on file I/O) ──
+    /// Cached content of .yggdra/memory.md and last read time
+    memory_cache: (String, std::time::Instant),
+    /// Cached content of .yggdra/thoughts.md and last read time
+    thoughts_cache: (String, std::time::Instant),
+    /// Cached content of .yggdra/session_notes.md and last read time
+    session_notes_cache: (String, std::time::Instant),
+    /// Cache refresh interval: 500ms
+    cache_refresh_interval: std::time::Duration,
+
     // ── Loop-prevention state ────────────────────────────────────────────
     /// Rolling window of recent (tool_name, args_hash) dispatches — cap 20.
     /// Used to detect the agent calling the same tool with the same args repeatedly.
@@ -780,6 +790,10 @@ impl App {
             file_viewer_active: 0,
             stats,
             session_start: std::time::Instant::now(),
+            memory_cache: (String::new(), std::time::Instant::now()),
+            thoughts_cache: (String::new(), std::time::Instant::now()),
+            session_notes_cache: (String::new(), std::time::Instant::now()),
+            cache_refresh_interval: std::time::Duration::from_millis(500),
             recent_tool_calls: std::collections::VecDeque::new(),
             spin_notice_count: 0,
             recent_tool_errors: std::collections::HashMap::new(),
@@ -1839,7 +1853,7 @@ impl App {
             let tool_calls = sync_calls;
             if tool_calls.is_empty() {
                 // All calls were async — kick next stream turn so model can continue
-                if let Some(client) = &self.ollama_client {
+                if let Some(client) = self.ollama_client.clone() {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
                     let (tool_cap, ctx_win) = self.compression_params();
@@ -1911,7 +1925,7 @@ impl App {
                         .unwrap_or(self.cached_message_count + 1);
                 }
                 // Continue the turn so model can self-correct
-                if let Some(client) = &self.ollama_client {
+                if let Some(client) = self.ollama_client.clone() {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
                     let (tool_cap, ctx_win) = self.compression_params();
@@ -2754,7 +2768,7 @@ impl App {
                 if self.mode == AppMode::Ask {
                     // Ask mode: autonomously execute read-only tools and loop until </done>.
                     // Kick a new stream to let the agent continue processing the tool result.
-                    if let Some(client) = &self.ollama_client {
+                    if let Some(client) = self.ollama_client.clone() {
                         let steering_text = self.steering_text();
                         let messages = self.message_buffer.messages().unwrap_or_default();
                         let (tool_cap, ctx_win) = self.compression_params();
@@ -2772,7 +2786,7 @@ impl App {
                         self.turn_phase = TurnPhase::Idle;
                         self.tool_iteration_count = 0;
                     }
-                } else if let Some(client) = &self.ollama_client {
+                } else if let Some(client) = self.ollama_client.clone() {
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
                     let (tool_cap, ctx_win) = self.compression_params();
@@ -3012,6 +3026,31 @@ impl App {
         format!("THOUGHTS (.yggdra/thoughts.md):\n{}\n", tail)
     }
 
+    /// Get cached memory block, refreshing from disk if cache is stale.
+    /// Cache refresh is throttled to 500ms intervals to avoid frequent I/O.
+    fn get_cached_memory(&mut self) -> String {
+        if self.memory_cache.1.elapsed() >= self.cache_refresh_interval {
+            self.memory_cache = (Self::memory_block(), std::time::Instant::now());
+        }
+        self.memory_cache.0.clone()
+    }
+
+    /// Get cached thoughts block, refreshing from disk if cache is stale.
+    fn get_cached_thoughts(&mut self) -> String {
+        if self.thoughts_cache.1.elapsed() >= self.cache_refresh_interval {
+            self.thoughts_cache = (Self::thoughts_block(), std::time::Instant::now());
+        }
+        self.thoughts_cache.0.clone()
+    }
+
+    /// Get cached session notes block, refreshing from disk if cache is stale.
+    fn get_cached_session_notes(&mut self) -> String {
+        if self.session_notes_cache.1.elapsed() >= self.cache_refresh_interval {
+            self.session_notes_cache = (Self::session_notes_block(), std::time::Instant::now());
+        }
+        self.session_notes_cache.0.clone()
+    }
+
     /// First real user message (not a tool result injection), truncated to 150 chars.
     /// Used to anchor the model's goal at the bottom of the system prompt.
     fn current_task_block(&self) -> String {
@@ -3139,7 +3178,7 @@ impl App {
         }
     }
 
-    fn steering_text(&self) -> String {
+    fn steering_text(&mut self) -> String {
         crate::dlog!("steering_text: START");
         let _os = std::env::consts::OS;
 
@@ -3232,21 +3271,21 @@ impl App {
             );
         }
         crate::dlog!("steering_text: reading memory_block");
-        let memory = Self::memory_block();
+        let memory = self.get_cached_memory();
         if !memory.is_empty() {
             base.push_str("\n---\n");
             base.push_str(&memory);
             crate::dlog!("steering_text: memory_block added ({} bytes)", memory.len());
         }
         crate::dlog!("steering_text: reading thoughts_block");
-        let thoughts = Self::thoughts_block();
+        let thoughts = self.get_cached_thoughts();
         if !thoughts.is_empty() {
             base.push_str("\n---\n");
             base.push_str(&thoughts);
             crate::dlog!("steering_text: thoughts_block added ({} bytes)", thoughts.len());
         }
         crate::dlog!("steering_text: reading session_notes_block");
-        let session_notes = Self::session_notes_block();
+        let session_notes = self.get_cached_session_notes();
         if !session_notes.is_empty() {
             base.push_str("\n---\n");
             base.push_str(&session_notes);
