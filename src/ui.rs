@@ -7,7 +7,7 @@ use crate::message::{Message, MessageBuffer};
 use crate::ollama::{OllamaClient, StreamEvent};
 use crate::session::Session;
 use crate::steering::SteeringDirective;
-use crate::task::{TaskManager, Checkpoint};
+use crate::task::TaskManager;
 use crate::theme::Theme;
 use crate::tools::ToolRegistry;
 use crate::metrics::MetricsTracker;
@@ -1027,11 +1027,11 @@ impl App {
                 };
                 // Use ephemeral kick (like inject_continue_kick) — never persisted to DB
                 let kick_msg = Message::new("kick", &kick);
-                let steering = self.steering_text();
+                let _steering = self.steering_text();
                 let mut messages = self.message_buffer.messages().unwrap_or_default();
                 messages.push(kick_msg);
                 let steering = self.steering_text();
-                let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+                let (_fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
                 // In Forever mode, keep going anyway (just warned above)
                 
                 if let Some(client) = &self.ollama_client {
@@ -2177,7 +2177,7 @@ impl App {
         messages.push(kick);
         
         // Check if we're about to exceed context before streaming
-        let (fits, usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+        let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
         if !fits && self.mode == crate::config::AppMode::Forever {
             // In Forever mode, pause and let user know
             self.autokick_paused = true;
@@ -3044,7 +3044,7 @@ impl App {
     }
 
     fn steering_text(&self) -> String {
-        let os = std::env::consts::OS;
+        let _os = std::env::consts::OS;
 
         let mode_block = match self.mode {
             AppMode::Ask =>
@@ -3309,7 +3309,7 @@ impl App {
         }
         
         let est_tokens = crate::tokens::estimate_tokens(&total_text);
-        let (fits, threshold) = crate::tokens::check_fits_in_context(est_tokens, ctx_window);
+        let (fits, _threshold) = crate::tokens::check_fits_in_context(est_tokens, ctx_window);
         let usage_pct = (est_tokens as f64 / ctx_window as f64 * 100.0) as u32;
         
         if !fits {
@@ -5506,7 +5506,7 @@ impl App {
         let messages = self.message_buffer.messages().unwrap_or_default();
          
         // Check context before streaming (warns if near/over limit)
-        let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+        let (_fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
         // In Forever mode, keep going anyway (just warned above)
         
         if let Some(client) = &self.ollama_client {
@@ -6236,7 +6236,7 @@ impl App {
         }
 
         match &self.ollama_client {
-            Some(client) => {
+            Some(_client) => {
                 self.status_message = format!("🌸 Switching to {}…", model);
                 match OllamaClient::new_with_key(&self.config.endpoint, model, self.config.api_key.as_deref()).await {
                     Ok(new_client) => {
@@ -6264,7 +6264,7 @@ impl App {
         
         match change {
             ConfigChange::ConfigFileChanged => {
-                let mut fresh_config = crate::config::Config::reload_from_file();
+                let fresh_config = crate::config::Config::reload_from_file();
                 let model_changed = fresh_config.model != self.config.model;
                 let endpoint_changed = fresh_config.endpoint != self.config.endpoint;
                 
@@ -6559,7 +6559,7 @@ impl App {
         if let Some(tc_pos) = tool_call_pos {
             let prose = content[..tc_pos].trim();
             let tc_part = &content[tc_pos..];
-            if let Some(pretty_lines) = prettify_tool_calls(tc_part) {
+            if let Some(_pretty_lines) = prettify_tool_calls(tc_part) {
                 // Render any preceding prose first
                 if !prose.is_empty() {
                     let mut first_prose = true;
@@ -7702,8 +7702,8 @@ pub(crate) fn prettify_tool_calls(text: &str) -> Option<Vec<ratatui::text::Line<
 }
 
 pub(crate) fn render_markdown_line(line: &str, is_dark: bool) -> Vec<ratatui::text::Line<'static>> {
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::{Line as RLine, Span};
+    use ratatui::style::Color;
+    use ratatui::text::Line as RLine;
 
     let text_color = if is_dark {
         Color::Rgb(220, 230, 240)
@@ -7926,7 +7926,7 @@ pub(crate) fn format_message_styled(
                 // Prepend emoji to first table line if needed
                 if first_line && !table_lines.is_empty() {
                     let mut first_table_line = table_lines[0].clone();
-                    if let Some(first_span) = first_table_line.spans.first() {
+                    if let Some(_first_span) = first_table_line.spans.first() {
                         let mut new_spans = vec![Span::raw(format!("{} ", content_emoji))];
                         new_spans.extend(first_table_line.spans.iter().cloned());
                         first_table_line = RLine::from(new_spans);

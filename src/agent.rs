@@ -1229,7 +1229,7 @@ impl Agent {
             }
 
             // Execute tools with real-time injection
-            let mut tool_results = String::new();
+            let mut _tool_results = String::new();
             for call in tool_calls {
 
 

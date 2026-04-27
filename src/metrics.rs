@@ -1,6 +1,5 @@
 //! Metrics tracking: task completion, code coverage, tools used, inference speed
 
-use std::path::PathBuf;
 use std::collections::HashSet;
 use std::time::Instant;
 

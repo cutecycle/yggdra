@@ -258,7 +258,7 @@ impl Tool for ExecTool {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let mut child = Command::new(&resolved)
+        let child = Command::new(&resolved)
             .args(child_args)
             .current_dir(&cwd)
             .stdout(std::process::Stdio::piped())
@@ -417,7 +417,7 @@ impl Tool for ShellTool {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let mut child = Command::new("sh")
+        let child = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
             .current_dir(&cwd)
