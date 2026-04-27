@@ -1030,6 +1030,13 @@ impl App {
                 let steering = self.steering_text();
                 let mut messages = self.message_buffer.messages().unwrap_or_default();
                 messages.push(kick_msg);
+                let steering = self.steering_text();
+                let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+                if !fits && self.mode == crate::config::AppMode::Forever {
+                    self.autokick_paused = true;
+                    return Ok(());
+                }
+                
                 if let Some(client) = &self.ollama_client {
                     let (tool_cap, ctx_win) = self.compression_params();
                     self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));
@@ -5501,6 +5508,14 @@ impl App {
         // Trigger assistant response
         let steering = self.steering_text();
         let messages = self.message_buffer.messages().unwrap_or_default();
+        
+        // Check context before streaming
+        let (fits, _usage_pct) = self.check_context_before_stream(&messages, Some(&steering));
+        if !fits && self.mode == crate::config::AppMode::Forever {
+            self.autokick_paused = true;
+            return;
+        }
+        
         if let Some(client) = &self.ollama_client {
             let (tool_cap, ctx_win) = self.compression_params();
             self.stream_rx = Some(client.generate_streaming(messages, Some(&steering), self.effective_params(), tool_cap, ctx_win));

@@ -1,1 +1,3 @@
-This is my internal thought process
+Line 1
+Line 2
+Line 3
