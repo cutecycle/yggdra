@@ -957,10 +957,10 @@ impl Agent {
              \n\
              {tools}\n\
              \n\
-             DIRECTIVES:\n\
-             - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
-             - Constraints: Keep files under 1000 chars (~200 lines). Use async for long tasks.\n\
-             - Completion: Summarize results when finished.\n\
+              DIRECTIVES:\n\
+              - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
+              - Constraints: Keep output files to a maximum of 200 lines. If content exceeds 200 lines, split into multiple files or use async mode. Never exceed 200 lines in a single file.\n\
+              - Completion: Summarize results when finished.\n\
              \n\
              {project_ctx}\
              {recent_files}\
