@@ -4447,12 +4447,9 @@ impl App {
                 let matches = self.palette_matches();
                 let saved = self.palette_saved_buffer.take();
                 if let Some(&cmd) = matches.get(self.palette_selection) {
-                    self.input_buffer = cmd.fill.to_string();
+                    self.input_buffer = cmd.fill.trim_end().to_string();
                     self.palette_open = false;
-                    // Only submit immediately if fill has no trailing space (i.e. doesn't need args)
-                    if !cmd.fill.ends_with(' ') {
-                        self.handle_command().await;
-                    }
+                    self.handle_command().await;
                 } else {
                     self.palette_open = false;
                     self.handle_command().await;
