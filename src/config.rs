@@ -203,7 +203,7 @@ impl ModelParams {
         match key.trim() {
             "reset" | "default" => {
                 *self = ModelParams::default();
-                return Ok("all params reset to defaults".to_string());
+                Ok("all params reset to defaults".to_string())
             }
             "temperature" => {
                 let v: f32 = value.trim().parse()

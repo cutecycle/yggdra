@@ -162,7 +162,7 @@ impl MessageBuffer {
         Ok(rows[start..]
             .iter()
             .cloned()
-            .map(|r| Self::row_to_msg(r))
+            .map(Self::row_to_msg)
             .collect())
     }
 

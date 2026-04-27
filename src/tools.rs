@@ -713,7 +713,7 @@ impl Tool for ReadfileTool {
             let selected: String = content
                 .lines()
                 .enumerate()
-                .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
+                .filter(|(i, _)| *i >= start - 1 && *i < end)
                 .map(|(i, l)| format!("{:4}: {}\n", i + 1, l))
                 .collect();
             return Ok(format!(

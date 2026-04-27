@@ -52,7 +52,7 @@ fn sanitize_snippet(text: &str) -> String {
                 && !t.starts_with("[TOOL_ERROR:")
                 && !t.starts_with("</done>")
         })
-        .map(|l| redact_paths(l))
+        .map(redact_paths)
         .collect::<Vec<_>>()
         .join("\n");
     filtered.trim().to_string()
