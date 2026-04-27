@@ -5215,24 +5215,15 @@ impl App {
 
         self.notify(format!("🗜️ Summarizing {} messages…", msg_count));
 
-        // Call the model with timeout to prevent hangs
+        // Call the model without timeout — compression is allowed to take as long as needed
         let summary = if let Some(client) = self.ollama_client.clone() {
             let summary_msg = vec![crate::message::Message::new("user", &summary_prompt)];
             let (tool_cap, ctx_win) = self.compression_params();
             
-            let timeout_result = tokio::time::timeout(
-                std::time::Duration::from_secs(90),
-                client.generate(summary_msg, None, &self.effective_params(), tool_cap, ctx_win),
-            ).await;
-            
-            match timeout_result {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
+            match client.generate(summary_msg, None, &self.effective_params(), tool_cap, ctx_win).await {
+                Ok(s) => s,
+                Err(e) => {
                     self.notify(format!("❌ Summarization failed: {}", e));
-                    return;
-                }
-                Err(_) => {
-                    self.notify("❌ Compression timeout (90s) — model may be stuck. Try again or increase timeout with /ctx.");
                     return;
                 }
             }
@@ -5279,11 +5270,11 @@ impl App {
         );
         match std::fs::write(&notes_path, &notes_content) {
             Ok(_) => {
-                self.notify(format!("✅ Compressed: {} messages → summary saved to .yggdra/session_notes.md", archived));
+                self.notify(format!("✅ Compressed: {} messages archived to scrollback (history preserved in view)", archived));
             }
             Err(e) => {
                 crate::dlog!("⚠️ handle_compress: failed to write session_notes.md: {}", e);
-                self.notify(format!("✅ Compressed: {} messages → summary injected (notes write failed: {})", archived, e));
+                self.notify(format!("✅ Compressed: {} messages archived (notes write failed: {})", archived, e));
             }
         }
         

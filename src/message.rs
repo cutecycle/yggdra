@@ -192,7 +192,10 @@ impl MessageBuffer {
                 };
                 writeln!(f, "{}", serde_json::to_string(&sb)?)?;
             }
-            fs::write(&self.messages_path, "")?;
+            // IMPORTANT: Do NOT clear the active messages buffer. Messages are copied to scrollback for
+            // durability, but users should retain the full conversation history in the active view.
+            // The model receives the summarized context via session_notes.md, so we don't need to delete
+            // the raw messages. This preserves user ability to scroll through and review past messages.
         }
         Ok(count)
     }
@@ -397,7 +400,8 @@ mod tests {
         }
         let archived = buffer.archive_to_scrollback().expect("Failed to archive");
         assert_eq!(archived, 3);
-        assert_eq!(buffer.count().unwrap(), 0);
+        // After archiving: messages stay in active buffer (preserved for user view)
+        assert_eq!(buffer.count().unwrap(), 3);
         assert_eq!(buffer.scrollback_count().unwrap(), 3);
     }
 
@@ -686,7 +690,10 @@ mod tests {
         buf.archive_to_scrollback().unwrap();
         buf.add_and_persist(Message::new("user", "current")).unwrap();
         let all = buf.all_messages().unwrap();
-        assert_eq!(all.len(), 2, "all_messages must include both archived and current");
+        // With the new behavior, messages are preserved in both active and scrollback.
+        // all_messages() returns both, so "archived" appears in both layers = 3 total entries
+        // (though only 2 unique messages: "archived" and "current")
+        assert_eq!(all.len(), 3, "all_messages includes scrollback + current");
         assert!(all.iter().any(|m| m.content == "archived"));
         assert!(all.iter().any(|m| m.content == "current"));
     }

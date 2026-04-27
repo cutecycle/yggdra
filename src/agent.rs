@@ -835,7 +835,7 @@ impl Agent {
     }
 
     /// Execute a tool and return result, respecting ask-mode restrictions
-    fn execute_tool(&self, call: &ToolCall) -> Result<String> {
+    async fn execute_tool(&self, call: &ToolCall) -> Result<String> {
         if self.config.app_mode == AppMode::Ask {
             const WRITE_TOOLS: &[&str] = &["setfile", "commit"];
             if WRITE_TOOLS.contains(&call.name.as_str()) {
@@ -845,7 +845,16 @@ impl Agent {
                 ));
             }
         }
-        self.registry.execute(&call.name, &call.args)
+        // Wrap tool execution in spawn_blocking to prevent blocking the async runtime on long-running
+        // commands (e.g., cargo build). Tool execution is CPU/IO-bound and blocks the thread it runs on.
+        let name = call.name.clone();
+        let args = call.args.clone();
+        let registry = ToolRegistry::new();
+        tokio::task::spawn_blocking(move || {
+            registry.execute(&name, &args)
+        })
+        .await
+        .map_err(|e| anyhow!("tool execution panicked: {}", e))?
     }
 
     /// Handle `set_params` tool call — updates runtime params, returns confirmation or error.
@@ -1101,7 +1110,7 @@ impl Agent {
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
-                    match self.execute_tool(&call) {
+                    match self.execute_tool(&call).await {
                         Ok(output) => output,
                         Err(e) => format!("[ERROR]: {}", e),
                     }
@@ -1236,7 +1245,7 @@ impl Agent {
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
-                    match self.execute_tool(&call) {
+                    match self.execute_tool(&call).await {
                         Ok(output) => output,
                         Err(e) => format!("[ERROR]: {}", e),
                     }
