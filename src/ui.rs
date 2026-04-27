@@ -5170,14 +5170,24 @@ impl App {
 
         self.notify(format!("🗜️ Summarizing {} messages…", msg_count));
 
-        // Call the model synchronously (non-streaming for simplicity)
+        // Call the model with timeout to prevent hangs
         let summary = if let Some(client) = self.ollama_client.clone() {
             let summary_msg = vec![crate::message::Message::new("user", &summary_prompt)];
             let (tool_cap, ctx_win) = self.compression_params();
-            match client.generate(summary_msg, None, &self.effective_params(), tool_cap, ctx_win).await {
-                Ok(s) => s,
-                Err(e) => {
+            
+            let timeout_result = tokio::time::timeout(
+                std::time::Duration::from_secs(90),
+                client.generate(summary_msg, None, &self.effective_params(), tool_cap, ctx_win),
+            ).await;
+            
+            match timeout_result {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     self.notify(format!("❌ Summarization failed: {}", e));
+                    return;
+                }
+                Err(_) => {
+                    self.notify("❌ Compression timeout (90s) — model may be stuck. Try again or increase timeout with /ctx.");
                     return;
                 }
             }
