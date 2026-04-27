@@ -3315,10 +3315,11 @@ impl App {
         if !fits {
             self.push_agent_notice(format!(
                 "⚠️ CONTEXT OVERFLOW: query + context = {} tokens ({}% of {} available). \
-                 Run /compress to summarize history, or increase context with /ctx {}",
-                est_tokens, usage_pct, ctx_window,
-                (ctx_window as f64 * 1.5) as u32
+                 Auto-compressing now...",
+                est_tokens, usage_pct, ctx_window
             ));
+            // Trigger auto-compress escape hatch
+            self.pending_auto_compress = true;
         } else if usage_pct >= 80 {
             self.push_agent_notice(format!(
                 "⚠️ Context at {}% ({} / {} tokens). If task fails, run /compress",
