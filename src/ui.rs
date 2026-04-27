@@ -824,6 +824,63 @@ impl App {
         }
     }
 
+    /// Interpolate gradient color at a specific Y position within the messages area.
+    /// position_ratio: 0.0 = gradient_start, 1.0 = gradient_end.
+    /// Returns an interpolated RGB color.
+    fn get_gradient_color_at_y(&self, position_ratio: f32) -> Color {
+        let clamped = position_ratio.max(0.0).min(1.0);
+        
+        let (start_r, start_g, start_b) = match self.theme.gradient_start {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => (0.0, 0.0, 0.0),
+        };
+        
+        let (end_r, end_g, end_b) = match self.theme.gradient_end {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => (255.0, 255.0, 255.0),
+        };
+        
+        let r = (start_r + (end_r - start_r) * clamped) as u8;
+        let g = (start_g + (end_g - start_g) * clamped) as u8;
+        let b = (start_b + (end_b - start_b) * clamped) as u8;
+        
+        Color::Rgb(r, g, b)
+    }
+
+    /// Boost saturation of a color for better readability against gradient.
+    /// Light mode: increase saturation slightly.
+    /// Dark mode: subtle brightness boost.
+    fn boost_band_color(&self, color: Color) -> Color {
+        match color {
+            Color::Rgb(r, g, b) => {
+                if self.theme.kind == crate::theme::ThemeKind::Light {
+                    // Light mode: nudge towards saturation (increase distance from gray)
+                    // Find max and min to compute current saturation
+                    let max = r.max(g).max(b);
+                    let min = r.min(g).min(b);
+                    let delta = (max - min) as i32;
+                    
+                    // Increase saturation by pushing channels toward extremes
+                    let boost_factor = 1.15;
+                    let mid = ((max as f32 + min as f32) / 2.0) as i32;
+                    let r_new = ((r as i32 - mid) as f32 * boost_factor + mid as f32) as u8;
+                    let g_new = ((g as i32 - mid) as f32 * boost_factor + mid as f32) as u8;
+                    let b_new = ((b as i32 - mid) as f32 * boost_factor + mid as f32) as u8;
+                    
+                    Color::Rgb(r_new, g_new, b_new)
+                } else {
+                    // Dark mode: subtle brightness increase for differentiation
+                    let r_new = (r as u16).saturating_add(20).min(255) as u8;
+                    let g_new = (g as u16).saturating_add(20).min(255) as u8;
+                    let b_new = (b as u16).saturating_add(20).min(255) as u8;
+                    
+                    Color::Rgb(r_new, g_new, b_new)
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Build (or rebuild) the pre-rendered message cache.
     /// Called before draw() whenever the message list, terminal width, or theme changes.
     /// This amortizes syntax-highlighting cost: O(N) only on changes, O(1) per frame.
@@ -871,6 +928,8 @@ impl App {
         };
 
         let mut divider_inserted = false;
+        let mut cumulative_height: u16 = 0;
+        let viewport_height_est = 30u16; // Reasonable estimate for typical viewport
 
         for (msg_idx, msg) in self.messages_cache.iter().enumerate() {
             // Insert divider before the first in-context message
@@ -894,6 +953,7 @@ impl App {
                         let height = 1u16;
                         cache.push(CachedRender { blank, content: divider_content, style: Style::default(), height });
                         divider_inserted = true;
+                        cumulative_height += height;
                     }
                 }
             }
@@ -903,22 +963,47 @@ impl App {
             let is_tool_msg = msg.role == "tool" || msg.role == "spawn";
             let is_expanded = self.zero_truncation || self.expanded_msgs.contains(&msg_idx);
 
+            // Calculate position ratio for gradient color sampling
+            let position_ratio = if viewport_height_est > 0 {
+                (cumulative_height as f32) / (viewport_height_est as f32)
+            } else {
+                0.5
+            };
+
             let (emoji, bg_tint, show_band) = match msg.role.as_str() {
                 "user" => {
                     exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
+                    // Derive color from gradient instead of using fixed band
+                    let base_color = self.get_gradient_color_at_y(position_ratio);
+                    let tint = self.boost_band_color(base_color);
                     ("👤", Some(tint), true)
                 }
                 "assistant" => {
                     exchange_idx += 1;
-                    let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
+                    // Derive color from gradient instead of using fixed band
+                    let base_color = self.get_gradient_color_at_y(position_ratio);
+                    let tint = self.boost_band_color(base_color);
                     ("🤖", Some(tint), true)
                 }
                 "tool"   => ("🔧", None, false),
                 "system" => ("⚙️", None, false),
                 "notice" => ("📋", None, false),
                 "clock"  => ("🕐", None, false),
-                "spawn"  => ("🤖", Some(self.theme.band_spawn), true),
+                "spawn"  => {
+                    // Spawn messages get a subtle tint: derive from gradient but push towards teal
+                    let base_color = self.get_gradient_color_at_y(position_ratio);
+                    let tint = match base_color {
+                        Color::Rgb(r, g, b) => {
+                            // Teal-ish: boost blue and green, reduce red
+                            let r_adj = (r as f32 * 0.8) as u8;
+                            let g_adj = (g as f32 * 1.2).min(255.0) as u8;
+                            let b_adj = (b as f32 * 1.3).min(255.0) as u8;
+                            self.boost_band_color(Color::Rgb(r_adj, g_adj, b_adj))
+                        }
+                        other => other,
+                    };
+                    ("🤖", Some(tint), true)
+                }
                 _        => ("💬", None, false),
             };
 
@@ -977,6 +1062,7 @@ impl App {
 
             let blank = ratatui::text::Text::from(" ".to_string());
             cache.push(CachedRender { blank, content, style, height });
+            cumulative_height = cumulative_height.saturating_add(height + 1); // +1 for blank line
         }
 
         self.render_cache_exchange_end = exchange_idx;
@@ -3734,7 +3820,10 @@ impl App {
         // Add streaming text as a virtual message at the end
         let is_streaming = self.turn_phase == TurnPhase::Streaming;
         if !self.streaming_text.is_empty() || !self.thinking_text.is_empty() || is_streaming {
-            let tint = if exchange_idx % 2 == 0 { self.theme.band_a } else { self.theme.band_b };
+            // Derive gradient color for streaming — estimate position at bottom of viewport
+            let position_ratio = 0.8; // Near the end of message stream
+            let base_color = self.get_gradient_color_at_y(position_ratio);
+            let tint = self.boost_band_color(base_color);
             let agent_badge = if self.active_subagents > 0 {
                 format!(" [🤖{}]", self.active_subagents)
             } else {
@@ -3815,7 +3904,10 @@ impl App {
 
         // Show live subagent output while a subagent is running
         if !self.subagent_live_text.is_empty() {
-            let tint = if exchange_idx % 2 == 0 { self.theme.band_b } else { self.theme.band_a };
+            // Derive gradient color for subagent — estimate position after streaming
+            let position_ratio = 0.85;
+            let base_color = self.get_gradient_color_at_y(position_ratio);
+            let tint = self.boost_band_color(base_color);
             // Show last 500 chars to keep it concise
             let tail = if self.subagent_live_text.chars().count() > 500 {
                 let start_idx = self.subagent_live_text.chars().count() - 500;
@@ -3836,7 +3928,10 @@ impl App {
 
         // Show running async tasks indicator
         if !self.async_tasks.is_empty() {
-            let tint = if exchange_idx % 2 == 0 { self.theme.band_b } else { self.theme.band_a };
+            // Derive gradient color for async tasks — estimate position at end
+            let position_ratio = 0.9;
+            let base_color = self.get_gradient_color_at_y(position_ratio);
+            let tint = self.boost_band_color(base_color);
             let tasks_str: String = self.async_tasks.iter()
                 .map(|t| {
                     let secs = t.started_at.elapsed().as_secs();
