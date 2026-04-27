@@ -2676,13 +2676,61 @@ impl App {
                     }
                 };
                 
-                self.inline_tool_results.push(InlineToolResult {
-                    tool_name: result.tool_name.clone(),
-                    start_time: std::time::Instant::now(),
-                    output: output_for_display,
-                    is_complete: true,
-                    exit_code: inferred_exit_code,
-                });
+                // Handle batch results: split into individual tool entries so each appears separately in /zt
+                if result.tool_name == "__batch__" {
+                    // Parse the combined output to extract individual tool results
+                    let output_str = match &result.output {
+                        Ok(s) => s.as_str(),
+                        Err(e) => e.as_str(),
+                    };
+                    
+                    // Extract [TOOL_OUTPUT: name = ...] and [TOOL_ERROR: name = ...] blocks
+                    let mut current_pos = 0;
+                    while let Some(start) = output_str[current_pos..].find("[TOOL_") {
+                        let start = current_pos + start;
+                        // Find the closing ']' (this is tricky due to nested content, but [TOOL_OUTPUT: name = content] has no nested brackets)
+                        let line_end = output_str[start..].find('\n').map(|p| start + p).unwrap_or(output_str.len());
+                        let block = &output_str[start..line_end];
+                        
+                        // Extract tool name: "TOOL_OUTPUT: name = " or "TOOL_ERROR: name = "
+                        if let Some(name_start) = block.find(": ") {
+                            let after_marker = &block[name_start + 2..];
+                            if let Some(name_end) = after_marker.find(" = ") {
+                                let tool_name = after_marker[..name_end].to_string();
+                                let content_start = name_start + 2 + name_end + 3;
+                                let mut content = output_str[start + content_start..].to_string();
+                                
+                                // Remove the closing ']' if present
+                                if content.ends_with(']') {
+                                    content.pop();
+                                }
+                                
+                                // Determine if this is an error or success
+                                let is_error = block.starts_with("[TOOL_ERROR:");
+                                let exit_code = if is_error { Some(1) } else { Some(0) };
+                                
+                                self.inline_tool_results.push(InlineToolResult {
+                                    tool_name,
+                                    start_time: std::time::Instant::now(),
+                                    output: content,
+                                    is_complete: true,
+                                    exit_code,
+                                });
+                            }
+                        }
+                        
+                        current_pos = line_end + 1;
+                    }
+                } else {
+                    // Single tool result
+                    self.inline_tool_results.push(InlineToolResult {
+                        tool_name: result.tool_name.clone(),
+                        start_time: std::time::Instant::now(),
+                        output: output_for_display,
+                        is_complete: true,
+                        exit_code: inferred_exit_code,
+                    });
+                }
 
                 // Inject result into streaming_text so it appears inline mid-response
                 // This avoids the janky effect of a separate message appearing
