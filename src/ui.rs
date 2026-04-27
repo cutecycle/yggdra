@@ -2669,16 +2669,11 @@ impl App {
                     exit_code: inferred_exit_code,
                 });
 
-                // Persist tool result
-                let tool_msg = Message::new("tool", &output_text);
-                if let Err(e) = self.message_buffer.add_and_persist(tool_msg) {
-                    self.notify(format!("⚠️ Failed to save tool result: {}", e));
-                    self.turn_phase = TurnPhase::Idle;
-                    self.tool_iteration_count = 0;
-                    return;
-                }
-                self.cached_message_count = self.message_buffer.count()
-                    .unwrap_or(self.cached_message_count + 1);
+                // Inject result into streaming_text so it appears inline mid-response
+                // This avoids the janky effect of a separate message appearing
+                self.streaming_text.push('\n');
+                self.streaming_text.push_str(&output_text);
+                self.streaming_text.push('\n');
 
                 // Start next streaming generation with full history including tool result
                 // think tool calls don't count against the iteration limit
@@ -4171,7 +4166,14 @@ impl App {
             spans.push(Span::styled(format!(" 💬{}", self.cached_message_count), bright));
             Line::from(spans)
         };
-        let status_bar = Paragraph::new(status_line);
+        // Apply background color to status bar for contrast
+        let status_bg = if is_dark_theme {
+            Color::Rgb(40, 40, 50)  // Dark bg for dark theme
+        } else {
+            Color::Rgb(200, 200, 200)  // Light bg for light theme (e.g. Solarized light)
+        };
+        let status_bar = Paragraph::new(status_line)
+            .style(Style::default().bg(status_bg));
         f.render_widget(status_bar, chunks[5]);
 
         // Render task progress bar if active (colored background in status bar area)
