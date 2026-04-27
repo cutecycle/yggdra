@@ -202,7 +202,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand { name: "models", description: "List available Ollama models",       keywords: "list llm ollama choose switch",     fill: "/models" },
     PaletteCommand { name: "params", description: "Set model params (temperature, top_k…)", keywords: "temperature top_k top_p repeat penalty params sampling", fill: "/set_params " },
     PaletteCommand { name: "temperature", description: "Set sampling temperature (0.0–2.0)", keywords: "temperature heat creativity sampling randomness", fill: "/temperature " },
-    PaletteCommand { name: "ctx",    description: "Set context window size",           keywords: "context window size tokens",      fill: "/ctx " },
+    PaletteCommand { name: "ctx",    description: "Set context window size (or bare /ctx to reset to model default)", keywords: "context window size tokens reset default", fill: "/ctx " },
     PaletteCommand { name: "toolcap", description: "Set tool output cap (chars, or 'off')", keywords: "tool output truncate cap compress context", fill: "/toolcap " },
     PaletteCommand { name: "zt",      description: "Toggle zero-truncation (show full raw tool output)", keywords: "truncation raw full output tool context debug", fill: "/zt" },
     PaletteCommand { name: "stats",   description: "Show cumulative session stats",       keywords: "stats metrics tokens usage tools sessions uptime", fill: "/stats" },
@@ -5032,9 +5032,21 @@ impl App {
                 msg = "❌ Nothing to abort (not currently running)".to_string();
             }
             self.notify(msg);
-        } else if command.starts_with("/ctx ") {
-            let ctx_str = command.strip_prefix("/ctx ").unwrap_or("").trim();
-            if let Ok(new_ctx) = ctx_str.parse::<u32>() {
+        } else if command == "/ctx" || command.starts_with("/ctx ") {
+            let ctx_str = command.strip_prefix("/ctx").unwrap_or("").trim();
+            
+            if ctx_str.is_empty() {
+                // /ctx with no argument: reset to model default
+                self.config.context_window = None;
+                let _ = self.config.save();
+                let native_ctx = self.ollama_client.as_ref().and_then(|c| c.get_native_ctx());
+                let msg = if let Some(ctx) = native_ctx {
+                    format!("🎯 Context window reset to model default ({} tokens)", ctx)
+                } else {
+                    "🎯 Context window reset to model default".to_string()
+                };
+                self.notify(msg);
+            } else if let Ok(new_ctx) = ctx_str.parse::<u32>() {
                 if new_ctx < 128 {
                     self.notify("❌ Context window must be at least 128 tokens");
                 } else if new_ctx > 200000 {
@@ -5046,7 +5058,7 @@ impl App {
                 }
             } else {
                 let current = self.effective_context_window();
-                self.notify(format!("❌ Usage: /ctx <number> (current: {})", current));
+                self.notify(format!("❌ Usage: /ctx [number]  (current: {}, /ctx to reset to model default)", current));
             }
         } else if command.starts_with("/toolcap ") {
             let arg = command.strip_prefix("/toolcap ").unwrap_or("").trim();
