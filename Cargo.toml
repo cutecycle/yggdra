@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "yggdra-shell"
-path = "src/main.rs"
+path = "src/bin/yggdra-shell.rs"
 
 [[bin]]
 name = "test_models"
