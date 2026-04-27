@@ -4459,6 +4459,7 @@ impl App {
                 if self.palette_open && (self.input_buffer.is_empty() || !self.input_buffer.starts_with('/')) {
                     self.palette_open = false;
                 }
+                self.render_cache_dirty = true;
             }
             KeyCode::Down if self.palette_open => {
                 let count = self.palette_matches().len();
