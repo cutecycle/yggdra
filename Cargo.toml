@@ -11,7 +11,7 @@ documentation = "https://github.com/cutecycle/yggdra"
 readme = "README.md"
 keywords = ["tui", "llm", "ollama", "agent", "cli"]
 categories = ["command-line-utilities", "command-line-interface"]
-exclude = [".github", "target", ".yggdra/**", "models.json", "*.txt", "vendor"]
+exclude = [".github", "target", ".yggdra/**", "models.json", "*.txt", "vendor", "target-*"]
 
 [lib]
 name = "yggdra"
