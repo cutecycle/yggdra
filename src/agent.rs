@@ -120,11 +120,31 @@ Search the local knowledge base (only available when .yggdra/knowledge/ exists):
 <query>async trait lifetime</query>
 <desc>Search knowledge base for async trait patterns.</desc>
 
+Write to an ephemeral session panel (display info in side panels while working):
+<tool>panel</tool>
+<panel_name>diagnostics</panel_name>
+<content>
+Key metrics:
+- Tests: 42/45 passing
+- Coverage: 87%
+</content>
+<column>0</column>
+<clear>true</clear>
+<desc>Display diagnostics in left panel.</desc>
+
 Optional tags on shell (add after <desc>):
   <returnlines>1-50</returnlines>   — slice output to line range
   <mode>async</mode>                — run in background, continue immediately
   <task_id>my-task</task_id>        — required with async; result in .yggdra/async/my-task.txt
   <tellhuman>message</tellhuman>    — show message to human + macOS notification
+
+Optional tags on panel (add after <content>):
+  <column>N</column>                — integer column index where N ∈ [0, num_columns-1], 
+                                      excluding center column (reserved for main chat).
+                                      Terminal width determines num_columns: 160-char terminal = 8 cols
+                                      (0-7, center at 4); 240-char ultrawide = 12 cols (0-11, center at 6).
+                                      Discover available columns by querying panel layout metrics.
+  <clear>true</clear>               — clear existing content before writing (default: false)
 
 THINK: reason inside <think>...</think> before acting — stripped before execution.
 
