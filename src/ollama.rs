@@ -721,6 +721,7 @@ impl OllamaClient {
     pub async fn new_with_key(endpoint: &str, model: &str, api_key: Option<&str>) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))  // 2-minute timeout for entire request/response
             // TCP keepalive: 1 hour to maintain connection across idle periods
             .tcp_keepalive(Duration::from_secs(3600))
             // Connection pool idle timeout: 1 hour
@@ -772,6 +773,7 @@ impl OllamaClient {
     pub fn new_unchecked(endpoint: &str, model: &str, api_key: Option<&str>) -> anyhow::Result<Self> {
         let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))  // 2-minute timeout for entire request/response
             .tcp_keepalive(Duration::from_secs(3600))
             .pool_idle_timeout(Duration::from_secs(3600))
             .build()?;

@@ -713,6 +713,11 @@ impl App {
         let project_context = build_project_context(10000);
         let recent_files_content = build_recent_files_content(5, 2000);
 
+        // Initialize cached_message_count to the actual count in the database.
+        // This ensures the first draw will reload messages from disk.
+        // If the count can't be fetched, default to 0.
+        let initial_cached_message_count = message_buffer.count().unwrap_or(0);
+
         Self {
             config,
             session,
@@ -724,7 +729,7 @@ impl App {
             task_manager,
             ollama_client,
             tool_registry: ToolRegistry::new(),
-            cached_message_count: 0,
+            cached_message_count: initial_cached_message_count,
             streaming_text: String::new(),
             thinking_text: String::new(),
             in_think_block: false,
@@ -1093,6 +1098,28 @@ impl App {
         // NOW create guard (enables raw mode + alternate screen) AFTER terminal is initialized
         let _guard = TerminalGuard::new()?;
 
+        // Set up signal handlers for graceful shutdown
+        // When SIGINT (Ctrl+C) or SIGTERM is received, set running = false to exit the loop
+        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("Failed to setup SIGINT handler");
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to setup SIGTERM handler");
+            loop {
+                tokio::select! {
+                    _ = sigint.recv() => {
+                        let _ = signal_tx.send(());
+                        break;
+                    }
+                    _ = sigterm.recv() => {
+                        let _ = signal_tx.send(());
+                        break;
+                    }
+                }
+            }
+        });
+
         // In Build mode, fire a kick prompt to orient the agent.
         // One mode waits for the user to specify their task first.
         if self.mode == AppMode::Forever {
@@ -1265,6 +1292,12 @@ impl App {
                 } else {
                     break 'events;
                 }
+            }
+
+            // Check for signals (Ctrl+C / SIGINT / SIGTERM) — this is our interrupt point
+            if signal_rx.try_recv().is_ok() {
+                self.running = false;
+                break;
             }
 
             if !self.running {
@@ -3328,6 +3361,17 @@ impl App {
         base.push_str(&agent::json_tool_descriptions());
         base.push_str("\n---\n");
 
+        // Async instructions moved to top for visibility
+        base.push_str(
+            "⚡ ASYNC MODE (use for background work):\n\
+             Add <mode>async</mode> and <task_id>my-task</task_id> tags to any shell call.\n\
+             You get an immediate ack and continue working while it runs in background.\n\
+             Result injected as [ASYNC_RESULT: my-task = ...] when done.\n\
+             Use async for: downloads, long builds, test suites, package installs, large files.\n\
+             Example: <shell><mode>async</mode><task_id>fetch-data</task_id>curl -L https://... -o file.zip</shell>\n\
+             ---\n"
+        );
+
         // Inject project root so the model always knows where to put files
         let root_display = crate::sandbox::project_root()
             .map(|p| p.display().to_string())
@@ -3344,13 +3388,7 @@ impl App {
         ));
 
         base.push_str(
-            "ASYNC: add <mode>async</mode> and <task_id>my-task</task_id> tags to any call\n\
-             to run it in the background. You get an immediate ack and continue.\n\
-             Result injected as [ASYNC_RESULT: my-task = ...] when done.\n\
-             Output also written to .yggdra/async/my-task.txt for inspection.\n\
-             Use async for: long builds, test suites, background installs.\n\
-             ---\n\
-             CODE EDITING — reliable shell patterns:\n\
+            "CODE EDITING — reliable shell patterns:\n\
              1. Read first — always get exact lines before changing:\n\
                 cat -n src/foo.rs | sed -n '25,40p'\n\
              2. Single-line replace by line number (no regex, handles any chars):\n\
@@ -3377,7 +3415,7 @@ impl App {
                  Use the knowledge tool to search it:\n\
                  <tool>knowledge</tool>\n\
                  <query>async trait lifetime</query>\n\
-                 shell \"ls .yggdra/knowledge/\"              — list categories\n\
+                 Available categories are in the file tree above. Read specific docs:\n\
                  shell \"cat .yggdra/knowledge/INDEX.md\"     — full index\n\
                  shell \"cat .yggdra/knowledge/rust/some-doc.md\" — read a doc"
             );
@@ -3408,8 +3446,7 @@ impl App {
             base.push_str("\n---\n--- AGENTS.md ---\n");
             base.push_str(ctx);
         } else {
-            base.push_str("\n---\nNo AGENTS.md exists yet. Use shell \"cat AGENTS.md\" or \
-                shell \"ls\" to explore the directory.");
+            base.push_str("\n---\nNo AGENTS.md exists yet.");
         }
         crate::dlog!("steering_text: injecting project_context ({} bytes)", self.project_context.len());
         // Inject live project file listing — model knows what exists without ls/find turns
@@ -4031,9 +4068,8 @@ impl App {
 
         let mut skipped: i32 = 0;
         let mut current_y = messages_area.top();
-        const MESSAGE_SPACING: u16 = 1; // Add 1 blank line between messages
 
-        for (idx, rm) in rendered.iter().enumerate() {
+        for rm in &rendered {
             let msg_h = rm.height as i32;
 
             // Skip messages that are entirely above the viewport
@@ -4068,11 +4104,6 @@ impl App {
 
             f.render_widget(msg_para, msg_area);
             current_y += draw_height;
-            
-            // Add spacing between messages (except after the last one)
-            if idx < rendered.len() - 1 && current_y < messages_area.bottom() {
-                current_y += MESSAGE_SPACING;
-            }
         }
 
         // Scroll indicator in top-right of messages area
