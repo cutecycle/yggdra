@@ -396,6 +396,25 @@ pub fn validate_endpoint(endpoint: &str) -> Result<()> {
     }
 }
 
+/// Check if an endpoint is localhost/loopback (http://127.0.0.1, http://localhost, etc.)
+/// Returns false for remote endpoints like https://openrouter.ai
+pub fn is_localhost_endpoint(endpoint: &str) -> bool {
+    match url::Url::parse(endpoint) {
+        Ok(url) => {
+            match url.host() {
+                Some(url::Host::Ipv4(ip)) => ip.octets()[0] == 127,
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                Some(url::Host::Domain(domain)) => {
+                    let lower = domain.to_lowercase();
+                    lower == "localhost" || lower == "localhost.localdomain"
+                }
+                None => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 impl FileConfig {
     fn load() -> Self {
         let cwd = std::env::current_dir().ok();

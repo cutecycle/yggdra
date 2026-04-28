@@ -2857,6 +2857,15 @@ impl App {
                     // Ask mode: autonomously execute read-only tools and loop until </done>.
                     // Kick a new stream to let the agent continue processing the tool result.
                     if let Some(client) = self.ollama_client.clone() {
+                        // Persist the tool result to message buffer so LLM sees it in context
+                        let tool_result_msg = Message::new("user", &output_text);
+                        if let Err(e) = self.message_buffer.add_and_persist(tool_result_msg) {
+                            self.notify(format!("⚠️ Tool result not saved: {}", e));
+                        } else {
+                            self.cached_message_count = self.message_buffer.count()
+                                .unwrap_or(self.cached_message_count + 1);
+                        }
+                        
                         let steering_text = self.steering_text();
                         let messages = self.message_buffer.messages().unwrap_or_default();
                         let (tool_cap, ctx_win) = self.compression_params();
@@ -2875,6 +2884,15 @@ impl App {
                         self.tool_iteration_count = 0;
                     }
                 } else if let Some(client) = self.ollama_client.clone() {
+                    // Persist the tool result to message buffer so LLM sees it in context
+                    let tool_result_msg = Message::new("user", &output_text);
+                    if let Err(e) = self.message_buffer.add_and_persist(tool_result_msg) {
+                        self.notify(format!("⚠️ Tool result not saved: {}", e));
+                    } else {
+                        self.cached_message_count = self.message_buffer.count()
+                            .unwrap_or(self.cached_message_count + 1);
+                    }
+                    
                     let steering_text = self.steering_text();
                     let messages = self.message_buffer.messages().unwrap_or_default();
                     let (tool_cap, ctx_win) = self.compression_params();
@@ -6733,9 +6751,11 @@ impl App {
         // Watchdog: if Build mode has been idle for 5+ seconds, re-kick.
         // One mode does not auto-kick — it waits for user input.
         // Respect autokick_paused: model is stuck or erroring, don't re-kick.
+        // Only apply battery-aware delay to localhost endpoints; remote endpoints should kick immediately
+        let is_localhost = crate::config::is_localhost_endpoint(&self.config.endpoint);
         if self.mode == AppMode::Forever
             && self.turn_phase == TurnPhase::Idle
-            && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(5)
+            && self.last_build_kick.elapsed() >= std::time::Duration::from_secs(if is_localhost { 5 } else { 0 })
             && self.ollama_client.is_some()
             && !self.autokick_paused
         {
