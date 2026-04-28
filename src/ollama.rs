@@ -397,16 +397,6 @@ pub(crate) struct OaiStreamState {
     pub gen_tokens: u32,
 }
 
-/// Result of parsing one `data:` line from an OpenAI SSE stream.
-pub(crate) enum SseDataResult {
-    /// Zero or more intermediate events (Token / ThinkToken).
-    Events(Vec<StreamEvent>),
-    /// Terminal event — caller must send it and return.
-    Done(StreamEvent),
-    /// Nothing to emit (empty line, SSE comment, JSON parse error).
-    Skip,
-}
-
 /// Split `buffer` on newlines.  Returns complete trimmed lines and the
 /// still-incomplete remainder (no trailing newline yet).
 pub(crate) fn split_newline_buffer(buffer: &str) -> (Vec<String>, String) {
@@ -459,46 +449,6 @@ pub(crate) fn parse_ollama_chunk(
     }
 }
 
-/// Parse one `data:` payload from an OpenAI SSE stream.
-/// The caller is responsible for stripping the `data: ` prefix and filtering
-/// empty lines / SSE comments before calling this function.
-pub(crate) fn parse_openai_sse_data(
-    data: &str,
-    state: &mut OaiStreamState,
-    context_trimmed: bool,
-    msgs_dropped: usize,
-) -> SseDataResult {
-    if data == "[DONE]" {
-        return SseDataResult::Done(StreamEvent::Done {
-            prompt_tokens: state.prompt_tokens,
-            gen_tokens: state.gen_tokens,
-            had_thinking: state.had_thinking,
-            eval_duration_ns: None,
-            context_trimmed,
-            msgs_dropped,
-        });
-    }
-    match serde_json::from_str::<OAIStreamChunk>(data) {
-        Ok(chunk) => {
-            if let Some(usage) = &chunk.usage {
-                state.prompt_tokens = usage.prompt_tokens;
-                state.gen_tokens = usage.completion_tokens;
-            }
-            let mut events = Vec::new();
-            for choice in &chunk.choices {
-                if !choice.delta.reasoning_content.is_empty() {
-                    state.had_thinking = true;
-                    events.push(StreamEvent::ThinkToken(choice.delta.reasoning_content.clone()));
-                }
-                if !choice.delta.content.is_empty() {
-                    events.push(StreamEvent::Token(choice.delta.content.clone()));
-                }
-            }
-            SseDataResult::Events(events)
-        }
-        Err(_) => SseDataResult::Skip,
-    }
-}
 
 /// Process one already-deserialized OpenAI stream chunk (from `async_openai` byot stream).
 /// Updates `state` with usage and thinking flag; returns Token/ThinkToken events.
@@ -599,19 +549,30 @@ async fn stream_openai(
     let mut chunks_seen = 0u32;
     let mut content_chunks = 0u32;
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(chunk) => {
-                chunks_seen += 1;
-                let events = process_oai_chunk(&chunk, &mut state);
-                for event in events {
-                    if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
-                    if tx.send(event).is_err() { return; }
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+        match chunk {
+            Ok(Some(result)) => {
+                match result {
+                    Ok(chunk) => {
+                        chunks_seen += 1;
+                        let events = process_oai_chunk(&chunk, &mut state);
+                        for event in events {
+                            if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
+                            if tx.send(event).is_err() { return; }
+                        }
+                    }
+                    Err(e) => {
+                        crate::dlog!("stream_openai: stream error: {}", e);
+                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                        return;
+                    }
                 }
             }
-            Err(e) => {
-                crate::dlog!("stream_openai: stream error: {}", e);
-                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+            Ok(None) => break,
+            Err(_) => {
+                crate::dlog!("stream_openai: chunk read timeout");
+                let _ = tx.send(StreamEvent::Error("Stream read timeout (no chunks for 30s)".to_string()));
                 return;
             }
         }
@@ -668,33 +629,44 @@ async fn stream_llamacpp(
     let mut chunks_seen = 0u32;
     let mut content_chunks = 0u32;
 
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(bytes) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                let (lines, remainder) = split_newline_buffer(&buffer);
-                buffer = remainder;
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+        match chunk {
+            Ok(Some(chunk_result)) => {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let (lines, remainder) = split_newline_buffer(&buffer);
+                        buffer = remainder;
 
-                for line in lines {
-                    if line.is_empty() { continue; }
-                    chunks_seen += 1;
-                    let events = parse_llamacpp_chunk(&line, context_trimmed, msgs_dropped);
-                    for event in events {
-                        let is_done = matches!(event, StreamEvent::Done { .. });
-                        if is_done {
-                            crate::dlog!("stream_llamacpp: stop received chunks={} content_chunks={}", chunks_seen, content_chunks);
-                            let _ = tx.send(event);
-                            return;
-                        } else {
-                            if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
-                            if tx.send(event).is_err() { return; }
+                        for line in lines {
+                            if line.is_empty() { continue; }
+                            chunks_seen += 1;
+                            let events = parse_llamacpp_chunk(&line, context_trimmed, msgs_dropped);
+                            for event in events {
+                                let is_done = matches!(event, StreamEvent::Done { .. });
+                                if is_done {
+                                    crate::dlog!("stream_llamacpp: stop received chunks={} content_chunks={}", chunks_seen, content_chunks);
+                                    let _ = tx.send(event);
+                                    return;
+                                } else {
+                                    if matches!(event, StreamEvent::Token(_)) { content_chunks += 1; }
+                                    if tx.send(event).is_err() { return; }
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        crate::dlog!("stream_llamacpp: stream error: {}", e);
+                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                        return;
                     }
                 }
             }
-            Err(e) => {
-                crate::dlog!("stream_llamacpp: stream error: {}", e);
-                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+            Ok(None) => break,
+            Err(_) => {
+                crate::dlog!("stream_llamacpp: chunk read timeout");
+                let _ = tx.send(StreamEvent::Error("Stream read timeout (no chunks for 30s)".to_string()));
                 return;
             }
         }
@@ -1233,30 +1205,41 @@ impl OllamaClient {
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
                     let mut had_thinking = false;
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                let (lines, remainder) = split_newline_buffer(&buffer);
-                                buffer = remainder;
-                                for line in lines {
-                                    let events = parse_ollama_chunk(&line, &mut had_thinking, context_trimmed, msgs_dropped);
-                                    for event in events {
-                                        let is_done = matches!(event, StreamEvent::Done { .. });
-                                        if is_done {
-                                            if let StreamEvent::Done { prompt_tokens, gen_tokens, .. } = &event {
-                                                dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
+                    loop {
+                        let chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+                        match chunk {
+                            Ok(Some(chunk_result)) => {
+                                match chunk_result {
+                                    Ok(bytes) => {
+                                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                        let (lines, remainder) = split_newline_buffer(&buffer);
+                                        buffer = remainder;
+                                        for line in lines {
+                                            let events = parse_ollama_chunk(&line, &mut had_thinking, context_trimmed, msgs_dropped);
+                                            for event in events {
+                                                let is_done = matches!(event, StreamEvent::Done { .. });
+                                                if is_done {
+                                                    if let StreamEvent::Done { prompt_tokens, gen_tokens, .. } = &event {
+                                                        dlog!("generate_streaming: stream DONE prompt_tokens={prompt_tokens} gen_tokens={gen_tokens} had_thinking={had_thinking}");
+                                                    }
+                                                    let _ = tx.send(event);
+                                                    return;
+                                                } else if tx.send(event).is_err() {
+                                                    return;
+                                                }
                                             }
-                                            let _ = tx.send(event);
-                                            return;
-                                        } else if tx.send(event).is_err() {
-                                            return;
                                         }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                                        return;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                            Ok(None) => break,
+                            Err(_) => {
+                                dlog!("generate_streaming: chunk read timeout");
+                                let _ = tx.send(StreamEvent::Error("Stream read timeout (no chunks for 30s)".to_string()));
                                 return;
                             }
                         }
@@ -1341,27 +1324,37 @@ impl OllamaClient {
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
                     let mut had_thinking = false;
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                let (lines, remainder) = split_newline_buffer(&buffer);
-                                buffer = remainder;
-                                for line in lines {
-                                    let events = parse_ollama_chunk(&line, &mut had_thinking, false, 0);
-                                    for event in events {
-                                        let is_done = matches!(event, StreamEvent::Done { .. });
-                                        if is_done {
-                                            let _ = tx.send(event);
-                                            return;
-                                        } else if tx.send(event).is_err() {
-                                            return;
+                    loop {
+                        let chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+                        match chunk {
+                            Ok(Some(chunk_result)) => {
+                                match chunk_result {
+                                    Ok(bytes) => {
+                                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                        let (lines, remainder) = split_newline_buffer(&buffer);
+                                        buffer = remainder;
+                                        for line in lines {
+                                            let events = parse_ollama_chunk(&line, &mut had_thinking, false, 0);
+                                            for event in events {
+                                                let is_done = matches!(event, StreamEvent::Done { .. });
+                                                if is_done {
+                                                    let _ = tx.send(event);
+                                                    return;
+                                                } else if tx.send(event).is_err() {
+                                                    return;
+                                                }
+                                            }
                                         }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                                        return;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e)));
+                            Ok(None) => break,
+                            Err(_) => {
+                                let _ = tx.send(StreamEvent::Error("Stream read timeout (no chunks for 30s)".to_string()));
                                 return;
                             }
                         }
@@ -2143,105 +2136,6 @@ mod tests {
         let mut ht = false;
         let events = parse_ollama_chunk("", &mut ht, false, 0);
         assert!(events.is_empty());
-    }
-
-    // ---- parse_openai_sse_data ----
-
-    #[test]
-    fn test_sse_data_content_token() {
-        let data = r#"{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data(data, &mut state, false, 0);
-        match result {
-            SseDataResult::Events(events) => {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0], StreamEvent::Token(ref s) if s == "hi"));
-            }
-            _ => panic!("expected Events"),
-        }
-    }
-
-    #[test]
-    fn test_sse_data_reasoning_content() {
-        let data = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"think","content":""},"finish_reason":null}]}"#;
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data(data, &mut state, false, 0);
-        match result {
-            SseDataResult::Events(events) => {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0], StreamEvent::ThinkToken(ref s) if s == "think"));
-                assert!(state.had_thinking);
-            }
-            _ => panic!("expected Events"),
-        }
-    }
-
-    #[test]
-    fn test_sse_data_usage_chunk() {
-        let data = r#"{"id":"x","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":8}}"#;
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data(data, &mut state, false, 0);
-        match result {
-            SseDataResult::Events(events) => {
-                assert!(events.is_empty());
-                assert_eq!(state.prompt_tokens, 5);
-                assert_eq!(state.gen_tokens, 8);
-            }
-            _ => panic!("expected Events"),
-        }
-    }
-
-    #[test]
-    fn test_sse_data_done_with_prior_usage() {
-        let mut state = OaiStreamState { prompt_tokens: 3, gen_tokens: 7, had_thinking: false };
-        let result = parse_openai_sse_data("[DONE]", &mut state, false, 0);
-        match result {
-            SseDataResult::Done(StreamEvent::Done { prompt_tokens, gen_tokens, .. }) => {
-                assert_eq!(prompt_tokens, 3);
-                assert_eq!(gen_tokens, 7);
-            }
-            _ => panic!("expected Done"),
-        }
-    }
-
-    #[test]
-    fn test_sse_data_done_no_prior_usage() {
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data("[DONE]", &mut state, false, 0);
-        match result {
-            SseDataResult::Done(StreamEvent::Done { prompt_tokens, gen_tokens, .. }) => {
-                assert_eq!(prompt_tokens, 0);
-                assert_eq!(gen_tokens, 0);
-            }
-            _ => panic!("expected Done"),
-        }
-    }
-
-    #[test]
-    fn test_sse_data_malformed_skip() {
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data("not json", &mut state, false, 0);
-        assert!(matches!(result, SseDataResult::Skip));
-    }
-
-    #[test]
-    fn test_sse_data_empty_skip() {
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data("", &mut state, false, 0);
-        assert!(matches!(result, SseDataResult::Skip));
-    }
-
-    #[test]
-    fn test_sse_data_multi_choice() {
-        let data = r#"{"id":"x","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null},{"index":1,"delta":{"content":"b"},"finish_reason":null}]}"#;
-        let mut state = OaiStreamState::default();
-        let result = parse_openai_sse_data(data, &mut state, false, 0);
-        match result {
-            SseDataResult::Events(events) => {
-                assert_eq!(events.len(), 2);
-            }
-            _ => panic!("expected Events"),
-        }
     }
 
     // ---- parse_llamacpp_chunk ----

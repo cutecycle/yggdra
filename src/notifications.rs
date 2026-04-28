@@ -48,6 +48,17 @@ pub async fn agent_says(message: &str) {
     send_notification_persistent("💬 Agent", message);
 }
 
+/// Notify user that agent is stuck (empty responses detected)
+pub async fn agent_blocked(message: &str) {
+    send_notification_persistent("⚠️ Agent Blocked", message);
+}
+
+/// Notify of a command timeout (synchronous version for non-async contexts)
+pub fn notify(message: &str) -> Result<(), String> {
+    dispatch("⏱️ Timeout", message, Some(5000));
+    Ok(())
+}
+
 /// Internal helper: send a timed notification with error logging.
 fn send_notification(summary: &str, body: &str, timeout_ms: i32) {
     if body.is_empty() {

@@ -257,6 +257,102 @@ pub fn lang_from_path(path: &str) -> &'static str {
     }
 }
 
+/// Detect language from code content using markdown markers or heuristics.
+/// Checks for:
+/// - Markdown code blocks: "```lang" at the start
+/// - Shebang lines: "#!/usr/bin/env python" or similar
+/// - File signatures: "<?php", "<!--", etc.
+/// - Keyword patterns: "fn ", "def ", "function ", etc.
+/// Returns the detected language name or "rust" as safe default.
+pub fn detect_language(content: &str) -> &'static str {
+    let trimmed = content.trim_start();
+    
+    // Check for markdown code block marker (```lang)
+    if trimmed.starts_with("```") {
+        let after_marker = &trimmed[3..];
+        if let Some(eol_pos) = after_marker.find('\n') {
+            let lang_tag = after_marker[..eol_pos].trim();
+            // Map common markdown language tags to our language names
+            return match lang_tag.to_lowercase().as_str() {
+                "rust" | "rs" => "rust",
+                "python" | "py" => "python",
+                "javascript" | "js" | "typescript" | "ts" | "jsx" | "tsx" => "javascript",
+                "go" | "golang" => "go",
+                "bash" | "sh" | "shell" | "zsh" | "fish" => "bash",
+                "c" => "c",
+                "cpp" | "c++" | "cxx" => "cpp",
+                "java" => "java",
+                "kotlin" | "kt" => "kotlin",
+                "swift" => "swift",
+                "zig" => "zig",
+                "toml" | "yaml" | "yml" | "json" => "toml",
+                _ => "rust", // unknown markdown lang tag → rust
+            };
+        }
+    }
+    
+    // Check for shebang
+    if trimmed.starts_with("#!") {
+        if trimmed.contains("python") {
+            return "python";
+        } else if trimmed.contains("ruby") {
+            return "rust"; // ruby not directly supported, fallback
+        } else if trimmed.contains("perl") {
+            return "rust"; // perl not directly supported, fallback
+        } else if trimmed.contains("node") {
+            return "javascript";
+        } else if trimmed.contains("bash") || trimmed.contains("sh") {
+            return "bash";
+        }
+    }
+    
+    // Check for file signatures
+    if trimmed.starts_with("<?php") {
+        return "rust"; // php not directly supported, fallback
+    } else if trimmed.starts_with("<!--") {
+        return "rust"; // html/xml, fallback
+    } else if trimmed.starts_with("<?xml") {
+        return "rust"; // xml, fallback
+    }
+    
+    // Heuristic keyword detection
+    let first_line = trimmed.lines().next().unwrap_or("");
+    
+    // Rust patterns
+    if first_line.contains("fn ") || first_line.contains("pub fn") || 
+       trimmed.contains("fn main()") || trimmed.contains("struct ") ||
+       trimmed.contains("impl ") {
+        return "rust";
+    }
+    
+    // Python patterns
+    if first_line.contains("def ") || first_line.contains("class ") ||
+       trimmed.contains("import ") && trimmed.contains("from ") {
+        return "python";
+    }
+    
+    // JavaScript/TypeScript patterns
+    if trimmed.contains("function ") || trimmed.contains("const ") ||
+       trimmed.contains("=>") || first_line.contains("console.log") {
+        return "javascript";
+    }
+    
+    // Go patterns
+    if first_line.contains("func ") || first_line.contains("package ") ||
+       trimmed.contains("interface ") && trimmed.contains("func ") {
+        return "go";
+    }
+    
+    // Bash patterns
+    if trimmed.contains("if [") || trimmed.contains("for ") && trimmed.contains("in ") ||
+       trimmed.contains("echo ") || trimmed.contains("$") {
+        return "bash";
+    }
+    
+    // Safe default
+    "rust"
+}
+
 /// Normalize code for display: expand tabs to 4 spaces and strip common leading whitespace.
 fn normalize_code(code: &str) -> String {
     // Step 1: expand tabs to 4 spaces
@@ -563,4 +659,78 @@ mod tests {
             assert!(!text.contains('\t'), "Tab should be expanded, got: {:?}", text);
         }
     }
+
+    #[test]
+    fn test_detect_language_markdown_rust() {
+        let code = "```rust\nfn main() {}\n```";
+        assert_eq!(detect_language(code), "rust");
+    }
+
+    #[test]
+    fn test_detect_language_markdown_python() {
+        let code = "```python\ndef hello():\n    pass\n```";
+        assert_eq!(detect_language(code), "python");
+    }
+
+    #[test]
+    fn test_detect_language_markdown_javascript() {
+        let code = "```javascript\nfunction hello() {}\n```";
+        assert_eq!(detect_language(code), "javascript");
+    }
+
+    #[test]
+    fn test_detect_language_shebang_python() {
+        let code = "#!/usr/bin/env python\nprint('hello')";
+        assert_eq!(detect_language(code), "python");
+    }
+
+    #[test]
+    fn test_detect_language_shebang_bash() {
+        let code = "#!/bin/bash\necho hello";
+        assert_eq!(detect_language(code), "bash");
+    }
+
+    #[test]
+    fn test_detect_language_heuristic_rust() {
+        let code = "fn main() {\n    println!(\"hello\");\n}";
+        assert_eq!(detect_language(code), "rust");
+    }
+
+    #[test]
+    fn test_detect_language_heuristic_python() {
+        let code = "def hello():\n    print('world')";
+        assert_eq!(detect_language(code), "python");
+    }
+
+    #[test]
+    fn test_detect_language_heuristic_javascript() {
+        let code = "function hello() {\n    console.log('world');\n}";
+        assert_eq!(detect_language(code), "javascript");
+    }
+
+    #[test]
+    fn test_detect_language_heuristic_go() {
+        let code = "package main\nfunc main() {}";
+        assert_eq!(detect_language(code), "go");
+    }
+
+    #[test]
+    fn test_detect_language_heuristic_bash() {
+        let code = "if [ $? -eq 0 ]; then\n    echo ok\nfi";
+        assert_eq!(detect_language(code), "bash");
+    }
+
+    #[test]
+    fn test_detect_language_fallback() {
+        let code = "some random text without clear patterns";
+        // Should fall back to rust as safe default
+        assert_eq!(detect_language(code), "rust");
+    }
+
+    #[test]
+    fn test_detect_language_whitespace_prefix() {
+        let code = "  \n```rust\nfn main() {}";
+        assert_eq!(detect_language(code), "rust");
+    }
 }
+

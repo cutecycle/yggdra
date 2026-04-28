@@ -10,6 +10,7 @@ use crate::tokens;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
+
 /// Tool call representation parsed from LLM output
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -94,14 +95,28 @@ pub fn is_hallucinated_output(text: &str) -> bool {
 
 /// Tool descriptions in XML format (used in the system prompt).
 pub fn json_tool_descriptions() -> String {
-    r#"TOOL FORMAT — XML tags, content is always literal (no escaping needed):
+    r#"═══════════════════════════════════════════════════════════
+TOOLS REFERENCE — Use XML tags. Content is always literal (no escaping needed).
+═══════════════════════════════════════════════════════════
 
-Run a shell command:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SHELL — Execute commands
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 <tool>shell</tool>
 <command>your sh -c command here</command>
 <desc>What you are doing and why.</desc>
 
-Create or overwrite a file (no escaping needed — write content verbatim):
+Optional enhancements:
+  <returnlines>1-50</returnlines>   → slice output to line range
+  <mode>async</mode>                → run in background, continue working
+  <task_id>my-task</task_id>        → required with async; result in .yggdra/async/my-task.txt
+  <tellhuman>message</tellhuman>    → show message to human + macOS notification
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SETFILE — Create or overwrite files
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 <tool>setfile</tool>
 <path>src/main.rs</path>
 <content>
@@ -109,18 +124,34 @@ fn main() {
     println!("hello");
 }
 </content>
-<desc>Create main.rs</desc>
+<desc>Create main.rs with initial code.</desc>
 
-Commit changes:
+Content is written verbatim with zero escaping required.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. COMMIT — Persist changes to git
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 <tool>commit</tool>
 <message>feat: add run function</message>
 
-Search the local knowledge base (only available when .yggdra/knowledge/ exists):
+Use present-tense, verb-first messages.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. KNOWLEDGE — Search local documentation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Available when .yggdra/knowledge/ exists.
+
 <tool>knowledge</tool>
 <query>async trait lifetime</query>
 <desc>Search knowledge base for async trait patterns.</desc>
 
-Write to an ephemeral session panel (display info in side panels while working):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PANEL — Display or stream content in side panels
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATIC PANEL (display fixed content):
 <tool>panel</tool>
 <panel_name>diagnostics</panel_name>
 <content>
@@ -132,36 +163,40 @@ Key metrics:
 <clear>true</clear>
 <desc>Display diagnostics in left panel.</desc>
 
-Optional tags on shell (add after <desc>):
-  <returnlines>1-50</returnlines>   — slice output to line range
-  <mode>async</mode>                — run in background, continue immediately
-  <task_id>my-task</task_id>        — required with async; result in .yggdra/async/my-task.txt
-  <tellhuman>message</tellhuman>    — show message to human + macOS notification
+STREAMING PANEL (live command output):
+<tool>panel</tool>
+<panel_name>build_output</panel_name>
+<command>cargo build 2>&1</command>
+<column>1</column>
+<stream>true</stream>
+<desc>Stream build output to right panel.</desc>
 
-Optional tags on panel (add after <content>):
-  <column>N</column>                — integer column index where N ∈ [0, num_columns-1], 
-                                      excluding center column (reserved for main chat).
-                                      Terminal width determines num_columns: 160-char terminal = 8 cols
-                                      (0-7, center at 4); 240-char ultrawide = 12 cols (0-11, center at 6).
-                                      Discover available columns by querying panel layout metrics.
-  <clear>true</clear>               — clear existing content before writing (default: false)
+Panel parameters:
+  <column>N</column>                → integer column index N ∈ [0, num_columns-1]
+                                      Terminal width determines available columns:
+                                      • 160-char terminal = 8 cols (center=4)
+                                      • 240-char ultrawide = 12 cols (center=6)
+                                      Center column is reserved for main chat.
+  <clear>true</clear>               → replace existing content (default: false)
+  <command>...</command>             → command to stream (e.g. "tail -f /var/log/app.log")
+  <stream>true</stream>              → stream live output if <command> provided; else static
 
-THINK: reason inside <think>...</think> before acting — stripped before execution.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT — Always use XML tags only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Rules:
-- Output ONLY XML tool tags. No prose before or after the tags.
-- Multiple tool calls: output them back-to-back with no separators.
-- Never wrap tags in ``` fences.
+→ Output ONLY XML tool tags. Zero prose before or after.
+→ Back-to-back calls: output sequentially with no separators.
+→ Reason inside <think>...</think> before acting (stripped at execution).
+→ Wrap tags in ``` fences → breaks parsing, so always skip them.
 
-Example (single call):
-
+SINGLE CALL:
 <think>I should check what files exist before building.</think>
 <tool>shell</tool>
 <command>cargo build --release 2>&1 | tail -30</command>
 <desc>Building release binary.</desc>
 
-Example (two calls back-to-back):
-
+MULTIPLE CALLS:
 <tool>shell</tool>
 <command>echo one</command>
 <desc>First step.</desc>
@@ -169,6 +204,7 @@ Example (two calls back-to-back):
 <command>echo two</command>
 <desc>Second step.</desc>"#.to_string()
 }
+
 
 /// Fix invalid JSON escape sequences emitted by models (e.g. `\&`, `\(`, `\s`).
 /// JSON only allows: `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`.
@@ -519,6 +555,15 @@ fn json_params_to_args(tool_name: &str, params: &serde_json::Value) -> String {
         "ruste" => get_str("rust_file_path"),
         "set_params" => get_str("settings"),
         "think" => get_str("thought"),
+        "panel" => {
+            let panel_name = get_str("panel_name");
+            let content = get_str("content");
+            let column = get_str("column");
+            let command = get_str("command");
+            let stream = get_str("stream");
+            let clear = get_str("clear");
+            format!("{}\x00{}\x00{}\x00{}\x00{}\x00{}", panel_name, content, column, command, stream, clear)
+        }
         _ => {
             // Generic fallback: space-join all string values
             params.as_object()
@@ -646,6 +691,16 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ToolCall> {
                     .to_string()
             }
             "knowledge" => extract_tag(block, "query").unwrap_or("").to_string(),
+            "panel" => {
+                // Parse panel parameters: panel_name, content, column, command, stream, clear
+                let panel_name = extract_tag(block, "panel_name").unwrap_or("").to_string();
+                let content = extract_tag_raw(block, "content").unwrap_or("").to_string();
+                let column = extract_tag(block, "column").unwrap_or("0").to_string();
+                let cmd = extract_tag(block, "command").unwrap_or("").to_string();
+                let stream = extract_tag(block, "stream").unwrap_or("false").to_string();
+                let clear = extract_tag(block, "clear").unwrap_or("false").to_string();
+                format!("{}\x00{}\x00{}\x00{}\x00{}\x00{}", panel_name, content, column, cmd, stream, clear)
+            }
             _ if command.is_empty() => String::new(),
             _ => command,
         };
@@ -995,6 +1050,7 @@ impl Agent {
              DIRECTIVES:\n\
              - Think: Record one sentence of intent to .yggdra/thought.md before every tool call.\n\
              - Constraints: Keep output files to a maximum of 200 lines. If content exceeds 200 lines, split into multiple files or use async mode. Never exceed 200 lines in a single file.\n\
+             - Navigation: The file tree above shows the project structure. Use it for navigation; do NOT call `ls -R` or recursive listing commands as they can produce huge outputs from build directories (target/, debug/, output/, etc). If the tree is empty or stale, use `ls -la` to list only the current directory, then navigate deeper as needed.\n\
              - Completion: Summarize results when finished.\n\
              \n\
              The file tree is live.",

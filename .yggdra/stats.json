@@ -1,12 +1,13 @@
 {
   "tools": {},
+  "query_results": {},
   "llm_requests": 0,
   "prompt_tokens": 0,
   "gen_tokens": 0,
   "avg_tok_per_s_x100": 0,
   "sessions": 1,
-  "last_active_unix": 1777333917,
-  "uptime_seconds": 0,
+  "last_active_unix": 1777364837,
+  "uptime_seconds": 38,
   "context_trims": 0,
   "compressions": 0
 }

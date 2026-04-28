@@ -22,12 +22,27 @@ pub struct ToolStats {
     pub output_bytes: u64,
 }
 
+/// Query result statistics for search-like tools.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryStats {
+    /// Individual result counts per query (e.g., [5, 12, 0, 3])
+    pub result_counts: Vec<u64>,
+    /// Average results per query
+    pub avg_results: f64,
+    /// Total queries executed
+    pub total_queries: u64,
+}
+
 /// Cumulative project statistics persisted to `.yggdra/stats.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Stats {
     // ── Tool usage ──────────────────────────────────────────────────────────
     /// Per-tool call and failure counts.
     pub tools: HashMap<String, ToolStats>,
+
+    // ── Query result statistics ─────────────────────────────────────────────
+    /// Per-tool query statistics (e.g., ripgrep, knowledge searches).
+    pub query_results: HashMap<String, QueryStats>,
 
     // ── LLM usage ───────────────────────────────────────────────────────────
     /// Total number of LLM inference requests sent (streaming + non-streaming).
@@ -94,6 +109,15 @@ impl Stats {
         }
     }
 
+    /// Record query results for a search/query tool (e.g., ripgrep, knowledge search).
+    /// `result_count` is the number of results returned by the query.
+    pub fn record_query_result(&mut self, tool_name: &str, result_count: u64) {
+        let entry = self.query_results.entry(tool_name.to_string()).or_default();
+        entry.result_counts.push(result_count);
+        entry.total_queries += 1;
+        entry.avg_results = entry.result_counts.iter().sum::<u64>() as f64 / entry.total_queries as f64;
+    }
+
     /// Record a completed LLM inference.
     pub fn record_llm(
         &mut self,
@@ -156,6 +180,7 @@ mod tests {
         assert_eq!(s.llm_requests, 0);
         assert_eq!(s.sessions, 0);
         assert!(s.tools.is_empty());
+        assert!(s.query_results.is_empty());
     }
 
     #[test]
@@ -168,6 +193,40 @@ mod tests {
         assert_eq!(t.calls, 2);
         assert_eq!(t.failures, 1);
         assert_eq!(t.output_bytes, 1536);
+    }
+
+    #[test]
+    fn test_record_query_result_single() {
+        let mut s = Stats::default();
+        s.record_query_result("rg", 5);
+        let q = &s.query_results["rg"];
+        assert_eq!(q.total_queries, 1);
+        assert_eq!(q.result_counts.len(), 1);
+        assert_eq!(q.result_counts[0], 5);
+        assert!((q.avg_results - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_record_query_result_multiple() {
+        let mut s = Stats::default();
+        s.record_query_result("rg", 10);
+        s.record_query_result("rg", 5);
+        s.record_query_result("rg", 15);
+        let q = &s.query_results["rg"];
+        assert_eq!(q.total_queries, 3);
+        assert_eq!(q.result_counts.len(), 3);
+        assert_eq!(q.result_counts, vec![10, 5, 15]);
+        assert!((q.avg_results - 10.0).abs() < 0.001); // (10+5+15)/3 = 10
+    }
+
+    #[test]
+    fn test_record_query_result_zero() {
+        let mut s = Stats::default();
+        s.record_query_result("rg", 0);
+        s.record_query_result("rg", 3);
+        let q = &s.query_results["rg"];
+        assert_eq!(q.total_queries, 2);
+        assert!((q.avg_results - 1.5).abs() < 0.001); // (0+3)/2 = 1.5
     }
 
     #[test]
@@ -204,12 +263,15 @@ mod tests {
         s.on_session_start();
         s.record_tool("editfile", true, 200);
         s.record_llm(50, 30, Some(15.0));
+        s.record_query_result("rg", 5);
         s.save(&dir);
 
         let loaded = Stats::load(&dir);
         assert_eq!(loaded.sessions, 1);
         assert_eq!(loaded.llm_requests, 1);
         assert_eq!(loaded.tools["editfile"].calls, 1);
+        assert_eq!(loaded.query_results["rg"].total_queries, 1);
+        assert_eq!(loaded.query_results["rg"].result_counts[0], 5);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

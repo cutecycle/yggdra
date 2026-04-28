@@ -1247,12 +1247,13 @@ mod file_edit_tests {
     fn registry_lists_exactly_4_tools() {
         let registry = ToolRegistry::new();
         let tools = registry.list_tools();
-        assert_eq!(tools.len(), 5, "expected 5 tools, got: {:?}", tools);
+        assert_eq!(tools.len(), 6, "Expected 6 tools, got: {:?}", tools);
         assert!(tools.contains(&"shell"));
         assert!(tools.contains(&"setfile"));
         assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"commit"));
         assert!(tools.contains(&"knowledge"));
+        assert!(tools.contains(&"panel"));
     }
 
     #[test]

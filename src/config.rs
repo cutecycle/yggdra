@@ -146,6 +146,10 @@ pub struct ModelParams {
     /// 0 = must be fully certain; higher = can proceed with some remaining questions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambiguity_threshold: Option<u32>,
+    /// Command timeout in seconds: max duration for shell/exec/spawn tool execution before SIGTERM.
+    /// None = use DEFAULT_TIMEOUT (600s). Tool-specific limits override this for spawn (1800s), compilers (900s), ripgrep (60s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_timeout_secs: Option<u32>,
 }
 
 impl Default for ModelParams {
@@ -161,6 +165,7 @@ impl Default for ModelParams {
             think: None,
             reasoning_effort: Some("xhigh".to_string()),
             ambiguity_threshold: Some(10),
+            command_timeout_secs: None,
         }
     }
 }
@@ -178,6 +183,7 @@ impl ModelParams {
             && self.think.is_none()
             && self.reasoning_effort.is_none()
             && self.ambiguity_threshold.is_none()
+            && self.command_timeout_secs.is_none()
     }
 
     /// Merge: self wins for any field set; base fills the rest.
@@ -193,6 +199,7 @@ impl ModelParams {
             think: self.think.or(base.think),
             reasoning_effort: self.reasoning_effort.clone().or_else(|| base.reasoning_effort.clone()),
             ambiguity_threshold: self.ambiguity_threshold.or(base.ambiguity_threshold),
+            command_timeout_secs: self.command_timeout_secs.or(base.command_timeout_secs),
         }
     }
 
@@ -281,7 +288,16 @@ impl ModelParams {
                 self.ambiguity_threshold = Some(v);
                 Ok(format!("ambiguity_threshold = {}", v))
             }
-            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, think, reasoning_effort, ambiguity_threshold, reset", other)),
+            "command_timeout_secs" => {
+                let v: u32 = value.trim().parse()
+                    .map_err(|_| format!("command_timeout_secs: expected unsigned int, got '{}'", value))?;
+                if v < 5 {
+                    return Err(format!("command_timeout_secs must be >= 5 seconds, got {}", v));
+                }
+                self.command_timeout_secs = Some(v);
+                Ok(format!("command_timeout_secs = {}s", v))
+            }
+            other => Err(format!("unknown param '{}' — valid: temperature, top_k, top_p, repeat_penalty, num_predict, tool_output_cap, think, reasoning_effort, ambiguity_threshold, command_timeout_secs, reset", other)),
         }
     }
 
@@ -317,6 +333,7 @@ impl ModelParams {
         if let Some(v) = self.think           { parts.push(format!("think={}", v)); }
         if let Some(ref v) = self.reasoning_effort { parts.push(format!("reasoning_effort={}", v)); }
         if let Some(v) = self.ambiguity_threshold { parts.push(format!("ambiguity_threshold={}", v)); }
+        if let Some(v) = self.command_timeout_secs { parts.push(format!("command_timeout_secs={}s", v)); }
         if parts.is_empty() { "defaults".to_string() } else { parts.join(" ") }
     }
 }
@@ -1060,6 +1077,7 @@ See docs for details.
             think: None,
             reasoning_effort: None,
             ambiguity_threshold: None,
+            command_timeout_secs: None,
         };
         assert!(p.is_empty());
     }
@@ -1076,7 +1094,7 @@ See docs for details.
         let mut p = ModelParams {
             temperature: None, top_k: None, top_p: None, repeat_penalty: None,
             num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
-            reasoning_effort: None, ambiguity_threshold: None,
+            reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None,
         };
         p.temperature = Some(0.5);
         assert!(!p.is_empty());
@@ -1098,7 +1116,7 @@ See docs for details.
         let overrides = ModelParams {
             temperature: None, top_k: None, top_p: None, repeat_penalty: None,
             num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
-            reasoning_effort: None, ambiguity_threshold: None,
+            reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None,
         };
         let base = ModelParams { temperature: Some(0.7), ..Default::default() };
         let merged = overrides.merge_over(&base);
@@ -1111,12 +1129,12 @@ See docs for details.
         let overrides = ModelParams {
             temperature: None, top_k: None, top_p: None, repeat_penalty: None,
             num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
-            reasoning_effort: None, ambiguity_threshold: None,
+            reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None,
         };
         let base = ModelParams {
             temperature: None, top_k: None, top_p: None, repeat_penalty: None,
             num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
-            reasoning_effort: None, ambiguity_threshold: None,
+            reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None,
         };
         let merged = overrides.merge_over(&base);
         assert!(merged.temperature.is_none());
@@ -1406,7 +1424,7 @@ See docs for details.
         let p = ModelParams {
             temperature: None, top_k: None, top_p: None, repeat_penalty: None,
             num_predict: None, num_ctx: None, tool_output_cap: None, think: None,
-            reasoning_effort: None, ambiguity_threshold: None,
+            reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None,
         };
         assert_eq!(p.summary(), "defaults");
     }
@@ -1415,7 +1433,7 @@ See docs for details.
     fn test_summary_temperature_shown() {
         let p = ModelParams { temperature: Some(0.7), top_k: None, top_p: None,
             repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
-            think: None, reasoning_effort: None, ambiguity_threshold: None };
+            think: None, reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None };
         let s = p.summary();
         assert!(s.contains("temperature="), "summary must show temperature, got: {}", s);
     }
@@ -1424,7 +1442,7 @@ See docs for details.
     fn test_summary_think_shown() {
         let p = ModelParams { temperature: None, top_k: None, top_p: None,
             repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
-            think: Some(true), reasoning_effort: None, ambiguity_threshold: None };
+            think: Some(true), reasoning_effort: None, ambiguity_threshold: None, command_timeout_secs: None };
         let s = p.summary();
         assert!(s.contains("think=true"), "summary must show think, got: {}", s);
     }
@@ -1433,7 +1451,7 @@ See docs for details.
     fn test_summary_reasoning_effort_shown() {
         let p = ModelParams { temperature: None, top_k: None, top_p: None,
             repeat_penalty: None, num_predict: None, num_ctx: None, tool_output_cap: None,
-            think: None, reasoning_effort: Some("high".into()), ambiguity_threshold: None };
+            think: None, reasoning_effort: Some("high".into()), ambiguity_threshold: None, command_timeout_secs: None };
         let s = p.summary();
         assert!(s.contains("reasoning_effort=high"), "got: {}", s);
     }

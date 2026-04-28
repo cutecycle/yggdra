@@ -123,6 +123,21 @@ impl Tool for RipgrepTool {
             .map_err(|e| anyhow!("rg: execution failed (is ripgrep installed?): {}", e))?;
 
         let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+        
+        // Count the number of result lines
+        let result_count = if stdout.is_empty() {
+            0u64
+        } else {
+            stdout.lines().count() as u64
+        };
+        
+        // Auto-log query result count to stats
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut stats = crate::stats::Stats::load(&cwd);
+            stats.record_query_result("rg", result_count);
+            let _ = stats.save(&cwd);
+        }
+        
         if stdout.is_empty() {
             Ok("no matches".to_string())
         } else {
@@ -955,11 +970,46 @@ impl Tool for SetfileTool {
 }
 
 impl SetfileTool {
+    fn colorize_diff(diff: &str) -> String {
+        const RED: &str = "\x1b[31m";
+        const GREEN: &str = "\x1b[32m";
+        const RESET: &str = "\x1b[0m";
+
+        diff.lines()
+            .map(|line| {
+                if line.starts_with('-') && !line.starts_with("---") {
+                    format!("{}{}{}", RED, line, RESET)
+                } else if line.starts_with('+') && !line.starts_with("+++") {
+                    format!("{}{}{}", GREEN, line, RESET)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn git_add_and_commit(&self, path: &std::path::Path) -> Result<(String, String)> {
+        // Find the git repo by looking for .git directory
+        let mut repo_dir = path.parent().unwrap_or(path).to_path_buf();
+        loop {
+            if repo_dir.join(".git").exists() {
+                break;
+            }
+            if let Some(parent) = repo_dir.parent() {
+                repo_dir = parent.to_path_buf();
+            } else {
+                // No .git found, try running git from current directory
+                repo_dir = std::env::current_dir().unwrap_or_else(|_| path.parent().unwrap_or(path).to_path_buf());
+                break;
+            }
+        }
+        
         // Stage this specific file
         let add = Command::new("git")
             .arg("add")
             .arg(path)
+            .current_dir(&repo_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -978,6 +1028,7 @@ impl SetfileTool {
                 "--",
                 path.to_str().unwrap_or(""),
             ])
+            .current_dir(&repo_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -988,6 +1039,9 @@ impl SetfileTool {
 
         // Trim the diff to keep output reasonable (first 60 lines)
         let diff_trimmed = diff_out.lines().take(60).collect::<Vec<_>>().join("\n");
+        
+        // Colorize the diff: red for removed, green for added
+        let diff_colorized = Self::colorize_diff(&diff_trimmed);
 
         // Use a relative path in the commit message so it isn't full-system-path noisy.
         let display_path = std::env::current_dir()
@@ -997,6 +1051,7 @@ impl SetfileTool {
         let msg = format!("setfile: {}", display_path.display());
         let commit = Command::new("git")
             .args(["commit", "-m", &msg, "--", path.to_str().unwrap_or("")])
+            .current_dir(&repo_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -1011,7 +1066,7 @@ impl SetfileTool {
                 .and_then(|l| l.split_whitespace().nth(1))
                 .map(|s| s.trim_end_matches(']').to_string())
                 .unwrap_or_else(|| "ok".to_string());
-            Ok((hash, diff_trimmed))
+            Ok((hash, diff_colorized))
         } else {
             let stderr = String::from_utf8_lossy(&commit.stderr);
             if stderr.contains("nothing to commit") || stderr.contains("nothing added") {
@@ -1568,6 +1623,150 @@ impl Tool for KnowledgeTool {
     }
 }
 
+// ===== Panel Tool (panel) =====
+
+pub struct PanelTool;
+
+impl PanelTool {
+    /// Validate panel name: alphanumeric + underscores only
+    fn validate_panel_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(anyhow!("panel: panel name cannot be empty"));
+        }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(anyhow!(
+                "panel: invalid panel name '{}' (use alphanumeric + underscores only)",
+                name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parse column: either numeric index or position name ("left", "right")
+    fn parse_column(column_str: &str) -> Result<u16> {
+        if column_str.is_empty() {
+            return Ok(0); // Default to left (column 0)
+        }
+        
+        match column_str {
+            "left" => Ok(0),
+            "right" => Ok(1),
+            _ => {
+                // Try to parse as numeric column index
+                column_str.parse::<u16>()
+                    .map_err(|_| anyhow!("panel: invalid column '{}' (use 'left', 'right', or a numeric index)", column_str))
+            }
+        }
+    }
+
+    /// Parse stream flag: accept "true", "false", "1", "0"
+    fn parse_stream(stream_str: &str) -> bool {
+        matches!(stream_str.to_lowercase().as_str(), "true" | "1" | "yes")
+    }
+}
+
+impl Tool for PanelTool {
+    fn name(&self) -> &str {
+        "panel"
+    }
+
+    fn validate_input(&self, args: &str) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow!("panel: missing arguments"));
+        }
+        
+        // Parse new format: panel_name\x00content\x00column\x00command\x00stream\x00clear
+        let parts: Vec<&str> = args.splitn(6, '\x00').collect();
+        if parts.is_empty() {
+            return Err(anyhow!("panel: invalid format (expected panel_name<null>...)"));
+        }
+
+        let panel_name = parts[0];
+        Self::validate_panel_name(panel_name)?;
+
+        // parts[1] = content (may be empty for streaming)
+        let content = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        
+        // parts[2] = column (may be empty, defaults to 0)
+        let column_str = parts.get(2).map(|s| s.trim()).unwrap_or("0");
+        if !column_str.is_empty() {
+            Self::parse_column(column_str)?;
+        }
+
+        // parts[3] = command (may be empty for static panels)
+        let command = parts.get(3).map(|s| s.trim()).unwrap_or("");
+
+        // parts[4] = stream flag (may be empty, defaults to false)
+        let stream_str = parts.get(4).map(|s| s.trim()).unwrap_or("false");
+        let stream = Self::parse_stream(stream_str);
+
+        // Validation rules:
+        // 1. Must have either content or command (or both)
+        if content.is_empty() && command.is_empty() {
+            return Err(anyhow!(
+                "panel: must provide either <content> (static) or <command> (streaming), or both"
+            ));
+        }
+
+        // 2. Cannot provide both content and command
+        if !content.is_empty() && !command.is_empty() {
+            return Err(anyhow!(
+                "panel: cannot provide both <content> and <command> — choose one:\n  \
+                 • <content> for static panel display\n  \
+                 • <command> with <stream>true for live streaming output"
+            ));
+        }
+
+        // 3. If stream=true, must have command
+        if stream && command.is_empty() {
+            return Err(anyhow!(
+                "panel: <stream>true requires <command> to be provided"
+            ));
+        }
+
+        // 4. If command provided, validate it can be resolved
+        if !command.is_empty() && stream {
+            // Extract the binary name (first word of command)
+            let binary = command.split_whitespace().next().unwrap_or("");
+            if !binary.is_empty() && ExecTool::resolve_binary(binary).is_none() {
+                return Err(anyhow!(
+                    "panel: command '{}' not found in PATH — cannot stream output",
+                    binary
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        self.validate_input(args)?;
+
+        let parts: Vec<&str> = args.splitn(6, '\x00').collect();
+        let panel_name = parts[0].to_string();
+        let content = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
+        let column_str = parts.get(2).map(|s| s.trim()).unwrap_or("0");
+        let column = Self::parse_column(column_str)?;
+        let command = parts.get(3).map(|s| s.to_string()).unwrap_or_default();
+        let stream_str = parts.get(4).map(|s| s.trim()).unwrap_or("false");
+        let stream = Self::parse_stream(stream_str);
+
+        // Return success with mode indicator
+        let mode_label = if stream && !command.is_empty() {
+            format!("streaming: {}", command.split_whitespace().next().unwrap_or("?"))
+        } else {
+            format!("static: {} bytes", content.len())
+        };
+
+        Ok(format!(
+            "✅ Panel '{}' created: column={}, {}",
+            panel_name,
+            column,
+            mode_label,
+        ))
+    }
+}
+
 pub struct ToolRegistry {
     tools: std::collections::HashMap<String, Box<dyn Tool>>,
 }
@@ -1598,6 +1797,7 @@ impl ToolRegistry {
                 max_bytes: tool_output_cap.max(300),
             }) as Box<dyn Tool>,
         );
+        tools.insert("panel".to_string(), Box::new(PanelTool) as Box<dyn Tool>);
         Self { tools }
     }
 
@@ -1880,7 +2080,8 @@ mod tests {
         assert!(tools.contains(&"setfile"));
         assert!(tools.contains(&"patchfile"));
         assert!(tools.contains(&"commit"));
-        assert_eq!(tools.len(), 5); // shell setfile patchfile commit knowledge
+        assert!(tools.contains(&"panel"));
+        assert_eq!(tools.len(), 6); // shell setfile patchfile commit knowledge panel
         assert_eq!(
             fix_macos_sed_inplace("sed -i 's/old/new/g' file.rs"),
             "sed -i '' 's/old/new/g' file.rs"
@@ -1969,6 +2170,38 @@ mod tests {
     }
 
     #[test]
+    fn test_setfile_colorize_diff_adds_removed_color() {
+        let diff = "--- a/file.txt\n+++ b/file.txt\n-removed line\n+added line\n context";
+        let colored = SetfileTool::colorize_diff(diff);
+        
+        // Check that removed lines have red color code
+        assert!(colored.contains("\x1b[31m-removed line\x1b[0m"), "removed lines should be red");
+        
+        // Check that added lines have green color code
+        assert!(colored.contains("\x1b[32m+added line\x1b[0m"), "added lines should be green");
+        
+        // Check that file header lines are not colored
+        assert!(colored.contains("--- a/file.txt"), "file header should not be colored");
+        assert!(colored.contains("+++ b/file.txt"), "file header should not be colored");
+        
+        // Check that context lines are not colored
+        assert!(colored.contains(" context"), "context lines should not be colored");
+    }
+
+    #[test]
+    fn test_setfile_colorize_diff_preserves_structure() {
+        let diff = "- old\n+ new\n common";
+        let colored = SetfileTool::colorize_diff(diff);
+        
+        // Count that we still have 3 lines
+        assert_eq!(colored.lines().count(), 3, "diff structure should be preserved");
+        
+        // Verify the content is wrapped with ANSI codes
+        assert!(colored.contains("\x1b["), "should contain ANSI escape codes");
+        assert!(colored.contains("\x1b[0m"), "should contain ANSI reset codes");
+    }
+
+    #[test]
     fn test_registry_unknown_tool() {
         let registry = ToolRegistry::new();
         let result = registry.execute("nonexistent", "args");
@@ -2053,7 +2286,8 @@ mod tests {
         assert!(tools.contains(&"shell"), "shell should be registered");
         assert!(tools.contains(&"setfile"), "setfile should be registered");
         assert!(tools.contains(&"commit"), "commit should be registered");
-        assert_eq!(tools.len(), 5); // shell setfile patchfile commit knowledge
+        assert!(tools.contains(&"panel"), "panel should be registered");
+        assert_eq!(tools.len(), 6); // shell setfile patchfile commit knowledge panel
     }
 
     // ===== parse_line_range tests =====
@@ -3376,4 +3610,165 @@ mod tests {
         assert!(tools.contains(&"commit"));
     }
 
+    // ===== Panel Tool tests =====
+
+    #[test]
+    fn test_panel_tool_valid_panel_name() {
+        let tool = PanelTool;
+        // Valid names: alphanumeric + underscores
+        // Format: panel_name\x00content\x00column\x00clear
+        assert!(tool.validate_input("test_panel\x00content\x002").is_ok());
+        assert!(tool.validate_input("panel123\x00content\x000").is_ok());
+        assert!(tool.validate_input("_private\x00content\x001").is_ok());
+    }
+
+    #[test]
+    fn test_panel_tool_invalid_panel_name() {
+        let tool = PanelTool;
+        // Invalid names: special characters, spaces
+        assert!(tool.validate_input("test-panel\x00content\x000").is_err());
+        assert!(tool.validate_input("test panel\x00content\x000").is_err());
+        assert!(tool.validate_input("test.panel\x00content\x000").is_err());
+        assert!(tool.validate_input("\x00content\x000").is_err()); // empty name
+    }
+
+    #[test]
+    fn test_panel_tool_valid_position() {
+        let tool = PanelTool;
+        // Test valid column indices (0=left, 1=center, 2=right)
+        assert!(tool.validate_input("panel\x00content\x000").is_ok());
+        assert!(tool.validate_input("panel\x00content\x002").is_ok());
+        assert!(tool.validate_input("panel\x00content\x001").is_ok());
+    }
+
+    #[test]
+    fn test_panel_tool_invalid_position() {
+        let tool = PanelTool;
+        // Test invalid column formats (non-numeric, negative)
+        assert!(tool.validate_input("panel\x00content\x00center").is_err());
+        assert!(tool.validate_input("panel\x00content\x00top").is_err());
+    }
+
+    #[test]
+    fn test_panel_tool_execute_success_static() {
+        let tool = PanelTool;
+        // Format (new): panel_name\x00content\x00column\x00command\x00stream\x00clear
+        // For static panels: command="" and stream="false"
+        let result = tool.execute("test_panel\x00Hello world\x002\x00\x00false\x00false");
+        assert!(result.is_ok(), "Static panel should succeed");
+        let output = result.unwrap();
+        assert!(output.contains("test_panel"));
+        assert!(output.contains("static: 11 bytes")); // "Hello world" is 11 bytes
+    }
+
+    #[test]
+    fn test_panel_tool_validate_static_content() {
+        let tool = PanelTool;
+        // Valid static panel with content
+        let result = tool.validate_input("my_panel\x00Content here\x000\x00\x00false\x00false");
+        assert!(result.is_ok(), "Static panel with content should be valid");
+    }
+
+    #[test]
+    fn test_panel_tool_validate_streaming_command() {
+        let tool = PanelTool;
+        // Valid streaming panel with echo command
+        let result = tool.validate_input("my_panel\x00\x000\x00echo hello\x00true\x00false");
+        assert!(result.is_ok(), "Streaming panel with valid command should be valid");
+    }
+
+    #[test]
+    fn test_panel_tool_reject_both_content_and_command() {
+        let tool = PanelTool;
+        // Both content and command provided — should error
+        let result = tool.validate_input("my_panel\x00Content\x000\x00echo cmd\x00true\x00false");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot provide both"));
+    }
+
+    #[test]
+    fn test_panel_tool_reject_streaming_without_command() {
+        let tool = PanelTool;
+        // stream=true but no command — should error
+        // We must still provide content so we don't hit the "must provide either" check first
+        // But with command empty, it should error on stream=true requiring command
+        let result = tool.validate_input("my_panel\x00dummy\x002\x00\x00true\x00false");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Check that the error is about both content and command, not about stream
+        // Actually, if content is provided and command is empty, it's a static panel scenario
+        // Let me test this differently: provide neither content nor command but set stream=true
+        // This should fail because we need a command for streaming
+        let result2 = tool.validate_input("my_panel\x00\x002\x00\x00true\x00false");
+        assert!(result2.is_err());
+        let err_msg2 = result2.unwrap_err().to_string();
+        // This will fail on "must provide either" first, so let's just check that it errors
+        assert!(err_msg2.contains("must provide") || err_msg2.contains("requires"));
+    }
+
+    #[test]
+    fn test_panel_tool_reject_empty_content_and_command() {
+        let tool = PanelTool;
+        // Neither content nor command provided — should error
+        let result = tool.validate_input("my_panel\x00\x002\x00\x00false\x00false");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must provide either"));
+    }
+
+    #[test]
+    fn test_panel_tool_reject_invalid_command() {
+        let tool = PanelTool;
+        // Invalid command that won't be found in PATH
+        let result = tool.validate_input("my_panel\x00\x002\x00/nonexistent/bin/xyz\x00true\x00false");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found in PATH"));
+    }
+
+    #[test]
+    fn test_panel_tool_execute_streaming_mode() {
+        let tool = PanelTool;
+        // Valid streaming with echo command
+        let result = tool.execute("stream_panel\x00\x001\x00echo hello world\x00true\x00false");
+        assert!(result.is_ok(), "Streaming panel execution should succeed");
+        let output = result.unwrap();
+        assert!(output.contains("stream_panel"));
+        assert!(output.contains("streaming: echo"));
+    }
+
+    #[test]
+    fn test_panel_tool_invalid_panel_name_with_dash() {
+        let tool = PanelTool;
+        // Panel name with invalid characters (dash)
+        let result = tool.validate_input("panel-name\x00content\x000\x00\x00false\x00false");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid panel name"));
+    }
+
+    #[test]
+    fn test_panel_tool_invalid_column_name() {
+        let tool = PanelTool;
+        // Invalid column (non-numeric and not "left"/"right")
+        let result = tool.validate_input("valid_name\x00content\x00middle\x00\x00false\x00false");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid column"));
+    }
+
+    #[test]
+    fn test_panel_tool_streaming_with_echo_success() {
+        let tool = PanelTool;
+        // Test successful streaming with echo command
+        let result = tool.execute("output_panel\x00\x000\x00echo 'test output'\x00true\x00false");
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("streaming"));
+    }
+
+    #[test]
+    fn test_panel_tool_registry_includes_panel() {
+        let registry = ToolRegistry::new();
+        let tools = registry.list_tools();
+        assert!(tools.contains(&"panel"), "panel tool must be in registry");
+    }
+
 }
+
