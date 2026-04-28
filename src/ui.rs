@@ -4031,8 +4031,9 @@ impl App {
 
         let mut skipped: i32 = 0;
         let mut current_y = messages_area.top();
+        const MESSAGE_SPACING: u16 = 1; // Add 1 blank line between messages
 
-        for rm in &rendered {
+        for (idx, rm) in rendered.iter().enumerate() {
             let msg_h = rm.height as i32;
 
             // Skip messages that are entirely above the viewport
@@ -4067,6 +4068,11 @@ impl App {
 
             f.render_widget(msg_para, msg_area);
             current_y += draw_height;
+            
+            // Add spacing between messages (except after the last one)
+            if idx < rendered.len() - 1 && current_y < messages_area.bottom() {
+                current_y += MESSAGE_SPACING;
+            }
         }
 
         // Scroll indicator in top-right of messages area
