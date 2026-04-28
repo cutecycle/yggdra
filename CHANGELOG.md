@@ -5,7 +5,18 @@ All notable changes to Yggdra will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.5] - 2026-04-26
+## [0.2.7] - 2026-04-28
+
+### Fixed
+
+- Removed 150+ lines of dead code from incomplete refactoring (cargo fix applied)
+- Registry test now correctly validates tool count after test infrastructure updates
+
+### Changed
+
+- Internal code quality improvements and cleanup
+
+## [0.2.6] - 2026-04-28
 
 ### Added
 
