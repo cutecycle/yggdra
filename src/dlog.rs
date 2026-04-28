@@ -51,3 +51,38 @@ macro_rules! dlog {
         $crate::dlog::log(&format!($($arg)*))
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::fs;
+
+    #[test]
+    fn test_dlog_creates_debug_log() {
+        // Initialize dlog
+        init();
+        
+        // Log test traces
+        log("[AGENT:parse] tool_calls_found: count=2 names=shell,setfile");
+        log("[TOOL:shell] done: exit_code=0 stdout_len=1500 stderr_len=0");
+        log("[UI:mode] transition: old=plan new=one reason=plan_understood");
+        
+        // Give the logger time to flush
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // Verify debug.log exists and has traces
+        let log_path = ".yggdra/debug.log";
+        assert!(Path::new(log_path).exists(), "debug.log was not created");
+        
+        let content = fs::read_to_string(log_path).expect("Could not read debug.log");
+        
+        // Verify all trace types are present
+        assert!(content.contains("[AGENT:parse]"), "Agent parse traces missing");
+        assert!(content.contains("[TOOL:shell]"), "Tool shell traces missing");
+        assert!(content.contains("[UI:mode]"), "UI mode traces missing");
+        
+        // Verify timestamp format is present
+        assert!(content.contains("==="), "Debug log header missing");
+    }
+}
