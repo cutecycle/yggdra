@@ -258,6 +258,8 @@ impl Tool for ExecTool {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+        crate::dlog!("[TOOL:exec] start: binary={} args_count={}", binary, child_args.len());
+
         let child = Command::new(&resolved)
             .args(child_args)
             .current_dir(&cwd)
@@ -274,8 +276,10 @@ impl Tool for ExecTool {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         if output.status.success() {
+            crate::dlog!("[TOOL:exec] done: binary={} exit_code=0 stdout_len={}", binary, stdout.len());
             Ok(stdout)
         } else {
+            crate::dlog!("[TOOL:exec] error: binary={} exit_code={:?}", binary, output.status.code());
             Err(anyhow!(
                 "exec: child process failed: {}\n{}",
                 stdout,
@@ -406,6 +410,8 @@ impl Tool for ShellTool {
             (args.to_string(), None)
         };
 
+        crate::dlog!("[TOOL:shell] start: cmd_len={}", raw_cmd.len());
+
         // On macOS, BSD sed requires an empty extension with -i: `sed -i '' 's/...'`
         // GNU-style `sed -i 's/...'` (no extension) fails. Auto-fix transparently.
         #[cfg(target_os = "macos")]
@@ -432,6 +438,11 @@ impl Tool for ShellTool {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        
+        let stdout_len = stdout.len();
+        let stderr_len = stderr.len();
+        let exit_code = output.status.code().unwrap_or(-1);
+        
         let combined = if stderr.is_empty() {
             stdout
         } else if stdout.is_empty() {
@@ -439,6 +450,9 @@ impl Tool for ShellTool {
         } else {
             format!("{}{}", stdout, stderr)
         };
+
+        crate::dlog!("[TOOL:shell] done: exit_code={} stdout_len={} stderr_len={}", 
+            exit_code, stdout_len, stderr_len);
 
         // Append git diff for human viewing.
         //

@@ -116,6 +116,7 @@ impl MessageBuffer {
     }
 
     pub fn add_and_persist(&mut self, message: Message) -> Result<()> {
+        crate::dlog!("[MSG:buffer] add_and_persist: role={} content_len={}", message.role, message.content.len());
         let row = MsgRow {
             role: message.role,
             content: message.content,
@@ -132,6 +133,7 @@ impl MessageBuffer {
     }
 
     pub fn add_multiple(&mut self, messages: &[Message]) -> Result<()> {
+        crate::dlog!("[MSG:buffer] add_multiple: count={}", messages.len());
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)

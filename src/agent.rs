@@ -1209,8 +1209,20 @@ impl Agent {
             let tool_calls = parse_xml_tool_calls(&llm_output);
             let mut spawn_calls = crate::spawner::parse_spawn_agent_calls(&llm_output);
             
+            // Trace tool call parsing
+            if !tool_calls.is_empty() {
+                crate::dlog!("[AGENT:parse] tool_calls_found: count={} names={}", 
+                    tool_calls.len(), 
+                    tool_calls.iter().map(|t| &t.name).cloned().collect::<Vec<_>>().join(","));
+            }
+            if !spawn_calls.is_empty() {
+                crate::dlog!("[AGENT:parse] spawn_calls_found: count={}", spawn_calls.len());
+            }
+            
             // Disable subagent spawning if recursion depth limit reached
             if self.config.current_depth >= self.config.max_recursion_depth {
+                crate::dlog!("[AGENT:spawn] depth_limit_reached: current={} max={}", 
+                    self.config.current_depth, self.config.max_recursion_depth);
                 spawn_calls.clear();
             }
 
@@ -1245,9 +1257,16 @@ impl Agent {
                 let result = if call.name == "set_params" {
                     self.handle_set_params(&call.args)
                 } else {
+                    crate::dlog!("[TOOL:exec] start: name={} args_len={}", call.name, call.args.len());
                     match self.execute_tool(&call).await {
-                        Ok(output) => output,
-                        Err(e) => format!("[ERROR]: {}", e),
+                        Ok(output) => {
+                            crate::dlog!("[TOOL:exec] done: name={} result_len={}", call.name, output.len());
+                            output
+                        }
+                        Err(e) => {
+                            crate::dlog!("[TOOL:exec] error: name={} err={}", call.name, e);
+                            format!("[ERROR]: {}", e)
+                        }
                     }
                 };
                 // Apply configured truncation limit to prevent unbounded context growth
@@ -1255,6 +1274,7 @@ impl Agent {
                 let result = if result.chars().count() > limit {
                     let truncated: String = result.chars().take(limit).collect();
                     let dropped = result.chars().count() - limit;
+                    crate::dlog!("[TOOL:output] truncated: name={} dropped={}", call.name, dropped);
                     format!("{}…({} omitted)", truncated, dropped)
                 } else {
                     result
@@ -1275,6 +1295,9 @@ impl Agent {
                 // Calculate remaining spawn depth: (max - current), max is typically 10
                 let remaining_depth = (self.config.max_recursion_depth as u32).saturating_sub(self.config.current_depth as u32);
                 
+                crate::dlog!("[AGENT:spawn] start: task_id={} depth={}/{} desc_len={}", 
+                    task_id, child_config.current_depth, self.config.max_recursion_depth, task_desc.len());
+                
                 let subagent_result = crate::spawner::spawn_subagent(
                     "agent",
                     task_id,
@@ -1283,6 +1306,15 @@ impl Agent {
                     child_config,
                     remaining_depth,
                 ).await;
+
+                match &subagent_result {
+                    Ok(result) => {
+                        crate::dlog!("[AGENT:spawn] done: task_id={} result_len={}", task_id, result.output.len());
+                    }
+                    Err(e) => {
+                        crate::dlog!("[AGENT:spawn] error: task_id={} err={}", task_id, e);
+                    }
+                }
 
                 let injection = match subagent_result {
                     Ok(result) => result.to_injection(),

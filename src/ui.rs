@@ -1070,6 +1070,8 @@ impl App {
         self.render_cache_width = area_width;
         self.render_cache_theme = self.theme.kind.clone();
         self.render_cache = cache;
+        crate::dlog!("[UI:render] cache_build: msg_count={} exchange_idx={} width={}", 
+            self.messages_cache.len(), exchange_idx, area_width);
     }
 
     /// Run the TUI — main event loop with streaming support
@@ -2919,6 +2921,7 @@ impl App {
     /// fire a persistent OS notification, and surface a clear message in the chat.
     /// `reason` is a short human-readable explanation logged to the chat.
     fn complete_one_mode(&mut self, reason: &str) {
+        crate::dlog!("[UI:mode] transition: old=one new=plan reason={}", reason);
         self.push_system_event(format!("✅ Task complete ({reason}) — switching to Plan mode"));
         tokio::spawn(crate::notifications::agent_says("✅ Task complete"));
         self.mode = crate::config::AppMode::Plan;
@@ -2933,6 +2936,7 @@ impl App {
 
     /// Launch One mode after agent declared [UNDERSTOOD]: switch mode, kick, clear flag.
     fn launch_plan_understood(&mut self) {
+        crate::dlog!("[UI:mode] transition: old=plan new=one reason=plan_understood");
         self.plan_understood = false;
         self.autokick_paused = false;
         self.input_buffer.clear();
@@ -3277,10 +3281,14 @@ impl App {
                  When you understand the task, emit </understood> on its own line — this signals you're ready to proceed.",
             AppMode::Forever =>
                 "MODE: BUILD (autonomous). Execute shell commands to complete tasks. \
-                 When the task is fully complete, emit </done> on its own line.",
+                 When the task is fully complete, emit </done> on its own line. \
+                 FALLBACK: If a command doesn't return output, try a different approach — don't repeat the same command. \
+                 Consider: reading AGENTS.md for context, exploring the file structure differently, or examining error blocks below.",
             AppMode::One =>
                 "MODE: ONE (one-off). Execute shell commands autonomously to complete a single task. \
-                 When the task is fully complete, emit </done> on its own line — this stops the loop.",
+                 When the task is fully complete, emit </done> on its own line — this stops the loop. \
+                 FALLBACK: If a command doesn't return output, try a different approach — don't repeat the same command. \
+                 Consider: reading AGENTS.md for context, exploring the file structure differently, or examining error blocks below.",
         };
         crate::dlog!("steering_text: mode_block built");
 
